@@ -3181,16 +3181,65 @@ nvme_ctrlr_update_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 	}
 }
 
-static int
-nvme_ctrlr_clear_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr)
+static void
+nvme_ctrlr_process_async_event_finish(struct spdk_nvme_ctrlr_aer_completion *async_event)
 {
-	struct nvme_completion_poll_status	*status;
-	int		rc = -ENOMEM;
-	char		*buffer = NULL;
-	uint32_t	nsid;
-	size_t		buf_size = (SPDK_NVME_MAX_CHANGED_NAMESPACES * sizeof(uint32_t));
+	struct spdk_nvme_ctrlr *ctrlr = async_event->ctrlr;
+	struct spdk_nvme_cpl *cpl = &async_event->cpl;
+	struct spdk_nvme_ctrlr_process *active_proc;
+
+	active_proc = nvme_ctrlr_get_current_process(ctrlr);
+	if (active_proc && active_proc->aer_cb_fn) {
+		active_proc->aer_cb_fn(active_proc->aer_cb_arg, cpl);
+	}
+
+	spdk_free(async_event);
+}
+
+static void
+nvme_ctrlr_reenumerate_active_ns(struct spdk_nvme_ctrlr *ctrlr)
+{
+	int rc;
+
+	rc = nvme_ctrlr_identify_active_ns(ctrlr);
+	if (rc) {
+		return;
+	}
+	nvme_ctrlr_update_namespaces(ctrlr);
+	nvme_io_msg_ctrlr_update(ctrlr);
+}
+
+static void
+nvme_ctrlr_clear_changed_ns_log_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct spdk_nvme_ctrlr_aer_completion *async_event = arg;
+	char *buffer = async_event->buffer;
+	struct spdk_nvme_ctrlr *ctrlr = async_event->ctrlr;
+	uint32_t nsid;
+
+	/* only check the case of overflow. */
+	nsid = from_le32(buffer);
+	if (nsid == 0xffffffffu) {
+		NVME_CTRLR_WARNLOG(ctrlr, "changed ns log overflowed.\n");
+	}
+
+	spdk_dma_free(buffer);
+
+	nvme_ctrlr_reenumerate_active_ns(ctrlr);
+
+	nvme_ctrlr_process_async_event_finish(async_event);
+}
+
+static int
+nvme_ctrlr_clear_changed_ns_log(struct spdk_nvme_ctrlr_aer_completion *async_event)
+{
+	struct spdk_nvme_ctrlr	*ctrlr = async_event->ctrlr;
+	int						rc = -ENOMEM;
+	char					*buffer = NULL;
+	size_t					buf_size = (SPDK_NVME_MAX_CHANGED_NAMESPACES * sizeof(uint32_t));
 
 	if (ctrlr->opts.disable_read_changed_ns_list_log_page) {
+		nvme_ctrlr_clear_changed_ns_log_cb(async_event, NULL);
 		return 0;
 	}
 
@@ -3201,66 +3250,37 @@ nvme_ctrlr_clear_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr)
 		return rc;
 	}
 
-	status = calloc(1, sizeof(*status));
-	if (!status) {
-		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate status tracker\n");
-		goto free_buffer;
-	}
+	async_event->buffer = buffer;
 
 	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr,
 					      SPDK_NVME_LOG_CHANGED_NS_LIST,
 					      SPDK_NVME_GLOBAL_NS_TAG,
-					      buffer, buf_size, 0,
-					      nvme_completion_poll_cb, status);
+					      async_event->buffer, buf_size, 0,
+					      nvme_ctrlr_clear_changed_ns_log_cb, async_event);
 
 	if (rc) {
 		NVME_CTRLR_ERRLOG(ctrlr, "spdk_nvme_ctrlr_cmd_get_log_page() failed: rc=%d\n", rc);
-		free(status);
-		goto free_buffer;
+		spdk_dma_free(buffer);
 	}
 
-	rc = nvme_wait_for_completion_timeout(ctrlr->adminq, status,
-					      ctrlr->opts.admin_timeout_ms * 1000);
-	if (!status->timed_out) {
-		free(status);
-	}
-
-	if (rc) {
-		NVME_CTRLR_ERRLOG(ctrlr, "wait for spdk_nvme_ctrlr_cmd_get_log_page failed: rc=%d\n", rc);
-		goto free_buffer;
-	}
-
-	/* only check the case of overflow. */
-	nsid = from_le32(buffer);
-	if (nsid == 0xffffffffu) {
-		NVME_CTRLR_WARNLOG(ctrlr, "changed ns log overflowed.\n");
-	}
-
-free_buffer:
-	spdk_dma_free(buffer);
 	return rc;
 }
 
 static void
-nvme_ctrlr_process_async_event(struct spdk_nvme_ctrlr *ctrlr,
-			       const struct spdk_nvme_cpl *cpl)
+nvme_ctrlr_process_async_event(struct spdk_nvme_ctrlr_aer_completion *async_event)
 {
+	struct spdk_nvme_ctrlr *ctrlr = async_event->ctrlr;
+	struct spdk_nvme_cpl *cpl = &async_event->cpl;
 	union spdk_nvme_async_event_completion event;
-	struct spdk_nvme_ctrlr_process *active_proc;
 	int rc;
 
 	event.raw = cpl->cdw0;
 
 	if ((event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
 	    (event.bits.async_event_info == SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED)) {
-		nvme_ctrlr_clear_changed_ns_log(ctrlr);
-
-		rc = nvme_ctrlr_identify_active_ns(ctrlr);
-		if (rc) {
+		if (nvme_ctrlr_clear_changed_ns_log(async_event) == 0) {
 			return;
 		}
-		nvme_ctrlr_update_namespaces(ctrlr);
-		nvme_io_msg_ctrlr_update(ctrlr);
 	}
 
 	if ((event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
@@ -3275,10 +3295,7 @@ nvme_ctrlr_process_async_event(struct spdk_nvme_ctrlr *ctrlr,
 		}
 	}
 
-	active_proc = nvme_ctrlr_get_current_process(ctrlr);
-	if (active_proc && active_proc->aer_cb_fn) {
-		active_proc->aer_cb_fn(active_proc->aer_cb_arg, cpl);
-	}
+	nvme_ctrlr_process_async_event_finish(async_event);
 }
 
 static void
@@ -3296,6 +3313,7 @@ nvme_ctrlr_queue_async_event(struct spdk_nvme_ctrlr *ctrlr,
 			NVME_CTRLR_ERRLOG(ctrlr, "Alloc nvme event failed, ignore the event\n");
 			return;
 		}
+		nvme_event->ctrlr = ctrlr;
 		nvme_event->cpl = *cpl;
 
 		STAILQ_INSERT_TAIL(&proc->async_events, nvme_event, link);
@@ -3313,9 +3331,7 @@ nvme_ctrlr_complete_queued_async_events(struct spdk_nvme_ctrlr *ctrlr)
 	STAILQ_FOREACH_SAFE(nvme_event, &active_proc->async_events, link, nvme_event_tmp) {
 		STAILQ_REMOVE(&active_proc->async_events, nvme_event,
 			      spdk_nvme_ctrlr_aer_completion, link);
-		nvme_ctrlr_process_async_event(ctrlr, &nvme_event->cpl);
-		spdk_free(nvme_event);
-
+		nvme_ctrlr_process_async_event(nvme_event);
 	}
 }
 

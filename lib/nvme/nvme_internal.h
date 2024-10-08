@@ -877,7 +877,21 @@ enum nvme_ctrlr_state {
 #define NVME_TIMEOUT_KEEP_EXISTING	UINT64_MAX
 
 struct spdk_nvme_ctrlr_aer_completion {
+	struct spdk_nvme_ctrlr	*ctrlr;
 	struct spdk_nvme_cpl	cpl;
+
+	/*
+	 * Pointer to the payload buffer for the get log page command to be
+	 * executed in the async handling of this completion event.
+	 */
+	char			*buffer;
+
+	/*
+	 * Counter to be used in the update of active namespaces to keep track
+	 * of how many ns construct executions have been started.
+	 */
+	uint32_t		ns_count;
+
 	STAILQ_ENTRY(spdk_nvme_ctrlr_aer_completion) link;
 };
 
