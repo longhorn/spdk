@@ -696,6 +696,15 @@ nvme_ns_construct(struct spdk_nvme_ns *ns, uint32_t id,
 	return 0;
 }
 
+int
+nvme_ns_construct_async(struct spdk_nvme_ns *ns, uint32_t id,
+			struct spdk_nvme_ctrlr *ctrlr,
+			nvme_ns_async_cb_fn cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+	return 0;
+}
+
 void
 spdk_pci_device_detach(struct spdk_pci_device *device)
 {

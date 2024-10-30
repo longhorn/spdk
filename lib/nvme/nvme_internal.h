@@ -1222,6 +1222,8 @@ int nvme_poll_group_connect_qpair(struct spdk_nvme_qpair *qpair);
 int nvme_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair);
 
 /* Admin functions */
+typedef void (*nvme_ns_async_cb_fn)(void *cb_arg, int status);
+
 int	nvme_ctrlr_cmd_identify(struct spdk_nvme_ctrlr *ctrlr,
 				uint8_t cns, uint16_t cntid, uint32_t nsid,
 				uint8_t csi, void *payload, size_t payload_size,
@@ -1332,6 +1334,9 @@ void	nvme_ns_free_iocs_specific_data(struct spdk_nvme_ns *ns);
 bool	nvme_ns_has_supported_iocs_specific_data(struct spdk_nvme_ns *ns);
 int	nvme_ns_construct(struct spdk_nvme_ns *ns, uint32_t id,
 			  struct spdk_nvme_ctrlr *ctrlr);
+int	nvme_ns_construct_async(struct spdk_nvme_ns *ns, uint32_t id,
+				struct spdk_nvme_ctrlr *ctrlr,
+				nvme_ns_async_cb_fn cb_fn, void *cb_arg);
 void	nvme_ns_destruct(struct spdk_nvme_ns *ns);
 int	nvme_ns_cmd_zone_append_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 					void *buffer, void *metadata, uint64_t zslba,

@@ -137,6 +137,52 @@ nvme_ctrlr_identify_ns(struct spdk_nvme_ns *ns)
 	return 0;
 }
 
+struct nvme_ns_async_ctx {
+	struct spdk_nvme_ns	*ns;
+	nvme_ns_async_cb_fn	cb_fn;
+	void			*cb_arg;
+};
+
+static void
+nvme_ctrlr_identify_ns_async_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_ns_async_ctx *ctx = arg;
+
+	nvme_ns_set_identify_data(ctx->ns);
+
+	ctx->cb_fn(ctx->cb_arg, 0);
+
+	free(ctx);
+}
+
+static int
+nvme_ctrlr_identify_ns_async(struct spdk_nvme_ns *ns, nvme_ns_async_cb_fn cb_fn, void *cb_arg)
+{
+	struct nvme_ns_async_ctx	*ctx;
+	struct spdk_nvme_ns_data	*nsdata;
+	int				rc;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("Failed to allocate status tracker\n");
+		return -ENOMEM;
+	}
+
+	ctx->ns = ns;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	nsdata = _nvme_ns_get_data(ns);
+	rc = nvme_ctrlr_cmd_identify(ns->ctrlr, SPDK_NVME_IDENTIFY_NS, 0, ns->id, 0,
+				     nsdata, sizeof(*nsdata),
+				     nvme_ctrlr_identify_ns_async_cb, ctx);
+	if (rc != 0) {
+		free(ctx);
+	}
+
+	return rc;
+}
+
 static int
 nvme_ctrlr_identify_ns_zns_specific(struct spdk_nvme_ns *ns)
 {
@@ -293,6 +339,54 @@ nvme_ctrlr_identify_id_desc(struct spdk_nvme_ns *ns)
 	}
 
 	nvme_ns_set_id_desc_list_data(ns);
+
+	return rc;
+}
+
+static void
+nvme_ctrlr_identify_id_desc_async_done(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_ns_async_ctx *ctx = arg;
+
+	nvme_ns_set_id_desc_list_data(ctx->ns);
+
+	ctx->cb_fn(ctx->cb_arg, 0);
+
+	free(ctx);
+}
+
+static int
+nvme_ctrlr_identify_id_desc_async(struct spdk_nvme_ns *ns, nvme_ns_async_cb_fn cb_fn, void *cb_arg)
+{
+	struct nvme_ns_async_ctx	*ctx;
+	int                                     rc;
+
+	memset(ns->id_desc_list, 0, sizeof(ns->id_desc_list));
+
+	if ((ns->ctrlr->vs.raw < SPDK_NVME_VERSION(1, 3, 0) &&
+	     !(ns->ctrlr->cap.bits.css & SPDK_NVME_CAP_CSS_IOCS)) ||
+	    (ns->ctrlr->quirks & NVME_QUIRK_IDENTIFY_CNS)) {
+		SPDK_DEBUGLOG(nvme, "Version < 1.3; not attempting to retrieve NS ID Descriptor List\n");
+		return 0;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("Failed to allocate status tracker\n");
+		return -ENOMEM;
+	}
+
+	ctx->ns = ns;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	SPDK_DEBUGLOG(nvme, "Attempting to retrieve NS ID Descriptor List\n");
+	rc = nvme_ctrlr_cmd_identify(ns->ctrlr, SPDK_NVME_IDENTIFY_NS_ID_DESCRIPTOR_LIST, 0, ns->id,
+				     0, ns->id_desc_list, sizeof(ns->id_desc_list),
+				     nvme_ctrlr_identify_id_desc_async_done, ctx);
+	if (rc < 0) {
+		free(ctx);
+	}
 
 	return rc;
 }
@@ -641,6 +735,74 @@ nvme_ns_construct(struct spdk_nvme_ns *ns, uint32_t id,
 	}
 
 	return 0;
+}
+
+static void
+nvme_ns_construct_async_identify_id_desc_done(void *cb_arg, int status)
+{
+	struct nvme_ns_async_ctx *ctx = cb_arg;
+	struct spdk_nvme_ns *ns = ctx->ns;
+	int rc = 0;
+
+	if (nvme_ctrlr_multi_iocs_enabled(ns->ctrlr) &&
+	    nvme_ns_has_supported_iocs_specific_data(ns)) {
+		rc = nvme_ctrlr_identify_ns_iocs_specific(ns);
+	}
+
+	ctx->cb_fn(ctx->cb_arg, rc);
+	free(ctx);
+}
+
+static void
+nvme_ns_construct_async_identify_ns_done(void *cb_arg, int status)
+{
+	struct nvme_ns_async_ctx *ctx = cb_arg;
+	struct spdk_nvme_ns *ns = ctx->ns;
+	int rc;
+
+	/* skip Identify NS ID Descriptor List for inactive NS */
+	if (!spdk_nvme_ns_is_active(ns)) {
+		ctx->cb_fn(ctx->cb_arg, 0);
+		free(ctx);
+		return;
+	}
+
+	rc = nvme_ctrlr_identify_id_desc_async(ns, nvme_ns_construct_async_identify_id_desc_done, ctx);
+	if (rc != 0) {
+		ctx->cb_fn(ctx->cb_arg, rc);
+		free(ctx);
+		return;
+	}
+}
+
+int
+nvme_ns_construct_async(struct spdk_nvme_ns *ns, uint32_t id,
+			struct spdk_nvme_ctrlr *ctrlr,
+			nvme_ns_async_cb_fn cb_fn, void *cb_arg)
+{
+	struct nvme_ns_async_ctx	*ctx;
+	int				rc;
+
+	assert(id > 0);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("Failed to allocate status tracker\n");
+		return -ENOMEM;
+	}
+
+	ctx->ns = ns;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	ns->ctrlr = ctrlr;
+	ns->id = id;
+	/* This will be overwritten when reading ANA log page. */
+	ns->ana_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
+
+	rc = nvme_ctrlr_identify_ns_async(ns, nvme_ns_construct_async_identify_ns_done, ctx);
+
+	return rc;
 }
 
 void

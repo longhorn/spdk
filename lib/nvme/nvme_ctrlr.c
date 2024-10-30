@@ -3240,20 +3240,55 @@ nvme_ctrlr_process_async_event_finish(struct spdk_nvme_ctrlr_aer_completion *asy
 }
 
 static void
+nvme_ctrlr_ns_attr_changed_namespaces_updated(void *arg, int status)
+{
+	struct spdk_nvme_ctrlr_aer_completion *async_event = arg;
+	struct spdk_nvme_ctrlr *ctrlr = async_event->ctrlr;
+
+	if (status) {
+		nvme_ctrlr_process_async_event_finish(async_event);
+		return;
+	}
+
+	if (--async_event->ns_count == 0) {
+		nvme_io_msg_ctrlr_update(ctrlr);
+		nvme_ctrlr_process_async_event_finish(async_event);
+	}
+}
+
+static void
+nvme_ctrlr_update_namespaces_async(struct spdk_nvme_ctrlr *ctrlr, nvme_ns_async_cb_fn cb_fn,
+				   void *cb_arg)
+{
+	uint32_t nsid;
+	struct spdk_nvme_ns *ns;
+
+	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
+	     nsid != 0; nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
+		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+		nvme_ns_construct_async(ns, nsid, ctrlr, cb_fn, cb_arg);
+	}
+}
+
+static void
 nvme_ctrlr_reenumerate_active_ns(void *cb_arg, int status)
 {
 	struct spdk_nvme_ctrlr_aer_completion *async_event = cb_arg;
 	struct spdk_nvme_ctrlr *ctrlr = async_event->ctrlr;
+	uint32_t nsid;
 
 	if (status) {
-		goto out;
+		nvme_ctrlr_process_async_event_finish(async_event);
+		return;
 	}
 
-	nvme_ctrlr_update_namespaces(ctrlr);
-	nvme_io_msg_ctrlr_update(ctrlr);
+	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
+	     nsid != 0; nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
+		async_event->ns_count++;
+	}
 
-out:
-	nvme_ctrlr_process_async_event_finish(async_event);
+	nvme_ctrlr_update_namespaces_async(ctrlr, nvme_ctrlr_ns_attr_changed_namespaces_updated,
+					   async_event);
 }
 
 static void
