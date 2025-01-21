@@ -82,6 +82,14 @@ enum spdk_blob_state {
 	 */
 	SPDK_BLOB_STATE_DIRTY,
 
+	/* The blob in-memory version does not match the on-disk
+	 * version because xattrs have been added or updated.
+	 * This state is used to add or update xattrs to read
+	 * only blobs, for which it is not possible to change
+	 * other blob metadata.
+	 */
+	SPDK_BLOB_STATE_DIRTY_XATTR,
+
 	/* The blob in memory version of the blob matches the on disk
 	 * version.
 	 */

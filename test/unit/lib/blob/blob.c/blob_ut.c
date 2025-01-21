@@ -2248,6 +2248,27 @@ blob_xattr(void)
 	CU_ASSERT(value_len == 8);
 	blob->md_ro = false;
 
+	/* set_xattr, for both add and update xattrs, should still work even if md_ro flag is set. */
+	value = NULL;
+	blob->md_ro = true;
+	length = 4567;
+	rc = spdk_blob_set_xattr(blob, "length", &length, sizeof(length));
+	CU_ASSERT(rc == 0);
+	rc = spdk_blob_get_xattr_value(blob, "length", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(value != NULL);
+	CU_ASSERT(*(uint64_t *)value == length);
+	CU_ASSERT(value_len == 8);
+	length = 5678;
+	rc = spdk_blob_set_xattr(blob, "length2", &length, sizeof(length));
+	CU_ASSERT(rc == 0);
+	rc = spdk_blob_get_xattr_value(blob, "length2", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(value != NULL);
+	CU_ASSERT(*(uint64_t *)value == length);
+	CU_ASSERT(value_len == 8);
+	blob->md_ro = false;
+
 	rc = spdk_blob_get_xattr_value(blob, "foobar", &value, &value_len);
 	CU_ASSERT(rc == -ENOENT);
 
@@ -2255,7 +2276,7 @@ blob_xattr(void)
 	rc = spdk_blob_get_xattr_names(blob, &names);
 	CU_ASSERT(rc == 0);
 	SPDK_CU_ASSERT_FATAL(names != NULL);
-	CU_ASSERT(spdk_xattr_names_get_count(names) == 2);
+	CU_ASSERT(spdk_xattr_names_get_count(names) == 3);
 	name1 = spdk_xattr_names_get_name(names, 0);
 	SPDK_CU_ASSERT_FATAL(name1 != NULL);
 	CU_ASSERT(!strcmp(name1, "name") || !strcmp(name1, "length"));

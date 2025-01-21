@@ -452,6 +452,9 @@ show_blob(struct cli_context_t *cli_context)
 	case SPDK_BLOB_STATE_DIRTY:
 		printf("state: DIRTY\n");
 		break;
+	case SPDK_BLOB_STATE_DIRTY_XATTR:
+		printf("state: DIRTY XATTR\n");
+		break;
 	case SPDK_BLOB_STATE_CLEAN:
 		printf("state: CLEAN\n");
 		break;
