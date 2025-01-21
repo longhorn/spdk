@@ -35,9 +35,10 @@ function test_set_xattr() {
 	value=$(rpc_cmd bdev_lvol_get_xattr "$lvol_uuid" "foo")
 	[ "\"bar\"" = "$value" ]
 
-	# Snapshot is read-only, so setting xattr should fail
+	# Snapshot is read-only, but setting xattr is permitted
 	snapshot_uuid=$(rpc_cmd bdev_lvol_snapshot lvs_test/lvol_test lvol_snapshot)
-	NOT rpc_cmd bdev_lvol_set_xattr "$snapshot_uuid" "foo" "bar"
+	rpc_cmd bdev_lvol_set_xattr "$snapshot_uuid" "foo" "bar"
+	rpc_cmd bdev_lvol_set_xattr "$snapshot_uuid" "foo" "bar2"
 
 	# Create snapshot with xattr
 	snapshotx_uuid=$(rpc_cmd bdev_lvol_snapshot --xattr snapshot_timestamp=2024-01-16T16:06:46Z lvs_test/lvol_test lvol_snapshotx)
