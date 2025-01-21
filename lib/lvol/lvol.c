@@ -1812,12 +1812,6 @@ spdk_lvol_set_xattr(struct spdk_lvol *lvol, const char *name, const char *value,
 	struct spdk_lvol_req *req;
 	int rc;
 
-	if (spdk_blob_is_read_only(blob)) {
-		SPDK_ERRLOG("Cannot set xattr to read only lvol\n");
-		cb_fn(cb_arg, -EPERM);
-		return;
-	}
-
 	req = calloc(1, sizeof(*req));
 	if (!req) {
 		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
