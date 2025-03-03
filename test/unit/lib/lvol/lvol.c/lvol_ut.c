@@ -300,6 +300,7 @@ spdk_bs_blob_set_external_parent(struct spdk_blob_store *bs, spdk_blob_id blob_i
 void
 spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			  spdk_blob_id blob_id, const char *xattr_name,
+			  spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
 			  spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	g_checksum_registered = true;

@@ -158,6 +158,18 @@ typedef int (*spdk_bs_esnap_dev_create)(void *bs_ctx, void *blob_ctx, struct spd
  */
 typedef void (*spdk_blob_shallow_copy_status)(uint64_t copied_clusters, void *cb_arg);
 
+/**
+ * Snapshot checksum stop callback.
+ *
+ * This callback inform the snapshot checksum compute operation if it can proceed or if
+ * it must abort.
+ *
+ * \param cb_arg callback argument.
+ *
+ * \return true to stop the operation, false to let it to continue.
+ */
+typedef bool (*spdk_snapshot_checksum_stop)(void *cb_arg);
+
 struct spdk_bs_dev_cb_args {
 	spdk_bs_dev_cpl		cb_fn;
 	struct spdk_io_channel	*channel;
@@ -888,11 +900,14 @@ void spdk_bs_blob_set_external_parent(struct spdk_blob_store *bs, spdk_blob_id b
  * \param bs Blobstore.
  * \param blobid Id of blob.
  * \param xattr_name Name of the extended attribute.
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
 void spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			       spdk_blob_id blob_id, const char *xattr_name,
+			       spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
 			       spdk_blob_op_complete cb_fn, void *cb_arg);
 
 struct spdk_blob_open_opts {

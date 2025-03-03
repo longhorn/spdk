@@ -2828,7 +2828,7 @@ spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot, spdk_lvol_op_co
 	blob_id = spdk_blob_get_id(snapshot->blob);
 
 	spdk_bs_snapshot_checksum(snapshot->lvol_store->blobstore, req->channel, blob_id,
-				  LVOL_SNAPSHOT_CHECKSUM, lvol_snapshot_checksum_cb, req);
+				  LVOL_SNAPSHOT_CHECKSUM, NULL, NULL, lvol_snapshot_checksum_cb, req);
 }
 
 int

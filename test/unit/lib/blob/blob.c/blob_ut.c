@@ -209,6 +209,12 @@ blob_shallow_copy_status_cb(uint64_t copied_clusters, void *cb_arg)
 	g_copied_clusters_count = copied_clusters;
 }
 
+static bool
+blob_snapshot_checksum_stop_cb(void *cb_arg)
+{
+	return true;
+}
+
 static void
 ut_bs_reload(struct spdk_blob_store **bs, struct spdk_bs_opts *opts)
 {
@@ -10004,7 +10010,7 @@ snapshot_checksum(void)
 
 
 	/* Compute checksum on blob that is not a snapshot */
-	spdk_bs_snapshot_checksum(bs, blob_ch, blobid, xattr_name, blob_op_complete, NULL);
+	spdk_bs_snapshot_checksum(bs, blob_ch, blobid, xattr_name, NULL, NULL, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EPERM);
 
@@ -10020,8 +10026,14 @@ snapshot_checksum(void)
 	snap = g_blob;
 	CU_ASSERT(snap->md_ro == true);
 
+	/* Start and stop a snapshot checksum computing */
+	spdk_bs_snapshot_checksum(bs, blob_ch, snapid, xattr_name, blob_snapshot_checksum_stop_cb, NULL,
+				  blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINTR);
+
 	/* Compute and store checksum of a snapshot */
-	spdk_bs_snapshot_checksum(bs, blob_ch, snapid, xattr_name, blob_op_complete, NULL);
+	spdk_bs_snapshot_checksum(bs, blob_ch, snapid, xattr_name, NULL, NULL, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -0);
 

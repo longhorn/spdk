@@ -7925,6 +7925,12 @@ struct snapshot_checksum_ctx {
 
 	/* Name of the xattr where to store the checksum */
 	const char *xattr_name;
+
+	/* Stop callback to abort the operation */
+	spdk_snapshot_checksum_stop stop_cb;
+
+	/* Argument passed to function stop_cb */
+	void *stop_cb_arg;
 };
 
 static void
@@ -8005,6 +8011,15 @@ bs_snapshot_checksum_cluster_find_next(void *cb_arg)
 	struct snapshot_checksum_ctx *ctx = cb_arg;
 	struct spdk_blob *_blob = ctx->blob;
 
+	/* Check if the operation must terminate ahead of time */
+	if (ctx->stop_cb && ctx->stop_cb(ctx->stop_cb_arg)) {
+		SPDK_WARNLOG("blob 0x%" PRIx64 " snapshot checksum, operation interrupted\n", ctx->blob->id);
+		ctx->bserrno = -EINTR;
+		_blob->locked_operation_in_progress = false;
+		spdk_blob_close(_blob, bs_snapshot_checksum_cleanup_finish, ctx);
+		return;
+	}
+
 	while (ctx->cluster < _blob->active.num_clusters) {
 		if (_blob->active.clusters[ctx->cluster] != 0) {
 			break;
@@ -8061,6 +8076,7 @@ bs_snapshot_checksum_blob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bs
 void
 spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			  spdk_blob_id blob_id, const char *xattr_name,
+			  spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
 			  spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct snapshot_checksum_ctx *ctx;
@@ -8077,6 +8093,8 @@ spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *ch
 	ctx->cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	ctx->cpl.u.bs_basic.cb_fn = cb_fn;
 	ctx->cpl.u.bs_basic.cb_arg = cb_arg;
+	ctx->stop_cb = stop_cb_fn;
+	ctx->stop_cb_arg = stop_cb_arg;
 	ctx->bserrno = 0;
 	ctx->blob_channel = channel;
 	ctx->read_buff = spdk_malloc(bs->cluster_sz, bs->dev->blocklen, NULL,
