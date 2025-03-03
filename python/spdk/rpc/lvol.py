@@ -367,6 +367,18 @@ def bdev_lvol_get_snapshot_checksum(client, name):
     return client.call('bdev_lvol_get_snapshot_checksum', params)
 
 
+def bdev_lvol_stop_snapshot_checksum(client, name):
+    """Stop the registration of a snapshot's checksum.
+
+    Args:
+        name: name of the snapshot
+    """
+    params = {
+        'name': name,
+    }
+    return client.call('bdev_lvol_stop_snapshot_checksum', params)
+
+
 def bdev_lvol_delete_lvstore(client, uuid=None, lvs_name=None):
     """Destroy a logical volume store.
 

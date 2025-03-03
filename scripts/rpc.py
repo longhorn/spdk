@@ -2293,6 +2293,14 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('name', help='snapshot bdev name')
     p.set_defaults(func=bdev_lvol_get_snapshot_checksum)
 
+    def bdev_lvol_stop_snapshot_checksum(args):
+        rpc.lvol.bdev_lvol_stop_snapshot_checksum(args.client,
+                                                      name=args.name)
+
+    p = subparsers.add_parser('bdev_lvol_stop_snapshot_checksum', help='Stop the registration of a snapshot\'s checksum')
+    p.add_argument('name', help='snapshot bdev name')
+    p.set_defaults(func=bdev_lvol_stop_snapshot_checksum)
+
     def bdev_lvol_delete_lvstore(args):
         rpc.lvol.bdev_lvol_delete_lvstore(args.client,
                                           uuid=args.uuid,
