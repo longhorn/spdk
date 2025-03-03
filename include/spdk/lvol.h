@@ -512,11 +512,14 @@ void spdk_lvol_set_external_parent(struct spdk_lvol *lvol, const void *esnap_id,
  * The snapshot must have the option to add and update xattrs after its creation enabled.
  *
  * \param lvol Handle to snapshot
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
  * \param cb_fn Completion callback
  * \param cb_arg Completion callback custom arguments
  */
-void spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot, spdk_lvol_op_complete cb_fn,
-		void *cb_arg);
+void spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /**
  * Get snapshot's stored checksum.

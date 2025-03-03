@@ -2790,8 +2790,9 @@ lvol_snapshot_checksum_cb(void *cb_arg, int lvolerrno)
 }
 
 void
-spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot, spdk_lvol_op_complete cb_fn,
-				     void *cb_arg)
+spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot,
+				     spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+				     spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_req *req;
 	spdk_blob_id blob_id;
@@ -2828,7 +2829,7 @@ spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot, spdk_lvol_op_co
 	blob_id = spdk_blob_get_id(snapshot->blob);
 
 	spdk_bs_snapshot_checksum(snapshot->lvol_store->blobstore, req->channel, blob_id,
-				  LVOL_SNAPSHOT_CHECKSUM, NULL, NULL, lvol_snapshot_checksum_cb, req);
+				  LVOL_SNAPSHOT_CHECKSUM, stop_cb_fn, stop_cb_arg, lvol_snapshot_checksum_cb, req);
 }
 
 int

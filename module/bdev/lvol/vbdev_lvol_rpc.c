@@ -2067,7 +2067,8 @@ rpc_bdev_lvol_register_snapshot_checksum(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	spdk_lvol_register_snapshot_checksum(lvol, rpc_bdev_lvol_register_snapshot_checksum_cb, request);
+	spdk_lvol_register_snapshot_checksum(lvol, NULL, NULL, rpc_bdev_lvol_register_snapshot_checksum_cb,
+					     request);
 
 cleanup:
 	free_rpc_bdev_snapshot_checksum(&req);

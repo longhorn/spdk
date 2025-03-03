@@ -3753,15 +3753,15 @@ lvol_snapshot_checksum(void)
 	CU_ASSERT(rc == -ENOENT);
 
 	/* Register checksum with null lvol */
-	spdk_lvol_register_snapshot_checksum(NULL, op_complete, NULL);
+	spdk_lvol_register_snapshot_checksum(NULL, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(g_lvserrno == -EINVAL);
 
 	/* Successful register checksum */
-	spdk_lvol_register_snapshot_checksum(g_lvol, op_complete, NULL);
+	spdk_lvol_register_snapshot_checksum(g_lvol, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(g_lvserrno == 0);
 
 	/* Register again the checksum */
-	spdk_lvol_register_snapshot_checksum(g_lvol, op_complete, NULL);
+	spdk_lvol_register_snapshot_checksum(g_lvol, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(g_lvserrno == 0);
 
 	/* Get checksum with null lvol */
