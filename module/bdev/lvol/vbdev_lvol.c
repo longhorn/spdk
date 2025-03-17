@@ -792,6 +792,13 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 
+	/* Check if blob is locked by another operation */
+	if (spdk_blob_is_locked(lvol->blob)) {
+		SPDK_ERRLOG("Cannot delete lvol %s, blob is locked\n", lvol->name);
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
 	_vbdev_lvol_destroy(lvol, cb_fn, cb_arg);
 }
 

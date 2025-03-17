@@ -60,6 +60,7 @@ DEFINE_STUB(spdk_blob_get_esnap_bs_dev, struct spdk_bs_dev *, (const struct spdk
 DEFINE_STUB(spdk_lvol_is_degraded, bool, (const struct spdk_lvol *lvol), false);
 DEFINE_STUB_V(spdk_bs_free_io_channel, (struct spdk_io_channel *channel));
 DEFINE_STUB(spdk_blob_get_num_allocated_clusters, uint64_t, (struct spdk_blob *blob), 0);
+DEFINE_STUB(spdk_blob_is_locked, bool, (const struct spdk_blob *blob), false);
 
 struct spdk_blob {
 	uint64_t	id;
