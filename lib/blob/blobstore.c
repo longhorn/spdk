@@ -9817,6 +9817,13 @@ spdk_blob_is_esnap_clone(const struct spdk_blob *blob)
 	return blob_is_esnap_clone(blob);
 }
 
+bool
+spdk_blob_is_locked(const struct spdk_blob *blob)
+{
+	assert(blob != NULL);
+	return blob->locked_operation_in_progress;
+}
+
 static void
 blob_update_clear_method(struct spdk_blob *blob)
 {
