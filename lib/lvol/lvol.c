@@ -175,6 +175,21 @@ lvol_dup_xattr_list(const char *const *xattrs, size_t xattr_num)
 	return copy;
 }
 
+static bool
+lvol_check_exteranl_xattr_name(const char *name)
+{
+	char *internal_xattr_names[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME, LVOL_SNAPSHOT_CHECKSUM};
+	size_t i;
+
+	for (i = 0; i < SPDK_COUNTOF(internal_xattr_names); i++) {
+		if (strcmp(name, internal_xattr_names[i]) == 0) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static void
 lvol_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 {
@@ -1518,6 +1533,7 @@ spdk_lvol_create_snapshot_with_xattrs(struct spdk_lvol *origlvol, const char *sn
 	char **xattr_external_dup;
 	char *xattr_names_internal[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME};
 	int rc;
+	size_t i;
 
 	if (origlvol == NULL) {
 		SPDK_INFOLOG(lvol, "Lvol not provided.\n");
@@ -1534,6 +1550,19 @@ spdk_lvol_create_snapshot_with_xattrs(struct spdk_lvol *origlvol, const char *sn
 		SPDK_ERRLOG("Xattr list must contain couples of key-value\n");
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
+	}
+
+	/* 
+	 * Elements inside xattrs_external are as the following example:
+	 * [xattr1_name, xattr1_value, xattr2_name, xattr2_value, ...]
+	 * So xattr names are in even position.
+	 */
+	for (i = 0; i < xattrs_external_num; i += 2) {
+		if (!lvol_check_exteranl_xattr_name(xattrs_external[i])) {
+			SPDK_ERRLOG("Invalid xattr name: %s\n", xattrs_external[i]);
+			cb_fn(cb_arg, NULL, -EINVAL);
+			return;
+		}
 	}
 
 	origblob = origlvol->blob;
@@ -1811,6 +1840,12 @@ spdk_lvol_set_xattr(struct spdk_lvol *lvol, const char *name, const char *value,
 	struct spdk_blob *blob = lvol->blob;
 	struct spdk_lvol_req *req;
 	int rc;
+
+	if (!lvol_check_exteranl_xattr_name(name)) {
+		SPDK_ERRLOG("Invalid xattr name: %s\n", name);
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
 
 	req = calloc(1, sizeof(*req));
 	if (!req) {

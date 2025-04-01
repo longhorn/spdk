@@ -1656,6 +1656,7 @@ lvol_snapshot_xattr(void)
 	struct spdk_lvs_opts opts;
 	int rc = 0;
 	char *xattrs[] = {"snapshot_timestamp", "2024-01-16T16:06:46Z", "user_created", "true"};
+	char *xattrs_invalid[] = {"snapshot_timestamp", "2024-01-16T16:06:46Z", "checksum", "10"};
 	char *xattrs_bad[] = {"snapshot_timestamp"};
 	const char *value = NULL;
 	size_t value_len = 0;
@@ -1697,6 +1698,13 @@ lvol_snapshot_xattr(void)
 	/* With a bad xattrs list */
 	g_lvol = NULL;
 	spdk_lvol_create_snapshot_with_xattrs(lvol, "snap_x", (const char *const *)&xattrs_bad, 1,
+					      lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EINVAL);
+	CU_ASSERT(g_lvol == NULL);
+
+	/* With an invalid xattrs list */
+	g_lvol = NULL;
+	spdk_lvol_create_snapshot_with_xattrs(lvol, "snap_x", (const char *const *)&xattrs_invalid, 4,
 					      lvol_op_with_handle_complete, NULL);
 	CU_ASSERT(g_lvserrno == -EINVAL);
 	CU_ASSERT(g_lvol == NULL);
