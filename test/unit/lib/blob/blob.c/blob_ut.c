@@ -3674,6 +3674,139 @@ blob_serialize_test(void)
 	g_bs = NULL;
 }
 
+/* Try to serialize/deserialize a blob with a checksum array that doesn't fit into a single page */
+static void
+blob_serialize_checksums_test(void)
+{
+	struct spdk_bs_dev *dev;
+	struct spdk_bs_opts opts;
+	struct spdk_blob_store *bs;
+	struct spdk_blob_opts blob_opts;
+	spdk_blob_id blobid;
+	struct spdk_blob *blob;
+	uint64_t i;
+
+	dev = init_dev();
+
+	/* Initialize a new blobstore */
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	spdk_bs_init(dev, &opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	/* Create and open one blob */
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.thin_provision = true;
+	blob_opts.num_clusters = 5;
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	blobid = spdk_blob_get_id(blob);
+
+	/* Construct blob clusters_checksums array */
+	blob->clusters_checksums = calloc(5, sizeof(*blob->clusters_checksums));
+	blob->num_clusters_checksums = 5;
+	blob->clusters_checksums[0] = 1234567890;
+	blob->clusters_checksums[4] = 9876543210;
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Close the blob */
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Reload blobstore */
+	ut_bs_reload(&bs, &opts);
+
+	blob = NULL;
+
+	/* Reopen the blob */
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blob != NULL);
+	blob = g_blob;
+
+	CU_ASSERT(blob->clusters_checksums != NULL);
+	CU_ASSERT(blob->num_clusters_checksums == 5);
+	CU_ASSERT(blob->clusters_checksums[0] == 1234567890);
+	CU_ASSERT(blob->clusters_checksums[1] == 0);
+	CU_ASSERT(blob->clusters_checksums[2] == 0);
+	CU_ASSERT(blob->clusters_checksums[3] == 0);
+	CU_ASSERT(blob->clusters_checksums[4] == 9876543210);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/*
+	 * Now make again the same test but with a blob that have a clusters_checksums array so great
+	 * that it doesn't fit into a single page when serialized, so more than one page is needed.
+	 */
+
+	/* Create and open one blob */
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.thin_provision = true;
+	blob_opts.num_clusters = 600;
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	blobid = spdk_blob_get_id(blob);
+
+	/* Construct blob clusters_checksums array */
+	blob->clusters_checksums = calloc(600, sizeof(*blob->clusters_checksums));
+	blob->num_clusters_checksums = 600;
+	blob->clusters_checksums[0] = 1234567890;
+	blob->clusters_checksums[4] = 9876543210;
+	for (i = 5; i < 600; i++) {
+		blob->clusters_checksums[i] = i;
+	}
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Close the blob */
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Reload blobstore */
+	ut_bs_reload(&bs, &opts);
+
+	blob = NULL;
+
+	/* Reopen the blob */
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blob != NULL);
+	blob = g_blob;
+
+	CU_ASSERT(blob->clusters_checksums != NULL);
+	CU_ASSERT(blob->num_clusters_checksums == 600);
+	CU_ASSERT(blob->clusters_checksums[0] == 1234567890);
+	CU_ASSERT(blob->clusters_checksums[1] == 0);
+	CU_ASSERT(blob->clusters_checksums[2] == 0);
+	CU_ASSERT(blob->clusters_checksums[3] == 0);
+	CU_ASSERT(blob->clusters_checksums[4] == 9876543210);
+	for (i = 5; i < 600; i++) {
+		CU_ASSERT(blob->clusters_checksums[i] == i);
+	}
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+}
+
 static void
 blob_crc(void)
 {
@@ -10301,6 +10434,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, bs_grow_live_no_space);
 		CU_ADD_TEST(suite, bs_test_grow);
 		CU_ADD_TEST(suite, blob_serialize_test);
+		CU_ADD_TEST(suite, blob_serialize_checksums_test);
 		CU_ADD_TEST(suite_bs, blob_crc);
 		CU_ADD_TEST(suite, super_block_crc);
 		CU_ADD_TEST(suite_blob, blob_dirty_shutdown);

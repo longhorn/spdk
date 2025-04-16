@@ -368,6 +368,7 @@ blob_free(struct spdk_blob *blob)
 	free(blob->clean.clusters);
 	free(blob->active.pages);
 	free(blob->clean.pages);
+	free(blob->clusters_checksums);
 
 	xattrs_free(&blob->xattrs);
 	xattrs_free(&blob->xattrs_internal);
@@ -921,6 +922,44 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			if (rc != 0) {
 				return rc;
 			}
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_CHECKSUM) {
+			struct spdk_blob_md_descriptor_clusters_checksums	*desc_checksum;
+			unsigned int				i, j;
+			unsigned int				cluster_count = blob->num_clusters_checksums;
+
+			desc_checksum = (struct spdk_blob_md_descriptor_clusters_checksums *)desc;
+
+			if (desc_checksum->length == 0 ||
+			    (desc_checksum->length % sizeof(desc_checksum->checksums[0]) != 0)) {
+				return -EINVAL;
+			}
+
+			for (i = 0; i < desc_checksum->length / sizeof(desc_checksum->checksums[0]); i++) {
+				for (j = 0; j < desc_checksum->checksums[i].length; j++) {
+					cluster_count++;
+				}
+			}
+
+			if (cluster_count == 0) {
+				return -EINVAL;
+			}
+			tmp = realloc(blob->clusters_checksums, cluster_count * sizeof(*blob->clusters_checksums));
+			if (tmp == NULL) {
+				return -ENOMEM;
+			}
+			blob->clusters_checksums = tmp;
+
+			for (i = 0; i < desc_checksum->length / sizeof(desc_checksum->checksums[0]); i++) {
+				for (j = 0; j < desc_checksum->checksums[i].length; j++) {
+					if (desc_checksum->checksums[i].checksum != 0) {
+						blob->clusters_checksums[blob->num_clusters_checksums++] = desc_checksum->checksums[i].checksum;
+					} else if (spdk_blob_is_thin_provisioned(blob)) {
+						blob->clusters_checksums[blob->num_clusters_checksums++] = 0;
+					} else {
+						return -EINVAL;
+					}
+				}
+			}
 		} else {
 			/* Unrecognized descriptor type.  Do not fail - just continue to the
 			 *  next descriptor.  If this descriptor is associated with some feature
@@ -1367,6 +1406,94 @@ blob_serialize_xattrs(const struct spdk_blob *blob,
 	return 0;
 }
 
+static void
+blob_serialize_checksums(const struct spdk_blob *blob,
+			 uint64_t start_cluster, uint64_t *next_cluster,
+			 uint8_t **buf, size_t *buf_sz)
+{
+	struct spdk_blob_md_descriptor_clusters_checksums *desc_checksums;
+	size_t cur_sz;
+	uint64_t i, checksum_idx;
+	uint64_t checksum, checksum_count;
+
+	/* The buffer must have room for at least one checksum */
+	cur_sz = sizeof(struct spdk_blob_md_descriptor) + sizeof(desc_checksums->checksums[0]);
+	if (*buf_sz < cur_sz) {
+		*next_cluster = start_cluster;
+		return;
+	}
+
+	desc_checksums = (struct spdk_blob_md_descriptor_clusters_checksums *)*buf;
+	desc_checksums->type = SPDK_MD_DESCRIPTOR_TYPE_CHECKSUM;
+
+	checksum = blob->clusters_checksums[start_cluster];
+	checksum_count = 1;
+	checksum_idx = 0;
+	for (i = start_cluster + 1; i < blob->num_clusters_checksums; i++) {
+		if (checksum == 0 && blob->clusters_checksums[i] == 0) {
+			/* Run-length encode unallocated clusters */
+			checksum_count++;
+			continue;
+		}
+		desc_checksums->checksums[checksum_idx].checksum = checksum;
+		desc_checksums->checksums[checksum_idx].length = checksum_count;
+		checksum_idx++;
+
+		cur_sz += sizeof(desc_checksums->checksums[checksum_idx]);
+
+		if (*buf_sz < cur_sz) {
+			/* If we ran out of buffer space, return */
+			*next_cluster = i;
+			break;
+		}
+
+		checksum = blob->clusters_checksums[i];
+		checksum_count = 1;
+	}
+
+	if (*buf_sz >= cur_sz) {
+		desc_checksums->checksums[checksum_idx].checksum = checksum;
+		desc_checksums->checksums[checksum_idx].length = checksum_count;
+		checksum_idx++;
+
+		*next_cluster = blob->num_clusters_checksums;
+	}
+
+	desc_checksums->length = sizeof(desc_checksums->checksums[0]) * checksum_idx;
+	*buf_sz -= sizeof(struct spdk_blob_md_descriptor) + desc_checksums->length;
+	*buf += sizeof(struct spdk_blob_md_descriptor) + desc_checksums->length;
+}
+
+static int
+blob_serialize_clusters_checksums(const struct spdk_blob *blob,
+				  struct spdk_blob_md_page **pages,
+				  struct spdk_blob_md_page *cur_page,
+				  uint32_t *page_count, uint8_t **buf,
+				  size_t *remaining_sz)
+{
+	uint64_t				last_cluster;
+	int					rc;
+
+	last_cluster = 0;
+	while (last_cluster < blob->num_clusters_checksums) {
+		blob_serialize_checksums(blob, last_cluster, &last_cluster, buf, remaining_sz);
+
+		if (last_cluster == blob->num_clusters_checksums) {
+			break;
+		}
+
+		rc = blob_serialize_add_page(blob, pages, page_count, &cur_page);
+		if (rc < 0) {
+			return rc;
+		}
+
+		*buf = (uint8_t *)cur_page->descriptors;
+		*remaining_sz = sizeof(cur_page->descriptors);
+	}
+
+	return 0;
+}
+
 static int
 blob_serialize(const struct spdk_blob *blob, struct spdk_blob_md_page **pages,
 	       uint32_t *page_count)
@@ -1417,6 +1544,15 @@ blob_serialize(const struct spdk_blob *blob, struct spdk_blob_md_page **pages,
 	} else {
 		/* Serialize extents */
 		rc = blob_serialize_extents_rle(blob, pages, cur_page, page_count, &buf, &remaining_sz);
+	}
+
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Serialize the array containing the checksums of all clusters */
+	if (blob->clusters_checksums) {
+		rc = blob_serialize_clusters_checksums(blob, pages, cur_page, page_count, &buf, &remaining_sz);
 	}
 
 	return rc;
@@ -4606,6 +4742,8 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 					}
 				}
 			}
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_CHECKSUM) {
+			/* Skip this item */
 		} else {
 			/* Error */
 			return -EINVAL;
@@ -5331,6 +5469,22 @@ bs_dump_print_md_page(struct spdk_bs_load_ctx *ctx)
 			bs_dump_print_type_flags(ctx, desc);
 		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE) {
 			bs_dump_print_extent_table(ctx, desc);
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_CHECKSUM) {
+			struct spdk_blob_md_descriptor_clusters_checksums	*desc_checksum;
+			unsigned int				i;
+
+			desc_checksum = (struct spdk_blob_md_descriptor_clusters_checksums *)desc;
+
+			for (i = 0; i < desc_checksum->length / sizeof(desc_checksum->checksums[0]); i++) {
+				if (desc_checksum->checksums[i].checksum != 0) {
+					fprintf(ctx->fp, "Allocated Checksum: %" PRIu64,
+						desc_checksum->checksums[i].checksum);
+				} else {
+					fprintf(ctx->fp, "Unallocated Checksum - ");
+				}
+				fprintf(ctx->fp, " Length: %" PRIu32, desc_checksum->checksums[i].length);
+				fprintf(ctx->fp, "\n");
+			}
 		} else {
 			/* Error */
 			fprintf(ctx->fp, "Unknown descriptor type %" PRIu8 "\n", desc->type);
