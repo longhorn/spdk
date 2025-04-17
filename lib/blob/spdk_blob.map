@@ -46,6 +46,7 @@
 	spdk_bs_blob_set_external_parent;
 	spdk_bs_snapshot_checksum;
 	spdk_bs_snapshot_set_range_checksum;
+	spdk_bs_snapshot_get_range_checksum;
 	spdk_blob_open_opts_init;
 	spdk_bs_open_blob;
 	spdk_bs_open_blob_ext;

@@ -8340,6 +8340,37 @@ spdk_bs_snapshot_set_range_checksum(struct spdk_blob_store *bs, struct spdk_io_c
 }
 /* END spdk_bs_snapshot_set_range_checksum */
 
+int
+spdk_bs_snapshot_get_range_checksum(struct spdk_blob *blob, uint64_t *checksums,
+				    uint64_t cluster_start_index, uint64_t cluster_count)
+{
+	uint64_t i;
+
+	assert(blob != NULL);
+	assert(checksums != NULL);
+
+	if (blob->clusters_checksums == NULL) {
+		return -ENOENT;
+	}
+
+	if (cluster_start_index >= blob->num_clusters_checksums) {
+		SPDK_ERRLOG("Invalid cluster start index\n");
+		return -EINVAL;
+	}
+
+	if (cluster_start_index + cluster_count > blob->num_clusters_checksums) {
+		SPDK_ERRLOG("Invalid cluster count\n");
+		return -EINVAL;
+	}
+
+	for (i = cluster_start_index; i < cluster_count; i++) {
+		checksums[i] = blob->clusters_checksums[cluster_start_index + i];
+	}
+
+	return 0;
+}
+
+
 /* START spdk_blob_resize */
 struct spdk_bs_resize_ctx {
 	spdk_blob_op_complete cb_fn;

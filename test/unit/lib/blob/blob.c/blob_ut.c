@@ -10220,6 +10220,7 @@ snapshot_range_checksum(void)
 	uint64_t io_units_per_cluster;
 	uint64_t offset;
 	uint64_t checksum;
+	uint64_t checksums[4];
 	const void *value;
 	size_t value_len;
 	int rc;
@@ -10277,17 +10278,29 @@ snapshot_range_checksum(void)
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EINTR);
 
+	/* Get snapshot checksums before the computing */
+	rc = spdk_bs_snapshot_get_range_checksum(snap, checksums, 0, 4);
+	CU_ASSERT(rc == -ENOENT);
+
 	/* Compute and store range checksum of a snapshot */
 	spdk_bs_snapshot_set_range_checksum(bs, blob_ch, snapid, xattr_name, NULL, NULL, blob_op_complete,
 					    NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -0);
 
+	/* Get clusters checksums with bad input parameters */
+	rc = spdk_bs_snapshot_get_range_checksum(snap, checksums, 5, 1);
+	CU_ASSERT(rc == -EINVAL);
+	rc = spdk_bs_snapshot_get_range_checksum(snap, checksums, 2, 4);
+	CU_ASSERT(rc == -EINVAL);
+
 	/* Get clusters checksums */
-	CU_ASSERT(snap->clusters_checksums[0] == 0);
-	CU_ASSERT(snap->clusters_checksums[1] == 0x817358EFBFFB03D5);
-	CU_ASSERT(snap->clusters_checksums[2] == 0);
-	CU_ASSERT(snap->clusters_checksums[3] == 0x817358EFBFFB03D5);
+	rc = spdk_bs_snapshot_get_range_checksum(snap, checksums, 0, 4);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksums[0] == 0);
+	CU_ASSERT(checksums[1] == 0x817358EFBFFB03D5);
+	CU_ASSERT(checksums[2] == 0);
+	CU_ASSERT(checksums[3] == 0x817358EFBFFB03D5);
 
 	/* Get whole checksum */
 	rc = spdk_blob_get_xattr_value(snap, xattr_name, &value, &value_len);

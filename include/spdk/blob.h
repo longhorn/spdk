@@ -942,6 +942,23 @@ void spdk_bs_snapshot_set_range_checksum(struct spdk_blob_store *bs,
 		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
 		spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/**
+ * Provide table with snapshot's clusters checksum in a specific range
+ *
+ * Checksums array must be allocated and its size must be greater than/equal to cluster_count,
+ * cluster_start_index must be less than blob's number of cluster,
+ * cluster_start_index + cluster_count must be less than/equal to blob's number of cluster.
+ *
+ * \param blob Blob to query.
+ * \param checksums Array of the checksums.
+ * \param cluster_start_index The index of the first cluster whose checksum must be retrieved.
+ * \param cluster_count The number of clusters whose checksums must be retrieved.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_bs_snapshot_get_range_checksum(struct spdk_blob *blob, uint64_t *checksums,
+					uint64_t cluster_start_index, uint64_t cluster_count);
+
 struct spdk_blob_open_opts {
 	enum blob_clear_method  clear_method;
 
