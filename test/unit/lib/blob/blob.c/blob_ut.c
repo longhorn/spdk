@@ -10207,6 +10207,102 @@ snapshot_checksum(void)
 }
 
 static void
+snapshot_range_checksum(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob, *snap;
+	spdk_blob_id blobid, snapid;
+	uint64_t num_clusters = 4;
+	const char *xattr_name = "checksum";
+	struct spdk_io_channel *blob_ch;
+	uint8_t buf1[DEV_BUFFER_BLOCKLEN];
+	uint64_t io_units_per_cluster;
+	uint64_t offset;
+	uint64_t checksum;
+	const void *value;
+	size_t value_len;
+	int rc;
+
+	blob_ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(blob_ch != NULL);
+
+	/* Set blob dimension and as thin provisioned */
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.thin_provision = true;
+	blob_opts.num_clusters = num_clusters;
+
+	/* Create a blob */
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	blobid = spdk_blob_get_id(blob);
+	io_units_per_cluster = bs_io_units_per_cluster(blob);
+
+	/* Write on cluster 2 and 4 of blob */
+	for (offset = io_units_per_cluster; offset < 2 * io_units_per_cluster; offset++) {
+		memset(buf1, (int)offset, DEV_BUFFER_BLOCKLEN);
+		spdk_blob_io_write(blob, blob_ch, buf1, offset, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	for (offset = 3 * io_units_per_cluster; offset < 4 * io_units_per_cluster; offset++) {
+		memset(buf1, (int)offset, DEV_BUFFER_BLOCKLEN);
+		spdk_blob_io_write(blob, blob_ch, buf1, offset, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 2);
+
+
+	/* Compute checksums on blob that is not a snapshot */
+	spdk_bs_snapshot_set_range_checksum(bs, blob_ch, blobid, xattr_name, NULL, NULL, blob_op_complete,
+					    NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EPERM);
+
+	/* Make a blob's snapshot */
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapid = g_blobid;
+
+	spdk_bs_open_blob(bs, snapid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snap = g_blob;
+
+	/* Start and stop a snapshot range checksum computing */
+	spdk_bs_snapshot_set_range_checksum(bs, blob_ch, snapid, xattr_name, blob_snapshot_checksum_stop_cb,
+					    NULL, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINTR);
+
+	/* Compute and store range checksum of a snapshot */
+	spdk_bs_snapshot_set_range_checksum(bs, blob_ch, snapid, xattr_name, NULL, NULL, blob_op_complete,
+					    NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -0);
+
+	/* Get clusters checksums */
+	CU_ASSERT(snap->clusters_checksums[0] == 0);
+	CU_ASSERT(snap->clusters_checksums[1] == 0x817358EFBFFB03D5);
+	CU_ASSERT(snap->clusters_checksums[2] == 0);
+	CU_ASSERT(snap->clusters_checksums[3] == 0x817358EFBFFB03D5);
+
+	/* Get whole checksum */
+	rc = spdk_blob_get_xattr_value(snap, xattr_name, &value, &value_len);
+	CU_ASSERT(rc == 0);
+	checksum = *(uint64_t *)value;
+	CU_ASSERT(checksum == 0xED4B60E9A233D878);
+
+	/* Clean up */
+	spdk_bs_free_io_channel(blob_ch);
+	ut_blob_close_and_delete(bs, blob);
+	ut_blob_close_and_delete(bs, snap);
+	poll_threads();
+}
+
+static void
 suite_bs_setup(void)
 {
 	struct spdk_bs_dev *dev;
@@ -10488,6 +10584,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_esnap_bs, blob_set_parent);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_external_parent);
 		CU_ADD_TEST(suite_bs, snapshot_checksum);
+		CU_ADD_TEST(suite_bs, snapshot_range_checksum);
 	}
 
 	allocate_threads(2);

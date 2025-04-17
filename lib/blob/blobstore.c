@@ -8074,6 +8074,9 @@ struct snapshot_checksum_ctx {
 	/* Buffer for blob reading */
 	uint8_t *read_buff;
 
+	/* If true, compute both the whole checksum and clusters checksums */
+	bool compute_all;
+
 	/* Computed checksum */
 	uint64_t checksum;
 
@@ -8086,6 +8089,16 @@ struct snapshot_checksum_ctx {
 	/* Argument passed to function stop_cb */
 	void *stop_cb_arg;
 };
+
+static void
+bs_snapshot_free_clusters_checksums(struct spdk_blob *blob)
+{
+	if (blob->clusters_checksums) {
+		blob->num_clusters_checksums = 0;
+		free(blob->clusters_checksums);
+		blob->clusters_checksums = NULL;
+	}
+}
 
 static void
 bs_snapshot_checksum_cleanup_finish(void *cb_arg, int bserrno)
@@ -8115,6 +8128,7 @@ bs_snapshot_checksum_md_synchronized(void *cb_arg, int bserrno)
 		SPDK_ERRLOG("blob 0x%" PRIx64 " snapshot checksum, blob md sync error %d\n", ctx->blob->id,
 			    bserrno);
 		ctx->bserrno = bserrno;
+		bs_snapshot_free_clusters_checksums(_blob);
 	}
 
 	_blob->locked_operation_in_progress = false;
@@ -8149,11 +8163,16 @@ bs_snapshot_checksum_blob_read_cpl(void *cb_arg, int bserrno)
 		SPDK_ERRLOG("blob 0x%" PRIx64 " snapshot checksum, blob read error %d\n", ctx->blob->id, bserrno);
 		ctx->bserrno = bserrno;
 		_blob->locked_operation_in_progress = false;
+		bs_snapshot_free_clusters_checksums(_blob);
 		spdk_blob_close(_blob, bs_snapshot_checksum_cleanup_finish, ctx);
 		return;
 	}
 
 	ctx->checksum = spdk_crc64_iso_refl(ctx->read_buff, _blob->bs->cluster_sz, ctx->checksum);
+	if (_blob->clusters_checksums) {
+		_blob->clusters_checksums[ctx->cluster] = spdk_crc64_iso_refl(ctx->read_buff, _blob->bs->cluster_sz,
+				0);
+	}
 
 	ctx->cluster++;
 	bs_snapshot_checksum_cluster_find_next(ctx);
@@ -8170,6 +8189,7 @@ bs_snapshot_checksum_cluster_find_next(void *cb_arg)
 		SPDK_WARNLOG("blob 0x%" PRIx64 " snapshot checksum, operation interrupted\n", ctx->blob->id);
 		ctx->bserrno = -EINTR;
 		_blob->locked_operation_in_progress = false;
+		bs_snapshot_free_clusters_checksums(_blob);
 		spdk_blob_close(_blob, bs_snapshot_checksum_cleanup_finish, ctx);
 		return;
 	}
@@ -8223,6 +8243,26 @@ bs_snapshot_checksum_blob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bs
 
 	_blob->locked_operation_in_progress = true;
 
+	/*
+	 * If ctx->compute_all, we are executing a range checksum, so we must allocate
+	 * clusters_checksums if not already allocated in a previous call. Otherwise, we are
+	 * computing only the whole checksum, which will be stored in blob's xattr, and so there's
+	 * no need to allocate this array.
+	 */
+	if (ctx->compute_all && _blob->clusters_checksums == NULL) {
+		_blob->clusters_checksums = calloc(_blob->active.num_clusters, sizeof(uint64_t));
+		if (!_blob->clusters_checksums) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 " snapshot range checksum, error allocating clusters checksums\n",
+				    _blob->id);
+			_blob->locked_operation_in_progress = false;
+			ctx->bserrno = -ENOMEM;
+			spdk_blob_close(_blob, bs_snapshot_checksum_cleanup_finish, ctx);
+			return;
+		}
+		_blob->num_clusters_checksums = _blob->active.num_clusters;
+		_blob->state = SPDK_BLOB_STATE_DIRTY;
+	}
+
 	ctx->cluster = 0;
 	bs_snapshot_checksum_cluster_find_next(ctx);
 }
@@ -8262,6 +8302,43 @@ spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *ch
 	spdk_bs_open_blob(ctx->bs, ctx->blobid, bs_snapshot_checksum_blob_open_cpl, ctx);
 }
 /* END spdk_bs_snapshot_checksum */
+
+void
+spdk_bs_snapshot_set_range_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+				    spdk_blob_id blob_id, const char *xattr_name,
+				    spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+				    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct snapshot_checksum_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->bs = bs;
+	ctx->blobid = blob_id;
+	ctx->compute_all = true;
+	ctx->xattr_name = xattr_name;
+	ctx->cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	ctx->cpl.u.bs_basic.cb_fn = cb_fn;
+	ctx->cpl.u.bs_basic.cb_arg = cb_arg;
+	ctx->stop_cb = stop_cb_fn;
+	ctx->stop_cb_arg = stop_cb_arg;
+	ctx->bserrno = 0;
+	ctx->blob_channel = channel;
+	ctx->read_buff = spdk_malloc(bs->cluster_sz, bs->dev->blocklen, NULL,
+				     SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->read_buff) {
+		free(ctx);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	spdk_bs_open_blob(ctx->bs, ctx->blobid, bs_snapshot_checksum_blob_open_cpl, ctx);
+}
+/* END spdk_bs_snapshot_set_range_checksum */
 
 /* START spdk_blob_resize */
 struct spdk_bs_resize_ctx {

@@ -922,6 +922,26 @@ void spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channe
 			       spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
 			       spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/**
+ * Compute snapshot's whole and clusters checksums and store them in blob's metadata
+ *
+ * This call compute a crc64 iso reflected checksum of data for every cluster allocated to a
+ * snapshot and store these checksums in blob's metadata.
+ * It also computes the checksum of the whole blob and store it as an xattr, like spdk_bs_snapshot_checksum.
+ *
+ * \param bs Blobstore.
+ * \param blobid Id of blob.
+ * \param xattr_name Name of the extended attribute.
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_snapshot_set_range_checksum(struct spdk_blob_store *bs,
+		struct spdk_io_channel *channel, spdk_blob_id blob_id, const char *xattr_name,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_blob_op_complete cb_fn, void *cb_arg);
+
 struct spdk_blob_open_opts {
 	enum blob_clear_method  clear_method;
 
