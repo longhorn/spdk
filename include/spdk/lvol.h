@@ -534,6 +534,40 @@ void spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot,
 int
 spdk_lvol_get_snapshot_checksum(struct spdk_lvol *snapshot, uint64_t *checksum);
 
+/**
+ * Compute and store snapshot's whole and clusters checksums.
+ *
+ * A checksum for the whole lvol and a checksum for every allocated cluster is computed and stored
+ * in snapshot's metadata.
+ * The computed checksum is crc64 iso reflected.
+ *
+ * \param lvol Handle to snapshot
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ */
+void spdk_lvol_register_snapshot_range_checksums(struct spdk_lvol *snapshot,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Get snapshot's clusters checksums in a specific range.
+ *
+ * The lvol must be a snapshot and the checksums must has been previously registered.
+ * Checksums array must be allocated and the range must fit into snapshot's cluster number.
+ *
+ * \param snapshot Handle to snapshot.
+ * \param checksums Array of the checksums.
+ * \param cluster_start_index The index of the first cluster whose checksum must be retrieved.
+ * \param cluster_count The number of clusters whose checksums must be retrieved.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int
+spdk_lvol_get_snapshot_range_checksums(struct spdk_lvol *snapshot, uint64_t *checksums,
+				       uint64_t cluster_start_index, uint64_t cluster_count);
+
 
 #ifdef __cplusplus
 }

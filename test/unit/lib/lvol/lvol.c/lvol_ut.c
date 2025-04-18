@@ -307,6 +307,35 @@ spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *ch
 	cb_fn(cb_arg, 0);
 }
 
+void
+spdk_bs_snapshot_set_range_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+				    spdk_blob_id blob_id, const char *xattr_name,
+				    spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+				    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_checksum_registered = true;
+	cb_fn(cb_arg, 0);
+}
+
+int
+spdk_bs_snapshot_get_range_checksum(struct spdk_blob *blob, uint64_t *checksums,
+				    uint64_t cluster_start_index, uint64_t cluster_count)
+{
+	if (g_checksum_registered == false) {
+		return -ENOENT;
+	}
+
+	if (checksums == NULL) {
+		return -EINVAL;
+	}
+
+	for (uint64_t i = 0; i < cluster_count; i++) {
+		checksums[i] = blob->num_clusters + cluster_start_index + i;
+	}
+
+	return 0;
+}
+
 DEFINE_STUB(spdk_bs_get_page_size, uint64_t, (struct spdk_blob_store *bs), BS_PAGE_SIZE);
 
 int
@@ -3799,6 +3828,83 @@ lvol_snapshot_checksum(void)
 	free_dev(&bs_dev);
 }
 
+static void
+lvol_snapshot_range_checksums(void)
+{
+	struct lvol_ut_bs_dev bs_dev;
+	struct spdk_lvs_opts opts;
+	int rc = 0;
+	uint64_t checksum;
+	uint64_t checksums[4];
+
+	init_dev(&bs_dev);
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&bs_dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", 4 * BS_CLUSTER_SIZE, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	/* Get checksums without having previously registered them */
+	g_checksum_registered = false;
+	rc = spdk_lvol_get_snapshot_range_checksums(g_lvol, checksums, 0, 4);
+	CU_ASSERT(rc == -ENOENT);
+
+	/* Register checksums with null lvol */
+	spdk_lvol_register_snapshot_range_checksums(NULL, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EINVAL);
+
+	/* Successful register checksums */
+	spdk_lvol_register_snapshot_range_checksums(g_lvol, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Register again the checksums */
+	spdk_lvol_register_snapshot_range_checksums(g_lvol, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Get clusters checksums with null lvol */
+	rc = spdk_lvol_get_snapshot_range_checksums(NULL, checksums, 0, 4);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Get clusters checksums with null array */
+	rc = spdk_lvol_get_snapshot_range_checksums(g_lvol, NULL, 0, 4);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Successful get clusters checksums */
+	rc = spdk_lvol_get_snapshot_range_checksums(g_lvol, checksums, 0, 4);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksums[0] == 4);
+	CU_ASSERT(checksums[1] == 5);
+	CU_ASSERT(checksums[2] == 6);
+	CU_ASSERT(checksums[3] == 7);
+
+	/* Get whole checksum */
+	rc = spdk_lvol_get_snapshot_checksum(g_lvol, &checksum);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksum == 4);
+
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&bs_dev);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3849,6 +3955,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_set_parent);
 	CU_ADD_TEST(suite, lvol_set_external_parent);
 	CU_ADD_TEST(suite, lvol_snapshot_checksum);
+	CU_ADD_TEST(suite, lvol_snapshot_range_checksums);
 
 	allocate_threads(1);
 	set_thread(0);

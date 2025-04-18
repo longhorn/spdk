@@ -2895,3 +2895,73 @@ spdk_lvol_get_snapshot_checksum(struct spdk_lvol *snapshot, uint64_t *checksum)
 	*checksum = *(uint64_t *)attr;
 	return 0;
 }
+
+void
+spdk_lvol_register_snapshot_range_checksums(struct spdk_lvol *snapshot,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	spdk_blob_id blob_id;
+
+	assert(cb_fn != NULL);
+
+	if (snapshot == NULL) {
+		SPDK_ERRLOG("snapshot must not be NULL\n");
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	assert(snapshot->lvol_store->thread == spdk_get_thread());
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	req->lvol = snapshot;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->channel = spdk_bs_alloc_io_channel(snapshot->lvol_store->blobstore);
+	if (req->channel == NULL) {
+		SPDK_ERRLOG("lvol %s snapshot range checksums, cannot alloc io channel for lvol request\n",
+			    snapshot->unique_id);
+		free(req);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	blob_id = spdk_blob_get_id(snapshot->blob);
+
+	spdk_bs_snapshot_set_range_checksum(snapshot->lvol_store->blobstore, req->channel, blob_id,
+					    LVOL_SNAPSHOT_CHECKSUM, stop_cb_fn, stop_cb_arg,
+					    lvol_snapshot_checksum_cb, req);
+}
+
+int
+spdk_lvol_get_snapshot_range_checksums(struct spdk_lvol *snapshot, uint64_t *checksums,
+				       uint64_t cluster_start_index, uint64_t cluster_count)
+{
+	int rc;
+
+	if (snapshot == NULL) {
+		SPDK_ERRLOG("snapshot must not be NULL\n");
+		return -EINVAL;
+	}
+
+	if (checksums == NULL) {
+		SPDK_ERRLOG("checksums must not be NULL\n");
+		return -EINVAL;
+	}
+
+	rc = spdk_bs_snapshot_get_range_checksum(snapshot->blob, checksums, cluster_start_index,
+			cluster_count);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to get range checksums for snapshot %s\n", snapshot->name);
+		return rc;
+	}
+
+	return 0;
+}
