@@ -2391,7 +2391,7 @@ rpc_bdev_lvol_stop_snapshot_checksum(struct spdk_jsonrpc_request *request,
 
 	if (!checksum_status) {
 		SPDK_ERRLOG("no checksum registration of lvol %s in progress\n", lvol->name);
-		spdk_jsonrpc_send_error_response(request, -ESRCH, spdk_strerror(ENODEV));
+		spdk_jsonrpc_send_error_response(request, -ESRCH, spdk_strerror(ESRCH));
 		goto cleanup;
 	}
 
