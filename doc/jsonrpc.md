@@ -11398,6 +11398,87 @@ Example response:
 }
 ~~~
 
+### bdev_lvol_register_snapshot_range_checksums {#rpc_bdev_lvol_register_snapshot_range_checksums}
+
+Compute and store snapshot's whole and clusters checksums. A checksum for the whole lvol and a checksum for every
+allocated cluster is computed and stored in snapshot's metadata. The computed checksum is crc64 iso reflected.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | UUID or alias of the snapshot
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_lvol_register_snapshot_range_checksums",
+  "id": 1,
+  "params": {
+    "name": "8d87fccc-c278-49f0-9d4c-6237951aca09"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### bdev_lvol_get_snapshot_range_checksums {#rpc_bdev_lvol_get_snapshot_range_checksums}
+
+Get snapshot's clusters checksums in a specific range. The lvol must be a snapshot and the
+checksums must have been previously registered. The range must fit into snapshot's cluster number
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | UUID or alias of the snapshot
+cluster_start_index     | Required | number      | start index of the cluster range
+cluster_count           | Required | number      | number of clusters in the range
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_lvol_get_snapshot_range_checksums",
+  "id": 1,
+  "params": {
+    "name": "8d87fccc-c278-49f0-9d4c-6237951aca09",
+    "cluster_start_index": 2,
+    "cluster_count": 1
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "cluster_index": 2,
+      "checksum": 828947163827886523,
+    }
+  ]
+}
+~~~
+
 ## RAID
 
 ### bdev_raid_set_options {#rpc_bdev_raid_set_options}

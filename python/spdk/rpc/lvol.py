@@ -367,6 +367,34 @@ def bdev_lvol_get_snapshot_checksum(client, name):
     return client.call('bdev_lvol_get_snapshot_checksum', params)
 
 
+def bdev_lvol_register_snapshot_range_checksums(client, name):
+    """Compute and store snapshot's whole and clusters checksums.
+
+    Args:
+        name: name of the snapshot
+    """
+    params = {
+        'name': name,
+    }
+    return client.call('bdev_lvol_register_snapshot_range_checksums', params)
+
+
+def bdev_lvol_get_snapshot_range_checksums(client, name, cluster_start_index, cluster_count):
+    """Get snapshot's clusters checksums in a specific range.
+
+    Args:
+        name: name of the snapshot
+        cluster_start_index: start index of the cluster range
+        cluster_count: number of clusters in the range
+    """
+    params = {
+        'name': name,
+        'cluster_start_index': cluster_start_index,
+        'cluster_count': cluster_count,
+    }
+    return client.call('bdev_lvol_get_snapshot_range_checksums', params)
+
+
 def bdev_lvol_stop_snapshot_checksum(client, name):
     """Stop the registration of a snapshot's checksum.
 

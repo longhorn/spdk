@@ -2026,6 +2026,8 @@ SPDK_RPC_REGISTER("bdev_lvol_get_fragmap", rpc_bdev_lvol_get_fragmap, SPDK_RPC_R
 
 struct rpc_bdev_snapshot_checksum {
 	char *name;
+	uint64_t cluster_start_index;
+	uint64_t cluster_count;
 };
 
 struct rpc_bdev_snapshot_checksum_ctx {
@@ -2041,6 +2043,8 @@ free_rpc_bdev_snapshot_checksum(struct rpc_bdev_snapshot_checksum *req)
 
 static const struct spdk_json_object_decoder rpc_bdev_snapshot_checksum_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_snapshot_checksum, name), spdk_json_decode_string},
+	{"cluster_start_index", offsetof(struct rpc_bdev_snapshot_checksum, cluster_start_index), spdk_json_decode_uint64, true},
+	{"cluster_count", offsetof(struct rpc_bdev_snapshot_checksum, cluster_count), spdk_json_decode_uint64, true},
 };
 
 static bool
@@ -2199,6 +2203,150 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_get_snapshot_checksum", rpc_bdev_lvol_get_snapshot_checksum,
+		  SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_lvol_register_snapshot_range_checksums(struct spdk_jsonrpc_request *request,
+		const struct spdk_json_val *params)
+{
+	struct rpc_bdev_snapshot_checksum req = {};
+	struct rpc_bdev_snapshot_checksum_ctx *ctx;
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+	struct rpc_snapshot_checksum_status *checksum_status;
+
+	SPDK_INFOLOG(lvol_rpc, "Registering snapshot range checksums\n");
+
+	if (spdk_json_decode_object(params, rpc_bdev_snapshot_checksum_decoders,
+				    SPDK_COUNTOF(rpc_bdev_snapshot_checksum_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	bdev = spdk_bdev_get_by_name(req.name);
+	if (bdev == NULL) {
+		SPDK_ERRLOG("bdev '%s' does not exist\n", req.name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	checksum_status = calloc(1, sizeof(*checksum_status));
+	if (checksum_status == NULL) {
+		SPDK_ERRLOG("Cannot allocate status entry for snapshot range checksums register of '%s'\n",
+			    req.name);
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+
+	checksum_status->blob_id = lvol->blob_id;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Cannot allocate context for snapshot range checksums register of '%s'\n", req.name);
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		free(checksum_status);
+		goto cleanup;
+	}
+
+	ctx->request = request;
+	ctx->checksum_status = checksum_status;
+
+	LIST_INSERT_HEAD(&g_snapshot_checksum_status_list, checksum_status, link);
+	spdk_lvol_register_snapshot_range_checksums(lvol,
+			rpc_bdev_lvol_register_snapshot_checksum_status_cb,
+			checksum_status, rpc_bdev_lvol_register_snapshot_checksum_cb, ctx);
+
+cleanup:
+	free_rpc_bdev_snapshot_checksum(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_register_snapshot_range_checksums",
+		  rpc_bdev_lvol_register_snapshot_range_checksums,
+		  SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_lvol_get_snapshot_range_checksums(struct spdk_jsonrpc_request *request,
+		const struct spdk_json_val *params)
+{
+	struct rpc_bdev_snapshot_checksum req = {};
+	struct spdk_json_write_ctx *w;
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+	uint64_t *checksums;
+	uint64_t cluster_start_index;
+	uint64_t cluster_count;
+	int rc;
+
+	SPDK_INFOLOG(lvol_rpc, "Getting snapshot range checksums\n");
+
+	if (spdk_json_decode_object(params, rpc_bdev_snapshot_checksum_decoders,
+				    SPDK_COUNTOF(rpc_bdev_snapshot_checksum_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	bdev = spdk_bdev_get_by_name(req.name);
+	if (bdev == NULL) {
+		SPDK_ERRLOG("bdev '%s' does not exist\n", req.name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	cluster_start_index = req.cluster_start_index;
+	cluster_count = req.cluster_count;
+
+	checksums = calloc(cluster_count, sizeof(*checksums));
+	if (checksums == NULL) {
+		SPDK_ERRLOG("Cannot allocate checksums array\n");
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+	rc = spdk_lvol_get_snapshot_range_checksums(lvol, checksums, cluster_start_index, cluster_count);
+	if (rc != 0) {
+		SPDK_INFOLOG(lvol_rpc, "Error %d getting snapshot range checksums\n", rc);
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		free(checksums);
+		goto cleanup;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_array_begin(w);
+	for (uint64_t i = 0; i < cluster_count; i++) {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_uint64(w, "cluster_index", cluster_start_index + i);
+		spdk_json_write_named_uint64(w, "checksum", checksums[i]);
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_jsonrpc_end_result(request, w);
+	free(checksums);
+
+cleanup:
+	free_rpc_bdev_snapshot_checksum(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_get_snapshot_range_checksums",
+		  rpc_bdev_lvol_get_snapshot_range_checksums,
 		  SPDK_RPC_RUNTIME)
 
 static void
