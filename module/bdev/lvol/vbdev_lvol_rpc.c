@@ -2118,6 +2118,17 @@ rpc_bdev_lvol_register_snapshot_checksum(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	LIST_FOREACH(checksum_status, &g_snapshot_checksum_status_list, link) {
+		if (checksum_status->blob_id == lvol->blob_id) {
+			break;
+		}
+	}
+	if (checksum_status) {
+		SPDK_ERRLOG("A snapshot checksum registration already exists for '%s'\n", req.name);
+		spdk_jsonrpc_send_error_response(request, -EEXIST, spdk_strerror(EEXIST));
+		goto cleanup;
+	}
+
 	checksum_status = calloc(1, sizeof(*checksum_status));
 	if (checksum_status == NULL) {
 		SPDK_ERRLOG("Cannot allocate status entry for snapshot checksum register of '%s'\n", req.name);
@@ -2237,6 +2248,17 @@ rpc_bdev_lvol_register_snapshot_range_checksums(struct spdk_jsonrpc_request *req
 	if (lvol == NULL) {
 		SPDK_ERRLOG("lvol does not exist\n");
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	LIST_FOREACH(checksum_status, &g_snapshot_checksum_status_list, link) {
+		if (checksum_status->blob_id == lvol->blob_id) {
+			break;
+		}
+	}
+	if (checksum_status) {
+		SPDK_ERRLOG("A snapshot checksum registration already exists for '%s'\n", req.name);
+		spdk_jsonrpc_send_error_response(request, -EEXIST, spdk_strerror(EEXIST));
 		goto cleanup;
 	}
 
