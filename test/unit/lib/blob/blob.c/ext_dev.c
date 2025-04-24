@@ -62,6 +62,22 @@ ext_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *pa
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
 }
 
+static void
+ext_dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+	      uint64_t lba, uint64_t lba_count,
+	      struct spdk_bs_dev_cb_args *cb_args)
+{
+	uint64_t offset, length;
+
+	offset = lba * dev->blocklen;
+	length = lba_count * dev->blocklen;
+	SPDK_CU_ASSERT_FATAL(offset + length <= EXT_DEV_BUFFER_SIZE);
+
+	memset(&g_ext_dev_buffer[offset], 0, length);
+
+	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+}
+
 static struct spdk_bs_dev *
 init_ext_dev(uint64_t blockcnt, uint32_t blocklen)
 {
@@ -74,6 +90,7 @@ init_ext_dev(uint64_t blockcnt, uint32_t blocklen)
 	dev->destroy = ext_dev_destroy;
 	dev->read = ext_dev_read;
 	dev->write = ext_dev_write;
+	dev->unmap = ext_dev_unmap;
 	dev->blockcnt = blockcnt;
 	dev->blocklen = blocklen;
 

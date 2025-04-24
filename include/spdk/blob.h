@@ -864,6 +864,33 @@ int spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel
 			      spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			      spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/**
+ * Perform a ranged shallow copy of a blob to a blobstore device.
+ *
+ * This makes a synchronization of a range of data between a blob and a blobstore device, writing
+ * to the destination device the content of blob's allocated clusters and unmapping the content of
+ * destination device if a cluster is not allocated in the blob.
+ * Blob must be read only and the cluster range must fit into blob and device size.
+ * Blobstore block size must be a multiple of device block size.
+
+ * \param bs Blobstore
+ * \param channel IO channel used to copy the blob.
+ * \param blobid The id of the blob.
+ * \param clusters_indexes The array containing the indexes of the clusters to be synchronized.
+ * \param cluster_count The number of clusters into the index array.
+ * \param ext_dev The device to copy on
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+				    spdk_blob_id blobid, uint64_t *clusters_indexes, uint64_t cluster_count,
+				    struct spdk_bs_dev *ext_dev,
+				    spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+				    spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
  * Set a snapshot as the parent of a blob
