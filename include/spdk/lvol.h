@@ -470,6 +470,29 @@ int spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
 			   spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /**
+ * Make a ranged shallow copy of lvol on given bs_dev.
+ *
+ * Lvol must be read only, and the cluster range must fit into lvol and device size.
+ * Lvol size must be less or equal than bs_dev size.
+ *
+ * \param lvol Handle to lvol
+ * \param clusters_indexes The array containing the indexes of the clusters to be synchronized
+ * \param cluster_count The number of clusters into the index array
+ * \param ext_dev The bs_dev to copy on. This is created on the given bdev by using
+ * spdk_bdev_create_bs_dev_ext() beforehand
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
+				 uint64_t cluster_count, struct spdk_bs_dev *ext_dev,
+				 spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+				 spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
  * Set a snapshot as the parent of a lvol
  *
  * This call set a snapshot as the parent of a lvol, making the lvol a clone of this snapshot.
