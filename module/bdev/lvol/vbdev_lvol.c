@@ -2300,6 +2300,67 @@ vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 	return rc;
 }
 
+int
+vbdev_lvol_range_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+			      uint64_t *clusters_indexes, uint64_t cluster_count,
+			      spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+			      spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_dev *ext_dev;
+	struct spdk_lvol_copy_req *req;
+	int rc;
+
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol must not be NULL\n");
+		return -EINVAL;
+	}
+
+	if (bdev_name == NULL) {
+		SPDK_ERRLOG("lvol %s, bdev name must not be NULL\n", lvol->name);
+		return -EINVAL;
+	}
+
+	assert(lvol->bdev != NULL);
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("lvol %s, cannot alloc memory for lvol copy request\n", lvol->name);
+		return -ENOMEM;
+	}
+
+	rc = spdk_bdev_create_bs_dev_ext(bdev_name, _vbdev_lvol_shallow_copy_base_bdev_event_cb,
+					 NULL, &ext_dev);
+	if (rc < 0) {
+		SPDK_ERRLOG("lvol %s, cannot create blobstore block device from bdev %s\n", lvol->name, bdev_name);
+		free(req);
+		return rc;
+	}
+
+	rc = spdk_bs_bdev_claim(ext_dev, &g_lvol_if);
+	if (rc != 0) {
+		SPDK_ERRLOG("lvol %s, unable to claim bdev %s, error %d\n", lvol->name, bdev_name, rc);
+		ext_dev->destroy(ext_dev);
+		free(req);
+		return rc;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = lvol;
+	req->ext_dev = ext_dev;
+
+	rc = spdk_lvol_range_shallow_copy(lvol, clusters_indexes, cluster_count, ext_dev,
+					  status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb,
+					  req);
+
+	if (rc < 0) {
+		ext_dev->destroy(ext_dev);
+		free(req);
+	}
+
+	return rc;
+}
+
 void
 vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
 			       spdk_lvol_op_complete cb_fn, void *cb_arg)

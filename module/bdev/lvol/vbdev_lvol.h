@@ -155,6 +155,25 @@ int vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 			    spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /**
+ * \brief Make a range shallow copy of lvol over a bdev
+ *
+ * \param lvol Handle to lvol
+ * \param bdev_name Name of the bdev to copy on
+ * \param clusters_indexes The array containing the indexes of the clusters to be synchronized
+ * \param cluster_count The number of clusters into the index array
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int vbdev_lvol_range_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+				  uint64_t *clusters_indexes, uint64_t cluster_count,
+				  spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+				  spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
  * \brief Set an external snapshot as the parent of a lvol.
  *
  * \param lvol Handle to lvol
