@@ -13,6 +13,8 @@
 #include "spdk/bdev_module.h"
 #include "spdk/bit_array.h"
 
+#define MAX_CLUSTERS 256
+
 SPDK_LOG_REGISTER_COMPONENT(lvol_rpc)
 
 struct rpc_shallow_copy_status {
@@ -1589,14 +1591,30 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_lvol_grow_lvstore", rpc_bdev_lvol_grow_lvstore, SPDK_RPC_RUNTIME)
 
+struct rpc_cluster_list {
+	size_t num_clusters;
+	uint64_t clusters[MAX_CLUSTERS];
+};
+
+static int
+decode_rpc_cluster_list(const struct spdk_json_val *val, void *out)
+{
+	struct rpc_cluster_list *list = out;
+
+	return spdk_json_decode_array(val, spdk_json_decode_uint64, list->clusters, MAX_CLUSTERS,
+				      &list->num_clusters, sizeof(uint64_t));
+}
+
 struct rpc_bdev_lvol_shallow_copy {
 	char *src_lvol_name;
 	char *dst_bdev_name;
+	struct rpc_cluster_list cluster_list;
 };
 
 struct rpc_bdev_lvol_shallow_copy_ctx {
 	struct spdk_jsonrpc_request *request;
 	struct rpc_shallow_copy_status *status;
+	uint64_t *clusters;
 };
 
 static void
@@ -1609,6 +1627,7 @@ free_rpc_bdev_lvol_shallow_copy(struct rpc_bdev_lvol_shallow_copy *req)
 static const struct spdk_json_object_decoder rpc_bdev_lvol_shallow_copy_decoders[] = {
 	{"src_lvol_name", offsetof(struct rpc_bdev_lvol_shallow_copy, src_lvol_name), spdk_json_decode_string},
 	{"dst_bdev_name", offsetof(struct rpc_bdev_lvol_shallow_copy, dst_bdev_name), spdk_json_decode_string},
+	{"clusters", offsetof(struct rpc_bdev_lvol_shallow_copy, cluster_list), decode_rpc_cluster_list, true},
 };
 
 static void
@@ -1618,6 +1637,9 @@ rpc_bdev_lvol_shallow_copy_cb(void *cb_arg, int lvolerrno)
 
 	ctx->status->result = lvolerrno;
 
+	if (ctx->clusters) {
+		free(ctx->clusters);
+	}
 	free(ctx);
 }
 
@@ -1714,6 +1736,103 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_start_shallow_copy", rpc_bdev_lvol_start_shallow_copy,
+		  SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_lvol_start_range_shallow_copy(struct spdk_jsonrpc_request *request,
+				       const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_shallow_copy req = {};
+	struct rpc_bdev_lvol_shallow_copy_ctx *ctx;
+	struct spdk_lvol *src_lvol;
+	struct spdk_bdev *src_lvol_bdev;
+	struct rpc_shallow_copy_status *status;
+	struct spdk_json_write_ctx *w;
+	int rc;
+
+	SPDK_INFOLOG(lvol_rpc, "Range shallow copying lvol\n");
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_shallow_copy_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_shallow_copy_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	src_lvol_bdev = spdk_bdev_get_by_name(req.src_lvol_name);
+	if (src_lvol_bdev == NULL) {
+		SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.src_lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	src_lvol = vbdev_lvol_get_from_bdev(src_lvol_bdev);
+	if (src_lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	status = calloc(1, sizeof(*status));
+	if (status == NULL) {
+		SPDK_ERRLOG("Cannot allocate status entry for range shallow copy of '%s'\n", req.src_lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+
+	status->operation_id = ++g_shallow_copy_count;
+	status->total_clusters = req.cluster_list.num_clusters;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Cannot allocate context for range shallow copy of '%s'\n", req.src_lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		free(status);
+		goto cleanup;
+	}
+	ctx->request = request;
+	ctx->status = status;
+	ctx->clusters = calloc(req.cluster_list.num_clusters, sizeof(uint64_t));
+	if (ctx->clusters == NULL) {
+		SPDK_ERRLOG("Cannot allocate clusters for range shallow copy of '%s'\n", req.src_lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		free(ctx);
+		free(status);
+		goto cleanup;
+	}
+
+	memcpy(ctx->clusters, req.cluster_list.clusters, req.cluster_list.num_clusters * sizeof(uint64_t));
+
+	LIST_INSERT_HEAD(&g_shallow_copy_status_list, status, link);
+	rc = vbdev_lvol_range_shallow_copy(src_lvol, req.dst_bdev_name,
+					   ctx->clusters, req.cluster_list.num_clusters,
+					   rpc_bdev_lvol_shallow_copy_status_cb, status,
+					   rpc_bdev_lvol_shallow_copy_cb, ctx);
+
+	if (rc < 0) {
+		spdk_jsonrpc_send_error_response(request, rc,
+						 spdk_strerror(-rc));
+		LIST_REMOVE(status, link);
+		free(ctx->clusters);
+		free(ctx);
+		free(status);
+	} else {
+		w = spdk_jsonrpc_begin_result(request);
+
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_uint32(w, "operation_id", status->operation_id);
+		spdk_json_write_object_end(w);
+
+		spdk_jsonrpc_end_result(request, w);
+	}
+
+cleanup:
+	free_rpc_bdev_lvol_shallow_copy(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_start_range_shallow_copy", rpc_bdev_lvol_start_range_shallow_copy,
 		  SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_shallow_copy_status {

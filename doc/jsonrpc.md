@@ -501,6 +501,7 @@ Example response:
     "bdev_lvol_rename_lvstore",
     "bdev_lvol_create_lvstore",
     "bdev_lvol_start_shallow_copy",
+    "bdev_lvol_start_range_shallow_copy",
     "bdev_lvol_check_shallow_copy",
     "bdev_lvol_set_parent",
     "bdev_lvol_set_parent_bdev",
@@ -11178,6 +11179,59 @@ Example request:
   "params": {
     "src_lvol_name": "8a47421a-20cf-444f-845c-d97ad0b0bd8e",
     "dst_bdev_name": "Nvme1n1"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "operation_id": 7
+  }
+}
+~~~
+
+### bdev_lvol_start_range_shallow_copy {#rpc_bdev_lvol_start_range_shallow_copy}
+
+Start a ranged shallow copy of an lvol over a given bdev. Data of clusters allocated to the lvol
+will be written on the bdev, data of clusters not allocated to the lvol will be unmapped on the bdev.
+Must have:
+
+* lvol read only
+* lvol size less or equal than bdev size
+* lvstore block size an even multiple of bdev block size
+* clusters must fit into lvol cluster range
+
+#### Result
+
+This RPC starts the operation and return an identifier that can be used to query the status of the operation
+with the RPC @ref rpc_bdev_lvol_check_shallow_copy.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+src_lvol_name           | Required | string      | UUID or alias of lvol to create a copy from
+dst_bdev_name           | Required | string      | Name of the bdev that acts as destination for the copy
+clusters                | Required | array       | Array of indexes of the clusters to be synchronized
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_lvol_start_range_shallow_copy",
+  "id": 1,
+  "params": {
+    "src_lvol_name": "8a47421a-20cf-444f-845c-d97ad0b0bd8e",
+    "dst_bdev_name": "Nvme1n1",
+    "clusters": [1,2,3]
   }
 }
 ~~~
