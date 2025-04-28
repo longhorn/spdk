@@ -156,7 +156,8 @@ typedef int (*spdk_bs_esnap_dev_create)(void *bs_ctx, void *blob_ctx, struct spd
  * \param copied_clusters Actual number of copied clusters by the shallow copy operation
  * \param cb_arg Callback argument.
  */
-typedef void (*spdk_blob_shallow_copy_status)(uint64_t copied_clusters, void *cb_arg);
+typedef void (*spdk_blob_shallow_copy_status)(uint64_t copied_clusters, uint64_t unmapped_clusters,
+		void *cb_arg);
 
 /**
  * Snapshot checksum stop callback.

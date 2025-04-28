@@ -31,6 +31,7 @@ char *g_xattr_values[] = {"one", "two", "three"};
 uint64_t g_ctx = 1729;
 bool g_use_extent_table = false;
 uint64_t g_copied_clusters_count = 0;
+uint64_t g_unmapped_clusters_count = 0;
 
 struct spdk_bs_super_block_ver1 {
 	uint8_t		signature[8];
@@ -204,9 +205,10 @@ blob_op_with_handle_complete2(void *cb_arg, struct spdk_blob *blob, int bserrno)
 }
 
 static void
-blob_shallow_copy_status_cb(uint64_t copied_clusters, void *cb_arg)
+blob_shallow_copy_status_cb(uint64_t copied_clusters, uint64_t unmapped_clusters, void *cb_arg)
 {
 	g_copied_clusters_count = copied_clusters;
+	g_unmapped_clusters_count = unmapped_clusters;
 }
 
 static bool

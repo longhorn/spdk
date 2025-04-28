@@ -23,6 +23,7 @@ struct rpc_shallow_copy_status {
 	 */
 	int					result;
 	uint64_t				copied_clusters;
+	uint64_t				unmapped_clusters;
 	uint64_t				total_clusters;
 	LIST_ENTRY(rpc_shallow_copy_status)	link;
 };
@@ -1621,11 +1622,13 @@ rpc_bdev_lvol_shallow_copy_cb(void *cb_arg, int lvolerrno)
 }
 
 static void
-rpc_bdev_lvol_shallow_copy_status_cb(uint64_t copied_clusters, void *cb_arg)
+rpc_bdev_lvol_shallow_copy_status_cb(uint64_t copied_clusters, uint64_t unmapped_clusters,
+				     void *cb_arg)
 {
 	struct rpc_shallow_copy_status *status = cb_arg;
 
 	status->copied_clusters = copied_clusters;
+	status->unmapped_clusters = unmapped_clusters;
 }
 
 static void
@@ -1735,7 +1738,7 @@ rpc_bdev_lvol_check_shallow_copy(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_lvol_shallow_copy_status req = {};
 	struct rpc_shallow_copy_status *status;
 	struct spdk_json_write_ctx *w;
-	uint64_t copied_clusters, total_clusters;
+	uint64_t copied_clusters, unmapped_clusters, total_clusters;
 	int result;
 
 	SPDK_INFOLOG(lvol_rpc, "Shallow copy check\n");
@@ -1762,6 +1765,7 @@ rpc_bdev_lvol_check_shallow_copy(struct spdk_jsonrpc_request *request,
 	}
 
 	copied_clusters = status->copied_clusters;
+	unmapped_clusters = status->unmapped_clusters;
 	total_clusters = status->total_clusters;
 	result = status->result;
 
@@ -1770,10 +1774,11 @@ rpc_bdev_lvol_check_shallow_copy(struct spdk_jsonrpc_request *request,
 	spdk_json_write_object_begin(w);
 
 	spdk_json_write_named_uint64(w, "copied_clusters", copied_clusters);
+	spdk_json_write_named_uint64(w, "unmapped_clusters", unmapped_clusters);
 	spdk_json_write_named_uint64(w, "total_clusters", total_clusters);
-	if (copied_clusters < total_clusters && result == 0) {
+	if (copied_clusters + unmapped_clusters < total_clusters && result == 0) {
 		spdk_json_write_named_string(w, "state", "in progress");
-	} else if (copied_clusters == total_clusters && result == 0) {
+	} else if (copied_clusters + unmapped_clusters == total_clusters && result == 0) {
 		spdk_json_write_named_string(w, "state", "complete");
 		LIST_REMOVE(status, link);
 		free(status);

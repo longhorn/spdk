@@ -7335,7 +7335,7 @@ bs_shallow_copy_bdev_write_cpl(struct spdk_io_channel *channel, void *cb_arg, in
 	ctx->cluster++;
 	if (ctx->status_cb) {
 		ctx->copied_clusters_count++;
-		ctx->status_cb(ctx->copied_clusters_count, ctx->status_cb_arg);
+		ctx->status_cb(ctx->copied_clusters_count, 0, ctx->status_cb_arg);
 	}
 
 	bs_shallow_copy_cluster_find_next(ctx);
