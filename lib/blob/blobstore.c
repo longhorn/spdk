@@ -8532,7 +8532,7 @@ spdk_bs_snapshot_get_range_checksum(struct spdk_blob *blob, uint64_t *checksums,
 		return -EINVAL;
 	}
 
-	for (i = cluster_start_index; i < cluster_count; i++) {
+	for (i = 0; i < cluster_count; i++) {
 		checksums[i] = blob->clusters_checksums[cluster_start_index + i];
 	}
 
