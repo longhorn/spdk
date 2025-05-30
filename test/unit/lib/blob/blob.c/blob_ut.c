@@ -10504,6 +10504,99 @@ snapshot_range_checksum(void)
 }
 
 static void
+snapshot_range_checksum_deleted(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob, *snap2;
+	spdk_blob_id blobid, snapid1, snapid2;
+	uint64_t num_clusters = 4;
+	const char *xattr_name = "checksum";
+	struct spdk_io_channel *blob_ch;
+	uint64_t checksums[4];
+	int rc;
+
+	blob_ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(blob_ch != NULL);
+
+	/* Set blob dimension and as thin provisioned */
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.thin_provision = true;
+	blob_opts.num_clusters = num_clusters;
+
+	/* Create a blob */
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	blobid = spdk_blob_get_id(blob);
+
+	/* Make a blob's snapshot */
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapid1 = g_blobid;
+
+	/* Make another blob's snapshot */
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapid2 = g_blobid;
+
+	spdk_bs_open_blob(bs, snapid2, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snap2 = g_blob;
+
+	/* Compute and store range checksum snapid2 snapshot */
+	spdk_bs_snapshot_set_range_checksum(bs, blob_ch, snapid2, xattr_name, NULL, NULL, blob_op_complete,
+					    NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -0);
+
+	/* Get clusters checksums of snapid2 */
+	rc = spdk_bs_snapshot_get_range_checksum(snap2, checksums, 0, 4);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksums[0] == 0);
+	CU_ASSERT(checksums[1] == 0);
+	CU_ASSERT(checksums[2] == 0);
+	CU_ASSERT(checksums[3] == 0);
+
+	/* Detach snapid2 from parent */
+	spdk_bs_blob_detach_parent(bs, snapid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -0);
+
+	/* Get clusters checksums after the snapshot detachment, checksum are still present */
+	rc = spdk_bs_snapshot_get_range_checksum(snap2, checksums, 0, 4);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksums[0] == 0);
+	CU_ASSERT(checksums[1] == 0);
+	CU_ASSERT(checksums[2] == 0);
+	CU_ASSERT(checksums[3] == 0);
+
+	/* Reattach snapid2 to its old parent snapid1 */
+	spdk_bs_blob_set_parent(bs, snapid2, snapid1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Decouple snapid2 from its parent */
+	spdk_bs_blob_decouple_parent(bs, blob_ch, snapid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Get clusters checksums after the snapshot decoupling, checksum have been deleted */
+	rc = spdk_bs_snapshot_get_range_checksum(snap2, checksums, 0, 4);
+	CU_ASSERT(rc == -ENOENT);
+
+	/* Clean up */
+	spdk_bs_free_io_channel(blob_ch);
+	ut_blob_close_and_delete(bs, blob);
+	ut_blob_close_and_delete(bs, snap2);
+	spdk_bs_delete_blob(bs, snapid1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+static void
 suite_bs_setup(void)
 {
 	struct spdk_bs_dev *dev;
@@ -10787,6 +10880,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_esnap_bs, blob_set_external_parent);
 		CU_ADD_TEST(suite_bs, snapshot_checksum);
 		CU_ADD_TEST(suite_bs, snapshot_range_checksum);
+		CU_ADD_TEST(suite_bs, snapshot_range_checksum_deleted);
 	}
 
 	allocate_threads(2);

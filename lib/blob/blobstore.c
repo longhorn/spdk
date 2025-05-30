@@ -7222,8 +7222,10 @@ bs_inflate_blob_done(struct spdk_clone_snapshot_ctx *ctx)
 		_blob->back_bs_dev = bs_create_zeroes_dev();
 	}
 
-	/* Blob data has changed, so I remove clusters checksums */
-	bs_snapshot_free_clusters_checksums(_blob);
+	/* If blob data has changed, I remove clusters checksums */
+	if (ctx->allocate_type != BLOB_INFLATE_ALLOCATE_NONE) {
+		bs_snapshot_free_clusters_checksums(_blob);
+	}
 
 	/* Temporarily override md_ro flag for MD modification */
 	_blob->md_ro = false;
