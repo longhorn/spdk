@@ -5869,17 +5869,16 @@ _blob_inflate_rw(enum blob_inflate_type allocate_type)
 		count = 2;
 		CU_ASSERT(spdk_blob_get_clones(bs, snapshotid, ids, &count) == 0);
 
-		/* snapshotid have two clones now */
-		CU_ASSERT(count == 2);
-		CU_ASSERT(ids[0] == blobid || ids[1] == blobid);
-		CU_ASSERT(ids[0] == snapshot2id || ids[1] == snapshot2id);
+		/* snapshotid have one clone */
+		CU_ASSERT(count == 1);
+		CU_ASSERT(ids[0] == snapshot2id);
 
 		/* snapshot2id have no clones */
 		count = 2;
 		CU_ASSERT(spdk_blob_get_clones(bs, snapshot2id, ids, &count) == 0);
 		CU_ASSERT(count == 0);
 
-		CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapshotid);
+		CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == SPDK_BLOBID_INVALID);
 	}
 
 	/* Try to delete snapshot2 (should pass) */
@@ -5901,7 +5900,12 @@ _blob_inflate_rw(enum blob_inflate_type allocate_type)
 
 	CU_ASSERT(spdk_blob_get_num_clusters(blob) == 5);
 
-	/* Check data consistency on inflated/decoupled or detached blob */
+	/*
+	 * Check data consistency on inflated/decoupled or detached blob
+	 * 	blob  -- AA -- -- --
+	 *	snap2 -- AA -- AA --
+	 *	snap  E5 E5 E5 E5 --
+	 */
 	memset(payload_read, 0xFF, payload_size);
 	spdk_blob_io_read(blob, channel, payload_read, 0, pages_per_payload,
 			  blob_op_complete, NULL);
@@ -5910,12 +5914,16 @@ _blob_inflate_rw(enum blob_inflate_type allocate_type)
 	if (allocate_type != BLOB_INFLATE_ALLOCATE_NONE) {
 		CU_ASSERT(memcmp(payload_clone, payload_read, payload_size) == 0);
 	} else {
-		CU_ASSERT(memcmp(payload_clone, payload_read, cluster_size * 3) == 0);
-		/* Blob's 4th clsuter is not allocated, because the detachment from its parent doesn't copy any data,
-		 * so we read 0xE5 from snapshot. We can find this data pattern at the beginning of payload_clone. */
-		CU_ASSERT(memcmp(payload_clone, payload_read + cluster_size * 3, cluster_size) == 0);
+		/* Clusters at index 0,2,3,4 are unallocated, so I compare with last cluster of payload_clone */
+		CU_ASSERT(memcmp(payload_clone + cluster_size * 4, payload_read, cluster_size) == 0);
+		CU_ASSERT(memcmp(payload_clone + cluster_size * 4, payload_read + cluster_size * 2,
+				 cluster_size) == 0);
+		CU_ASSERT(memcmp(payload_clone + cluster_size * 4, payload_read + cluster_size * 3,
+				 cluster_size) == 0);
 		CU_ASSERT(memcmp(payload_clone + cluster_size * 4, payload_read + cluster_size * 4,
 				 cluster_size) == 0);
+		/* Cluster at index 1 has data */
+		CU_ASSERT(memcmp(payload_clone + cluster_size, payload_read + cluster_size, cluster_size) == 0);
 	}
 
 	spdk_bs_free_io_channel(channel);

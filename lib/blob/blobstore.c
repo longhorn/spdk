@@ -7209,7 +7209,7 @@ bs_inflate_blob_done(struct spdk_clone_snapshot_ctx *ctx)
 		assert(!blob_is_esnap_clone(_blob));
 
 		_parent = ((struct spdk_blob_bs_dev *)(_blob->back_bs_dev))->blob;
-		if (_parent->parent_id != SPDK_BLOBID_INVALID) {
+		if (_parent->parent_id != SPDK_BLOBID_INVALID && ctx->allocate_type != BLOB_INFLATE_ALLOCATE_NONE) {
 			/* We must change the parent of the inflated blob */
 			spdk_bs_open_blob(_blob->bs, _parent->parent_id,
 					  bs_inflate_blob_set_parent_cpl, ctx);
