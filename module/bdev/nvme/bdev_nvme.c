@@ -200,6 +200,7 @@ struct spdk_thread *g_bdev_nvme_init_thread;
 static struct spdk_poller *g_hotplug_poller;
 static struct spdk_poller *g_hotplug_probe_poller;
 static struct spdk_nvme_probe_ctx *g_hotplug_probe_ctx;
+static enum spdk_nvme_transport_type g_nvme_trtype = SPDK_NVME_TRANSPORT_CUSTOM;
 
 static void nvme_ctrlr_populate_namespaces(struct nvme_ctrlr *nvme_ctrlr,
 		struct nvme_async_probe_ctx *ctx);
@@ -3797,6 +3798,17 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 	}
 
 	period = spdk_interrupt_mode_is_enabled() ? 0 : g_opts.nvme_ioq_poll_period_us;
+	if (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype == SPDK_NVME_TRANSPORT_TCP)) {
+		/* For TCP transport in interrupt mode, the IO queue must be polled periodically
+		 * to flush data. Since TCP transport does not automatically push data to
+		 * the OS stack, we poll periodically to ensure timely processing of IO
+		 * commands.
+		 *
+		 * Unit is in milliseconds.
+		 * https://github.com/spdk/spdk/blob/3cb3145bfa22a650a01c1183332a9f8c5bd2f868/doc/jsonrpc.md?plain=1#L3995
+		 */
+		period = 100;
+	}
 	group->poller = SPDK_POLLER_REGISTER(bdev_nvme_poll, group, period);
 
 	if (group->poller == NULL) {
@@ -3804,7 +3816,10 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 		return -1;
 	}
 
-	if (spdk_interrupt_mode_is_enabled()) {
+	/* Skip interrupt registration for TCP transport as it still requires periodic
+	 * polling to check and flush the IO queue.
+	 */
+	if (spdk_interrupt_mode_is_enabled() && g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP) {
 		spdk_poller_register_interrupt(group->poller, NULL, NULL);
 
 		fgrp = spdk_nvme_poll_group_get_fd_group(group->group);
@@ -6713,6 +6728,14 @@ spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 		SPDK_ERRLOG("A controller with the provided trid (traddr: %s, hostnqn: %s) "
 			    "already exists.\n", trid->traddr, drv_opts->hostnqn);
 		return -EEXIST;
+	}
+
+	if (g_nvme_trtype == SPDK_NVME_TRANSPORT_CUSTOM) {
+		g_nvme_trtype = trid->trtype;
+	} else if (g_nvme_trtype != trid->trtype) {
+		SPDK_ERRLOG("NVMe transport type %s is not supported.\n",
+			    spdk_nvme_transport_id_trtype_str(trid->trtype));
+		return -ENOTSUP;
 	}
 
 	len = strnlen(base_name, SPDK_CONTROLLER_NAME_MAX);
