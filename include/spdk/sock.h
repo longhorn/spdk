@@ -710,6 +710,14 @@ int spdk_sock_group_poll_count(struct spdk_sock_group *group, int max_events);
 int spdk_sock_group_close(struct spdk_sock_group **group);
 
 /**
+ * Retrieve the file descriptor associated with a given SPDK socket.
+ *
+ * @param sock Pointer to an spdk_sock structure representing the socket.
+ * @return The file descriptor of the socket on success, or -1 on failure.
+ */
+int spdk_get_sock_fd(struct spdk_sock *sock);
+
+/**
  * Get the optimal sock group for this sock.
  *
  * This function is allowed only when connection is established.

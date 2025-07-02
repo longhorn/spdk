@@ -188,6 +188,12 @@ _sock_impl_get_opts(struct spdk_sock_impl_opts *opts, struct spdk_sock_impl_opts
 }
 
 static int
+posix_sock_get_fd(struct spdk_sock *sock) {
+	struct spdk_posix_sock *posix_sock = __posix_sock(sock);
+	return posix_sock->fd;
+}
+
+static int
 posix_sock_impl_get_opts(struct spdk_sock_impl_opts *opts, size_t *len)
 {
 	return _sock_impl_get_opts(opts, &g_posix_impl_opts, len);
@@ -2456,6 +2462,7 @@ static struct spdk_net_impl g_posix_net_impl = {
 	.group_impl_close	= posix_sock_group_impl_close,
 	.get_opts	= posix_sock_impl_get_opts,
 	.set_opts	= posix_sock_impl_set_opts,
+	.get_fd 	= posix_sock_get_fd,
 };
 
 SPDK_NET_IMPL_REGISTER_DEFAULT(posix, &g_posix_net_impl);

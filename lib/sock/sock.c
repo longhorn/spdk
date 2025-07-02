@@ -206,6 +206,11 @@ spdk_sock_map_find_free(struct spdk_sock_map *map)
 }
 
 int
+spdk_get_sock_fd(struct spdk_sock *sock) {
+	return sock->net_impl->get_fd(sock);
+}
+
+int
 spdk_sock_get_optimal_sock_group(struct spdk_sock *sock, struct spdk_sock_group **group,
 				 struct spdk_sock_group *hint)
 {

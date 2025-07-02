@@ -1002,6 +1002,34 @@ nvme_tcp_qpair_reset(struct spdk_nvme_qpair *qpair)
 	return 0;
 }
 
+static int
+nvme_tcp_qpair_get_fd(struct spdk_nvme_qpair *qpair, struct spdk_event_handler_opts *opts)
+{
+	struct spdk_nvme_ctrlr *ctrlr = qpair->ctrlr;
+	struct nvme_tcp_qpair *tqpair;
+	int fd;
+
+	if (!ctrlr->opts.enable_interrupts) {
+		return -1;
+	}
+
+	if (!qpair) {
+        return -EINVAL;
+    }
+
+    tqpair = nvme_tcp_qpair(qpair);  // Convert generic qpair to TCP qpair
+    if (!tqpair || !tqpair->sock) {
+        return -EINVAL;
+    }
+
+	fd = spdk_get_sock_fd(tqpair->sock);
+	if (fd < 0) {
+		return -EINVAL;
+	}
+
+	return fd;
+}
+
 static void
 nvme_tcp_req_complete(struct nvme_tcp_req *tcp_req,
 		      struct nvme_tcp_qpair *tqpair,
@@ -2671,6 +2699,11 @@ nvme_tcp_ctrlr_get_max_sges(struct spdk_nvme_ctrlr *ctrlr)
 	return NVME_TCP_MAX_SGL_DESCRIPTORS;
 }
 
+static int nvme_tcp_ctrlr_enable_interrupts(struct spdk_nvme_ctrlr *ctrlr)
+{
+    return 0;
+}
+
 static int
 nvme_tcp_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
 				int (*iter_fn)(struct nvme_request *req, void *arg),
@@ -2905,6 +2938,11 @@ static void
 nvme_tcp_poll_group_check_disconnected_qpairs(struct spdk_nvme_transport_poll_group *tgroup,
 		spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
 {
+	struct spdk_nvme_qpair *qpair, *tmp_qpair;
+
+	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
+		disconnected_qpair_cb(qpair, tgroup->group->ctx);
+	}
 }
 
 static int
@@ -2980,6 +3018,7 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 	.ctrlr_scan = nvme_fabric_ctrlr_scan,
 	.ctrlr_destruct = nvme_tcp_ctrlr_destruct,
 	.ctrlr_enable = nvme_tcp_ctrlr_enable,
+	.ctrlr_enable_interrupts = nvme_tcp_ctrlr_enable_interrupts,
 
 	.ctrlr_set_reg_4 = nvme_fabric_ctrlr_set_reg_4,
 	.ctrlr_set_reg_8 = nvme_fabric_ctrlr_set_reg_8,
@@ -3006,6 +3045,7 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 	.qpair_process_completions = nvme_tcp_qpair_process_completions,
 	.qpair_iterate_requests = nvme_tcp_qpair_iterate_requests,
 	.qpair_authenticate = nvme_tcp_qpair_authenticate,
+	.qpair_get_fd = nvme_tcp_qpair_get_fd,
 	.admin_qpair_abort_aers = nvme_tcp_admin_qpair_abort_aers,
 
 	.poll_group_create = nvme_tcp_poll_group_create,
