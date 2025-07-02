@@ -513,7 +513,10 @@ nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nv
 		goto err;
 	}
 
-	if (qpair->poll_group) {
+	/* Skip TCP I/O queue pair registration since it's already handled in
+	 * nvme_transport_connect_qpair.
+	 */
+	if (qpair->poll_group && (ctrlr->trid.trtype != SPDK_NVME_TRANSPORT_TCP)) {
 		rc = nvme_poll_group_connect_qpair(qpair);
 		if (rc) {
 			goto err;
