@@ -523,7 +523,13 @@ nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nv
 		}
 	}
 
-	if (!qpair->async) {
+	/* For the TCP transport, we poll the I/O queue periodically using g_opts.nvme_ioq_poll_period_us,
+	 * and do no wait synchronously for the qpair to connect. This allows the NVMe-oF
+	 * initiator to send the command and gives the target an opportunity to process
+	 * and respond without blocking. This unblocks when the initiator and target
+	 * are running on the same host.
+	 */
+	if (!qpair->async && (ctrlr->trid.trtype != SPDK_NVME_TRANSPORT_TCP)) {
 		/* Busy wait until the qpair exits the connecting state */
 		while (nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING) {
 			if (qpair->poll_group && spdk_nvme_ctrlr_is_fabrics(ctrlr)) {
