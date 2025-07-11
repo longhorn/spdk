@@ -11,6 +11,7 @@
 
 #include "nvme_internal.h"
 #include "spdk/queue.h"
+#include "spdk/thread.h"
 
 #define SPDK_MAX_NUM_OF_TRANSPORTS 16
 
@@ -493,6 +494,95 @@ nvme_transport_connect_qpair_fail(struct spdk_nvme_qpair *qpair, void *unused)
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
 }
 
+typedef void (*connect_complete_cb)(struct spdk_nvme_qpair *qpair, int status, void *cb_arg);
+
+struct connect_ctx {
+    struct spdk_nvme_qpair *qpair;
+    struct spdk_nvme_poll_group *poll_group;
+    struct spdk_poller *poller;
+
+    connect_complete_cb cb_fn;
+    void *cb_arg;
+};
+
+static void
+nvme_connect_complete(struct connect_ctx *ctx, int status)
+{
+    if (ctx->cb_fn) {
+        ctx->cb_fn(ctx->qpair, status, ctx->cb_arg);
+    }
+
+    spdk_poller_unregister(&ctx->poller);
+    free(ctx);
+}
+
+static int
+nvme_connect_poller(void *arg)
+{
+    struct connect_ctx *ctx = arg;
+    struct spdk_nvme_qpair *qpair = ctx->qpair;
+    int rc;
+
+    if (ctx->poll_group && spdk_nvme_ctrlr_is_fabrics(qpair->ctrlr)) {
+        rc = spdk_nvme_poll_group_process_completions(ctx->poll_group, 0,
+                                                      nvme_transport_connect_qpair_fail);
+    } else {
+        rc = spdk_nvme_qpair_process_completions(qpair, 0);
+    }
+
+    if (rc < 0) {
+        nvme_connect_complete(ctx, rc);
+        return SPDK_POLLER_BUSY;
+    }
+
+    if (nvme_qpair_get_state(qpair) != NVME_QPAIR_CONNECTING) {
+        nvme_connect_complete(ctx, 0);
+        return SPDK_POLLER_BUSY;
+    }
+
+    return SPDK_POLLER_BUSY;
+}
+
+int
+start_async_qpair_connect(struct spdk_nvme_qpair *qpair,
+                          connect_complete_cb cb_fn,
+                          void *cb_arg)
+{
+    struct connect_ctx *ctx;
+
+    if (!qpair || !qpair->poll_group) {
+        return -EINVAL;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        return -ENOMEM;
+    }
+
+    ctx->qpair = qpair;
+    ctx->poll_group = qpair->poll_group->group;
+    ctx->cb_fn = cb_fn;
+    ctx->cb_arg = cb_arg;
+
+    ctx->poller = spdk_poller_register(nvme_connect_poller, ctx, 1000 /* 1ms */);
+    if (!ctx->poller) {
+        free(ctx);
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static void
+nvme_qpair_connect_completion_cb(struct spdk_nvme_qpair *qpair, int status, void *cb_arg)
+{
+    if (status == 0) {
+        SPDK_NOTICELOG("NVMe qpair %p connected successfully.\n", (void *)qpair);
+    } else {
+        SPDK_ERRLOG("Failed to connect NVMe qpair %p (status: %d).\n", (void *)qpair, status);
+    }
+}
+
 int
 nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
@@ -523,25 +613,31 @@ nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nv
 		}
 	}
 
-	/* For the TCP transport, we poll the I/O queue periodically using g_opts.nvme_ioq_poll_period_us,
-	 * and do no wait synchronously for the qpair to connect. This allows the NVMe-oF
-	 * initiator to send the command and gives the target an opportunity to process
-	 * and respond without blocking. This unblocks when the initiator and target
-	 * are running on the same host.
-	 */
-	if (!qpair->async && (ctrlr->trid.trtype != SPDK_NVME_TRANSPORT_TCP)) {
-		/* Busy wait until the qpair exits the connecting state */
-		while (nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING) {
-			if (qpair->poll_group && spdk_nvme_ctrlr_is_fabrics(ctrlr)) {
-				rc = spdk_nvme_poll_group_process_completions(
-					     qpair->poll_group->group, 0,
-					     nvme_transport_connect_qpair_fail);
-			} else {
-				rc = spdk_nvme_qpair_process_completions(qpair, 0);
-			}
+	if (!qpair->async) {
+		if (ctrlr->trid.trtype != SPDK_NVME_TRANSPORT_TCP) {
+			/* Busy wait until the qpair exits the connecting state */
+			while (nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING) {
+				if (qpair->poll_group && spdk_nvme_ctrlr_is_fabrics(ctrlr)) {
+					rc = spdk_nvme_poll_group_process_completions(
+							qpair->poll_group->group, 0,
+						    nvme_transport_connect_qpair_fail);
+				} else {
+					rc = spdk_nvme_qpair_process_completions(qpair, 0);
+				}
 
-			if (rc < 0) {
-				goto err;
+				if (rc < 0) {
+					goto err;
+				}
+			}
+		} else {
+			/*
+			 * Non-blocking path for TCP transport. Use a poller to complete connection
+			 * asynchronously.
+			 */
+			rc = start_async_qpair_connect(qpair, nvme_qpair_connect_completion_cb, NULL);
+			if (rc != 0) {
+			    SPDK_ERRLOG("Failed to start async connect: %d\n", rc);
+			    goto err;
 			}
 		}
 	}
