@@ -13,7 +13,11 @@ C_SRCS := spdk_tgt.c
 
 SPDK_LIB_LIST = $(ALL_MODULES_LIST)
 
-SPDK_LIB_LIST += event event_iscsi event_nvmf
+# The iSCSI subsystem is not used in Longhorn V2. To support interrupt mode,
+# Exclude event_iscsi from SPDK_LIB_LIST to prevent its initialization.
+#
+# SPDK_LIB_LIST += event event_iscsi event_nvmf
+SPDK_LIB_LIST += event event_nvmf
 
 ifeq ($(SPDK_ROOT_DIR)/lib/env_dpdk,$(CONFIG_ENV))
 SPDK_LIB_LIST += env_dpdk_rpc
