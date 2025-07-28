@@ -5986,12 +5986,16 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
 		spdk_bdev_nvme_get_default_ctrlr_opts(&nvme_ctrlr->opts);
 	}
 
-	period = spdk_interrupt_mode_is_enabled() ? 0 : g_opts.nvme_adminq_poll_period_us;
+	/* In interrupt mode, NVMe/TCP requires periodic polling of the admin queue
+	* to ensure timely Keep Alive command completion. Unlike PCIe, TCP transport
+	* does not provide hardware interrupts for admin completions.
+	*/
+	period = (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP)) ? 0 : g_opts.nvme_adminq_poll_period_us;
 
 	nvme_ctrlr->adminq_timer_poller = SPDK_POLLER_REGISTER(bdev_nvme_poll_adminq, nvme_ctrlr,
 					  period);
 
-	if (spdk_interrupt_mode_is_enabled()) {
+	if (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP)){
 		spdk_poller_register_interrupt(nvme_ctrlr->adminq_timer_poller, NULL, NULL);
 
 		fd = spdk_nvme_ctrlr_get_admin_qp_fd(nvme_ctrlr->ctrlr, &opts);
