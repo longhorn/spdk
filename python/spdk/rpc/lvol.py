@@ -331,6 +331,17 @@ def bdev_lvol_start_deep_copy(client, src_lvol_name, dst_bdev_name):
     }
     return client.call('bdev_lvol_start_deep_copy', params)
 
+def bdev_lvol_check_deep_copy(client, operation_id):
+    """Get deep copy status
+
+    Args:
+        operation_id: operation identifier
+    """
+    params = {
+        'operation_id': operation_id
+    }
+    return client.call('bdev_lvol_check_deep_copy', params)
+
 def bdev_lvol_set_parent(client, lvol_name, parent_name):
     """Set the parent snapshot of a lvol
 

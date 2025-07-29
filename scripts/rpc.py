@@ -2266,6 +2266,14 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('dst_bdev_name', help='destination bdev name')
     p.set_defaults(func=bdev_lvol_start_deep_copy)
 
+    def bdev_lvol_check_deep_copy(args):
+        print_json(rpc.lvol.bdev_lvol_check_deep_copy(args.client,
+                                                         operation_id=args.operation_id))
+
+    p = subparsers.add_parser('bdev_lvol_check_deep_copy', help='Get deep copy status')
+    p.add_argument('operation_id', help='operation identifier', type=int)
+    p.set_defaults(func=bdev_lvol_check_deep_copy)
+
     def bdev_lvol_set_parent(args):
         rpc.lvol.bdev_lvol_set_parent(args.client,
                                       lvol_name=args.lvol_name,

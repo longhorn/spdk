@@ -504,6 +504,7 @@ Example response:
     "bdev_lvol_start_range_shallow_copy",
     "bdev_lvol_check_shallow_copy",
     "bdev_lvol_start_deep_copy",
+    "bdev_lvol_check_deep_copy",
     "bdev_lvol_set_parent",
     "bdev_lvol_set_parent_bdev",
     "bdev_lvol_get_fragmap",
@@ -11375,6 +11376,55 @@ Example response:
   "id": 1,
   "result": {
     "operation_id": 7
+  }
+}
+~~~
+
+### bdev_lvol_check_deep_copy {#rpc_bdev_lvol_check_deep_copy}
+
+Get deep copy status.
+
+#### Result
+
+Get info about the deep copy operation identified by operation id.
+It reports operation's status, which can be `in progress`, `complete` or `error`,
+the actual number of processed clusters, the total number of clusters to process and,
+in case of error, a description.
+Once the operation is ended and the result has been retrieved, the
+operation is removed from the internal list of ended operation, so its
+result cannot be accessed anymore.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+operation_id            | Required | number      | operation identifier
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_lvol_check_deep_copy",
+  "id": 1,
+  "params": {
+    "operation_id": 7
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "state": "in progress",
+    "processed_clusters": 2,
+    "total_clusters": 4
   }
 }
 ~~~
