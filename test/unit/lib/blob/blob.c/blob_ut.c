@@ -4759,8 +4759,9 @@ blob_thin_prov_rw(void)
 	if (g_use_extent_table) {
 		/* Add one more page for EXTENT_PAGE write */
 		expected_bytes += spdk_bs_get_page_size(bs);
-	}	
-	CU_ASSERT(((g_dev_write_bytes - write_bytes)-(g_dev_write_zeroes_bytes - write_zeroes_bytes)) == expected_bytes);
+	}
+	CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+		  expected_bytes);
 	CU_ASSERT(g_dev_read_bytes - read_bytes == 0);
 
 	spdk_blob_io_read(blob, channel, payload_read, 4, 10, blob_op_complete, NULL);
@@ -4871,7 +4872,8 @@ blob_thin_prov_write_count_io(void)
 			 */
 			expected_bytes = io_unit_size + 2 * spdk_bs_get_page_size(bs);
 		}
-		CU_ASSERT(((g_dev_write_bytes - write_bytes)-(g_dev_write_zeroes_bytes - write_zeroes_bytes)) == expected_bytes);
+		CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+			  expected_bytes);
 
 		/* The write should have synced the metadata already.  Do another sync here
 		 * just to confirm.
@@ -4905,7 +4907,8 @@ blob_thin_prov_write_count_io(void)
 		 * For extent table metadata, we should have written the I/O and the extent metadata page.
 		 */
 		expected_bytes = io_unit_size + spdk_bs_get_page_size(bs);
-		CU_ASSERT(((g_dev_write_bytes - write_bytes)-(g_dev_write_zeroes_bytes - write_zeroes_bytes)) == expected_bytes);
+		CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+			  expected_bytes);
 
 		/* Send unmap aligned to the whole cluster - should free it up */
 		g_bserrno = -1;
@@ -5261,7 +5264,8 @@ blob_thin_prov_rle(void)
 		/* Add one more page for EXTENT_PAGE write */
 		expected_bytes += spdk_bs_get_page_size(bs);
 	}
-	CU_ASSERT(((g_dev_write_bytes - write_bytes)-(g_dev_write_zeroes_bytes - write_zeroes_bytes)) == expected_bytes);
+	CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+		  expected_bytes);
 	CU_ASSERT(g_dev_read_bytes - read_bytes == 0);
 
 	spdk_blob_io_read(blob, channel, payload_read, io_unit, 10, blob_op_complete, NULL);
