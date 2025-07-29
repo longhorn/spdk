@@ -388,6 +388,10 @@ These RPCs use the new API `spdk_lvol_shallow_copy()`.
 Added `bdev_lvol_set_parent` and `bdev_lvol_set_parent_bdev` RPC to change the parent of an existing lvol
 with the use of the new APIs `spdk_lvol_set_parent()` and `spdk_lvol_set_external_parent()`.
 
+Added `bdev_lvol_start_deep_copy` RPC to start a deep copy of an lvol over a given bdev and
+`bdev_lvol_check_deep_copy` RPC to get the status of the operation.
+These RPCs use the new API `spdk_lvol_deep_copy()`.
+
 ### nvme
 
 Added `spdk_nvme_ctrlr_get_max_sges()` API to retrieve maximum number of SGEs per request
@@ -479,6 +483,9 @@ like rebuild.
 
 Added `spdk_bs_grow_live()` and `spdk_bdev_update_bs_blockcnt()` API that can be used to
 increase size of blobstore filling the underlying device without first closing the blobstore.
+
+Added new API `spdk_bs_blob_deep_copy` to make a deep copy from a blob to a blobstore device. Only clusters
+allocated to the blob or blob's ancestors will be written on the device.
 
 ### env
 

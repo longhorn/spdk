@@ -212,6 +212,16 @@ bdev_lvol_check_shallow_copy [-h] operation_id
     Get shallow copy status
     optional arguments:
     -h, --help  show help
+bdev_lvol_start_deep_copy [-h] src_lvol_name dst_bdev_name
+    Make a deep copy of lvol over a given bdev
+    This RPC starts the operation and returns an identifier that can be used to query the status
+    of the operation with the RPC bdev_lvol_check_deep_copy.
+    optional arguments:
+    -h, --help  show help
+bdev_lvol_check_deep_copy [-h] operation_id
+    Get deep copy status
+    optional arguments:
+    -h, --help  show help
 bdev_lvol_set_parent [-h] lvol_name snapshot_name
     Set the parent snapshot of a lvol
     optional arguments:

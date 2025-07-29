@@ -446,6 +446,13 @@ than blob's size and blob store's block size must be an integer multiple of devi
 This functionality can be used to recreate the entire snapshot stack of a blob into a different blob
 store.
 
+#### Deep Copy {#blob_deep_copy}
+
+A read only blob can be copied over a blob store device in a way that only clusters
+allocated to the blob or blob's ancestors will be written on the device. This device must have a size equal or greater
+than blob's size and blob store's block size must be an integer multiple of device's block size.
+This functionality can be used to make a full copy of a blob into a different blob on the same or different blobstore.
+
 #### Change the parent of a blob {#blob_reparent}
 
 We can change the parent of a thin provisioned blob, making the blob a clone of a snapshot of the
