@@ -317,6 +317,19 @@ def bdev_lvol_check_shallow_copy(client, operation_id):
     }
     return client.call('bdev_lvol_check_shallow_copy', params)
 
+def bdev_lvol_start_deep_copy(client, src_lvol_name, dst_bdev_name):
+    """Start a deep copy of a lvol over a given bdev. The status of the operation
+    can be obtained with bdev_lvol_check_deep_copy
+
+    Args:
+        src_lvol_name: name of lvol to create a copy from
+        bdev_name: name of the bdev that acts as destination for the copy
+    """
+    params = {
+        'src_lvol_name': src_lvol_name,
+        'dst_bdev_name': dst_bdev_name
+    }
+    return client.call('bdev_lvol_start_deep_copy', params)
 
 def bdev_lvol_set_parent(client, lvol_name, parent_name):
     """Set the parent snapshot of a lvol
