@@ -31,6 +31,7 @@
 	spdk_lvol_get_by_names;
 	spdk_lvol_is_degraded;
 	spdk_lvol_shallow_copy;
+	spdk_lvol_deep_copy;
 	spdk_lvol_range_shallow_copy;
 	spdk_lvol_set_parent;
 	spdk_lvol_set_external_parent;

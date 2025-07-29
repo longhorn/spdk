@@ -287,6 +287,16 @@ spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_chann
 	return 0;
 }
 
+int
+spdk_bs_blob_deep_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+		       spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+		       spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+		       spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+	return 0;
+}
+
 bool
 spdk_blob_is_snapshot(struct spdk_blob *blob)
 {
@@ -3679,6 +3689,66 @@ lvol_range_shallow_copy(void)
 }
 
 static void
+lvol_deep_copy(void)
+{
+	struct lvol_ut_bs_dev bs_dev;
+	struct spdk_lvs_opts opts;
+	struct spdk_bs_dev ext_dev;
+	int rc = 0;
+
+	init_dev(&bs_dev);
+
+	ext_dev.blocklen = DEV_BUFFER_BLOCKLEN;
+	ext_dev.blockcnt = BS_CLUSTER_SIZE / DEV_BUFFER_BLOCKLEN;
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&bs_dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", BS_CLUSTER_SIZE, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	/* Successful deep copy */
+	g_blob_read_only = true;
+	rc = spdk_lvol_deep_copy(g_lvol, &ext_dev, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Deep copy with null lvol */
+	rc = spdk_lvol_deep_copy(NULL, &ext_dev, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Deep copy with null ext_dev */
+	rc = spdk_lvol_shallow_copy(g_lvol, NULL, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&bs_dev);
+
+	/* Make sure that all references to the io_channel was closed after
+	 * deep copy call
+	 */
+	CU_ASSERT(g_io_channel == NULL);
+}
+
+static void
 lvol_set_parent(void)
 {
 	struct lvol_ut_bs_dev bs1_dev;
@@ -4021,6 +4091,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_esnap_hotplug);
 	CU_ADD_TEST(suite, lvol_get_by);
 	CU_ADD_TEST(suite, lvol_shallow_copy);
+	CU_ADD_TEST(suite, lvol_deep_copy);
 	CU_ADD_TEST(suite, lvol_range_shallow_copy);
 	CU_ADD_TEST(suite, lvol_set_parent);
 	CU_ADD_TEST(suite, lvol_set_external_parent);
