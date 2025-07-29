@@ -41,6 +41,7 @@
 	spdk_bs_blob_decouple_parent;
 	spdk_bs_blob_detach_parent;
 	spdk_bs_blob_shallow_copy;
+	spdk_bs_blob_deep_copy;
 	spdk_bs_blob_range_shallow_copy;
 	spdk_bs_blob_set_parent;
 	spdk_bs_blob_set_external_parent;

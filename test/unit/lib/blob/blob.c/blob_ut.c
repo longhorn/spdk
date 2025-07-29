@@ -33,6 +33,7 @@ uint64_t g_ctx = 1729;
 bool g_use_extent_table = false;
 uint64_t g_copied_clusters_count = 0;
 uint64_t g_unmapped_clusters_count = 0;
+uint64_t g_processed_clusters_count = 0;
 
 struct spdk_bs_super_block_ver1 {
 	uint8_t		signature[8];
@@ -211,6 +212,13 @@ blob_shallow_copy_status_cb(uint64_t copied_clusters, uint64_t unmapped_clusters
 	g_copied_clusters_count = copied_clusters;
 	g_unmapped_clusters_count = unmapped_clusters;
 }
+
+static void
+blob_deep_copy_status_cb(uint64_t processed_clusters, void *cb_arg)
+{
+	g_processed_clusters_count = processed_clusters;
+}
+
 
 static bool
 blob_snapshot_checksum_stop_cb(void *cb_arg)
@@ -10215,6 +10223,171 @@ blob_range_shallow_copy(void)
 }
 
 static void
+blob_deep_copy(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	uint64_t num_clusters = 4;
+	struct spdk_bs_dev *ext_dev;
+	struct spdk_bs_dev_cb_args ext_args;
+	struct spdk_io_channel *bdev_ch, *blob_ch;
+	uint8_t buf1[DEV_BUFFER_BLOCKLEN];
+	uint8_t buf2[DEV_BUFFER_BLOCKLEN];
+	uint64_t io_units_per_cluster;
+	uint64_t offset;
+	int rc;
+
+	blob_ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(blob_ch != NULL);
+
+	/* Set blob dimension and as thin provisioned */
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.thin_provision = true;
+	blob_opts.num_clusters = num_clusters;
+
+	/* Create a blob */
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	blobid = spdk_blob_get_id(blob);
+	io_units_per_cluster = bs_io_units_per_cluster(blob);
+
+	/* Write on cluster 2 and 4 of blob */
+	for (offset = io_units_per_cluster; offset < 2 * io_units_per_cluster; offset++) {
+		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
+		spdk_blob_io_write(blob, blob_ch, buf1, offset, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	for (offset = 3 * io_units_per_cluster; offset < 4 * io_units_per_cluster; offset++) {
+		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
+		spdk_blob_io_write(blob, blob_ch, buf1, offset, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 2);
+
+	/* Make a snapshot over blob */
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
+
+	/* Write on cluster 1 of blob */
+	for (offset = 0; offset < io_units_per_cluster; offset++) {
+		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
+		spdk_blob_io_write(blob, blob_ch, buf1, offset, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+
+	/* Deep copy with a not read only blob */
+	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN);
+	rc = spdk_bs_blob_deep_copy(bs, blob_ch, blobid, ext_dev,
+				    blob_deep_copy_status_cb, NULL,
+				    blob_op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EPERM);
+	ext_dev->destroy(ext_dev);
+
+	/* Set blob read only */
+	spdk_blob_set_read_only(blob);
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Deep copy over a spdk_bs_dev with incorrect size */
+	ext_dev = init_ext_dev(1, DEV_BUFFER_BLOCKLEN);
+	rc = spdk_bs_blob_deep_copy(bs, blob_ch, blobid, ext_dev,
+				    blob_deep_copy_status_cb, NULL,
+				    blob_op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+	ext_dev->destroy(ext_dev);
+
+	/* Deep copy over a spdk_bs_dev with incorrect block len */
+	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN * 2);
+	rc = spdk_bs_blob_deep_copy(bs, blob_ch, blobid, ext_dev,
+				    blob_deep_copy_status_cb, NULL,
+				    blob_op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+	ext_dev->destroy(ext_dev);
+
+	/* Initialize ext_dev for the successuful deep copy */
+	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN);
+	bdev_ch = ext_dev->create_channel(ext_dev);
+	SPDK_CU_ASSERT_FATAL(bdev_ch != NULL);
+	ext_args.cb_fn = bs_dev_io_complete_cb;
+	for (offset = 0; offset < 4 * io_units_per_cluster; offset++) {
+		memset(buf2, 0xff, DEV_BUFFER_BLOCKLEN);
+		ext_dev->write(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+
+	/* Correct deep copy of blob over bdev */
+	rc = spdk_bs_blob_deep_copy(bs, blob_ch, blobid, ext_dev,
+				    blob_deep_copy_status_cb, NULL,
+				    blob_op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	poll_thread_times(0, 1);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_processed_clusters_count == 1);
+	poll_thread_times(0, 1);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_processed_clusters_count == 2);
+	poll_thread_times(0, 1);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_processed_clusters_count == 4);
+
+
+	/* Read from bdev */
+	/* Only cluster 1, 2, and 4 must be filled */
+	/* Cluster 3 should not have been touched */
+	for (offset = 0; offset < io_units_per_cluster; offset++) {
+		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
+	}
+	for (offset = io_units_per_cluster; offset < 2 * io_units_per_cluster; offset++) {
+		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
+	}
+	for (offset = 2 * io_units_per_cluster; offset < 3 * io_units_per_cluster; offset++) {
+		memset(buf1, 0xff, DEV_BUFFER_BLOCKLEN);
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
+	}
+	for (offset = 3 * io_units_per_cluster; offset < 4 * io_units_per_cluster; offset++) {
+		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
+	}
+
+	/* Clean up */
+	ext_dev->destroy_channel(ext_dev, bdev_ch);
+	ext_dev->destroy(ext_dev);
+	spdk_bs_free_io_channel(blob_ch);
+	ut_blob_close_and_delete(bs, blob);
+	poll_threads();
+}
+
+static void
 blob_set_parent(void)
 {
 	struct spdk_blob_store *bs = g_bs;
@@ -11087,6 +11260,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_clone_resize);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
+		CU_ADD_TEST(suite_bs, blob_deep_copy);
 		CU_ADD_TEST(suite_bs, blob_range_shallow_copy);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_parent);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_external_parent);

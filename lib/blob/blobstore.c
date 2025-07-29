@@ -48,6 +48,7 @@ static void blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, 
 
 static void bs_shallow_copy_cluster_find_next(void *cb_arg);
 static void bs_range_shallow_copy_cluster_handle_next(void *cb_arg);
+static void bs_deep_copy_cluster_find_next(void *cb_arg);
 static void bs_snapshot_checksum_cluster_find_next(void *cb_arg);
 
 static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
@@ -7854,7 +7855,7 @@ spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_chann
 	if (!ext_channel) {
 		spdk_free(ctx->read_buff);
 		free(ctx);
-		return -ENOMEM;
+		return -1;
 	}
 	ctx->ext_dev = ext_dev;
 	ctx->ext_channel = ext_channel;
@@ -7864,6 +7865,257 @@ spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_chann
 	return 0;
 }
 /* END spdk_bs_blob_range_shallow_copy */
+
+/* START spdk_bs_blob_deep_copy */
+struct deep_copy_ctx {
+	struct spdk_bs_cpl cpl;
+	int bserrno;
+
+	/* Blob source for copy */
+	struct spdk_blob_store *bs;
+	spdk_blob_id blobid;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *blob_channel;
+
+	/* Destination device for copy */
+	struct spdk_bs_dev *ext_dev;
+	struct spdk_io_channel *ext_channel;
+
+	/* Current cluster for copy operation */
+	uint64_t cluster;
+
+	/* Buffer for blob reading */
+	uint8_t *read_buff;
+
+	/* Struct for external device writing */
+	struct spdk_bs_dev_cb_args ext_args;
+
+	/* Status callback for updates about the ongoing operation */
+	spdk_blob_deep_copy_status status_cb;
+
+	/* Argument passed to function status_cb */
+	void *status_cb_arg;
+};
+
+static void
+bs_deep_copy_cleanup_finish(void *cb_arg, int bserrno)
+{
+	struct deep_copy_ctx *ctx = cb_arg;
+	struct spdk_bs_cpl *cpl = &ctx->cpl;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 " deep copy, cleanup error %d\n", ctx->blob->id, bserrno);
+		ctx->bserrno = bserrno;
+	}
+
+	ctx->ext_dev->destroy_channel(ctx->ext_dev, ctx->ext_channel);
+	spdk_free(ctx->read_buff);
+
+	cpl->u.blob_basic.cb_fn(cpl->u.blob_basic.cb_arg, ctx->bserrno);
+
+	free(ctx);
+}
+
+static void
+bs_deep_copy_bdev_write_cpl(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
+{
+	struct deep_copy_ctx *ctx = cb_arg;
+	struct spdk_blob *_blob = ctx->blob;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 " deep copy, ext dev write error %d\n", ctx->blob->id, bserrno);
+		ctx->bserrno = bserrno;
+		_blob->locked_operation_in_progress = false;
+		spdk_blob_close(_blob, bs_deep_copy_cleanup_finish, ctx);
+		return;
+	}
+
+	ctx->cluster++;
+
+	if (ctx->status_cb) {
+		ctx->status_cb(ctx->cluster, ctx->status_cb_arg);
+	}
+
+	bs_deep_copy_cluster_find_next(ctx);
+}
+
+static void
+bs_deep_copy_blob_read_cpl(void *cb_arg, int bserrno)
+{
+	struct deep_copy_ctx *ctx = cb_arg;
+	struct spdk_bs_dev *ext_dev = ctx->ext_dev;
+	struct spdk_blob *_blob = ctx->blob;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 " deep copy, blob read error %d\n", ctx->blob->id, bserrno);
+		ctx->bserrno = bserrno;
+		_blob->locked_operation_in_progress = false;
+		spdk_blob_close(_blob, bs_deep_copy_cleanup_finish, ctx);
+		return;
+	}
+
+	ctx->ext_args.channel = ctx->ext_channel;
+	ctx->ext_args.cb_fn = bs_deep_copy_bdev_write_cpl;
+	ctx->ext_args.cb_arg = ctx;
+
+	ext_dev->write(ext_dev, ctx->ext_channel, ctx->read_buff,
+		       bs_cluster_to_lba(_blob->bs, ctx->cluster),
+		       bs_dev_byte_to_lba(_blob->bs->dev, _blob->bs->cluster_sz),
+		       &ctx->ext_args);
+}
+
+
+static void
+bs_deep_copy_cluster_find_next(void *cb_arg)
+{
+	struct deep_copy_ctx *ctx = cb_arg;
+	struct spdk_blob *_blob = ctx->blob;
+	bool is_valid_range;
+	bool is_zeroes;
+
+	while (ctx->cluster < _blob->active.num_clusters) {
+		if (_blob->active.clusters[ctx->cluster] != 0) {
+			// The cluster is allocated in the current blob
+			break;
+		}
+
+		/* Check if the cluster valid for
+		 * the backing dev. For zeroes backing dev, it'll be always valid.
+		 *
+		 * For other backing dev e.g. a snapshot, it could be invalid if
+		 * the blob has been resized after snapshot was taken. Note that
+		 * in this case, we might unnecessarily copy cluster which is in
+		 * the expanded offset but not allocated in _blob or its ancestors.
+		 * We consider this a conner case.
+		 */
+		is_valid_range = _blob->back_bs_dev->is_range_valid(_blob->back_bs_dev,
+				 bs_io_unit_to_back_dev_lba(_blob, bs_cluster_to_lba(_blob->bs, ctx->cluster)),
+				 bs_dev_byte_to_lba(_blob->back_bs_dev, _blob->bs->cluster_sz));
+		is_zeroes = is_valid_range && _blob->back_bs_dev->is_zeroes(_blob->back_bs_dev,
+				bs_io_unit_to_back_dev_lba(_blob, bs_cluster_to_lba(_blob->bs, ctx->cluster)),
+				bs_dev_byte_to_lba(_blob->back_bs_dev, _blob->bs->cluster_sz));
+		if (_blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes) {
+			// The cluster is allocated in one of the ancestors of the blob
+			break;
+		}
+
+		ctx->cluster++;
+	}
+
+	if (ctx->cluster < _blob->active.num_clusters) {
+		blob_request_submit_op_single(ctx->blob_channel, _blob, ctx->read_buff,
+					      bs_cluster_to_lba(_blob->bs, ctx->cluster),
+					      bs_dev_byte_to_lba(_blob->bs->dev, _blob->bs->cluster_sz),
+					      bs_deep_copy_blob_read_cpl, ctx, SPDK_BLOB_READ);
+	} else {
+		if (ctx->status_cb) {
+			ctx->status_cb(_blob->active.num_clusters, ctx->status_cb_arg);
+		}
+		_blob->locked_operation_in_progress = false;
+		spdk_blob_close(_blob, bs_deep_copy_cleanup_finish, ctx);
+	}
+}
+
+static void
+bs_deep_copy_blob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
+{
+	struct deep_copy_ctx *ctx = cb_arg;
+	struct spdk_bs_dev *ext_dev = ctx->ext_dev;
+	uint32_t blob_block_size;
+	uint64_t blob_total_size;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Deep copy blob open error %d\n", bserrno);
+		ctx->bserrno = bserrno;
+		bs_deep_copy_cleanup_finish(ctx, 0);
+		return;
+	}
+
+	if (!spdk_blob_is_read_only(_blob)) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 " deep copy, blob must be read only\n", _blob->id);
+		ctx->bserrno = -EPERM;
+		spdk_blob_close(_blob, bs_deep_copy_cleanup_finish, ctx);
+		return;
+	}
+
+	blob_block_size = _blob->bs->dev->blocklen;
+	blob_total_size = spdk_blob_get_num_clusters(_blob) * spdk_bs_get_cluster_size(_blob->bs);
+
+	if (blob_total_size > ext_dev->blockcnt * ext_dev->blocklen) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 " deep copy, external device must have at least blob size\n",
+			    _blob->id);
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(_blob, bs_deep_copy_cleanup_finish, ctx);
+		return;
+	}
+
+	if (blob_block_size % ext_dev->blocklen != 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 " deep copy, external device block size is not compatible with \
+blobstore block size\n", _blob->id);
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(_blob, bs_deep_copy_cleanup_finish, ctx);
+		return;
+	}
+
+	ctx->blob = _blob;
+
+	if (_blob->locked_operation_in_progress) {
+		SPDK_DEBUGLOG(blob, "blob 0x%" PRIx64 " deep copy - another operation in progress\n", _blob->id);
+		ctx->bserrno = -EBUSY;
+		spdk_blob_close(_blob, bs_deep_copy_cleanup_finish, ctx);
+		return;
+	}
+
+	_blob->locked_operation_in_progress = true;
+
+	ctx->cluster = 0;
+	bs_deep_copy_cluster_find_next(ctx);
+}
+
+int
+spdk_bs_blob_deep_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+		       spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+		       spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+		       spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct deep_copy_ctx *ctx;
+	struct spdk_io_channel *ext_channel;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+
+	ctx->bs = bs;
+	ctx->blobid = blobid;
+	ctx->cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	ctx->cpl.u.bs_basic.cb_fn = cb_fn;
+	ctx->cpl.u.bs_basic.cb_arg = cb_arg;
+	ctx->bserrno = 0;
+	ctx->blob_channel = channel;
+	ctx->status_cb = status_cb_fn;
+	ctx->status_cb_arg = status_cb_arg;
+	ctx->read_buff = spdk_malloc(bs->cluster_sz, bs->dev->blocklen, NULL,
+				     SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->read_buff) {
+		free(ctx);
+		return -ENOMEM;
+	}
+
+	ext_channel = ext_dev->create_channel(ext_dev);
+	if (!ext_channel) {
+		spdk_free(ctx->read_buff);
+		free(ctx);
+		return -ENOMEM;
+	}
+	ctx->ext_dev = ext_dev;
+	ctx->ext_channel = ext_channel;
+
+	spdk_bs_open_blob(ctx->bs, ctx->blobid, bs_deep_copy_blob_open_cpl, ctx);
+
+	return 0;
+}
+/* END spdk_bs_blob_shallow_copy */
 
 /* START spdk_bs_blob_set_parent */
 

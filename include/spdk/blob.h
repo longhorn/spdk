@@ -160,6 +160,15 @@ typedef void (*spdk_blob_shallow_copy_status)(uint64_t copied_clusters, uint64_t
 		void *cb_arg);
 
 /**
+ * Blob deep copy status callback.
+ *
+ * \param processed_clusters Number of processed clusters by the deep copy operation
+ * \param cb_arg Callback argument.
+ */
+typedef void (*spdk_blob_deep_copy_status)(uint64_t processed_clusters,
+		void *cb_arg);
+
+/**
  * Snapshot checksum stop callback.
  *
  * This callback inform the snapshot checksum compute operation if it can proceed or if
@@ -883,6 +892,29 @@ int spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_c
 				    struct spdk_bs_dev *ext_dev,
 				    spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 				    spdk_blob_op_complete cb_fn, void *cb_arg);
+/**
+ * Perform a deep copy of a blob to a blobstore device.
+ *
+ * This makes a deep copy from a blob to a blobstore device.
+ * Clusters allocated to the blob or its parents will be written on the device.
+ * Blob must be read only and blob size must be less or equal than device size.
+ * Blobstore block size must be a multiple of device block size.
+
+ * \param bs Blobstore
+ * \param channel IO channel used to copy the blob.
+ * \param blobid The id of the blob.
+ * \param ext_dev The device to copy on
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int spdk_bs_blob_deep_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+			   spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+			   spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+			   spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
  * Set a snapshot as the parent of a blob
