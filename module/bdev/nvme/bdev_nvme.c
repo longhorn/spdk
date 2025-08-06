@@ -5986,12 +5986,21 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
 		spdk_bdev_nvme_get_default_ctrlr_opts(&nvme_ctrlr->opts);
 	}
 
-	/* In interrupt mode, NVMe/TCP requires periodic polling of the admin queue
-	* to ensure timely Keep Alive command completion. Unlike PCIe, TCP transport
-	* does not provide hardware interrupts for admin completions.
-	*/
-	period = (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP)) ? 0 : g_opts.nvme_adminq_poll_period_us;
+	period = spdk_interrupt_mode_is_enabled() ? 0 : g_opts.nvme_adminq_poll_period_us;
+	/*
+	 * In interrupt mode, NVMe/TCP requires periodic polling of the admin queue
+	 * to ensure timely Keep Alive and disconnect handling. TCP transport does not
+	 * provide hardware interrupts for admin completions.
+	 *
+	 * To prevent a race condition where IOQs detect socket closure before adminq
+	 * wakes up (causing commands to be issued on a closed socket, EBADF), we force
+	 * a shorter admin queue poll period for NVMe/TCP in interrupt mode.
+	 *
+	 * This should ideally match or be shorter than nvme_ioq_poll_period_us.
+	 */
+	period = (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP)) ? period : 100;
 
+	SPDK_DEBUGLOG(bdev_nvme, "Registering admin poller for controller with poll period %" PRIu64 "\n", period);
 	nvme_ctrlr->adminq_timer_poller = SPDK_POLLER_REGISTER(bdev_nvme_poll_adminq, nvme_ctrlr,
 					  period);
 
