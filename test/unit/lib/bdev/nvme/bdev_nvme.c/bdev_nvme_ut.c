@@ -6102,7 +6102,7 @@ test_fail_path(void)
 	poll_threads();
 
 	CU_ASSERT(bdev_io->internal.f.in_submit_request == false);
-	CU_ASSERT(bdev_io->internal.status == SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(bdev_io->internal.status == SPDK_BDEV_IO_STATUS_ABORTED);
 	CU_ASSERT(TAILQ_EMPTY(&nbdev_ch->retry_io_list));
 
 	/* Another I/O submission should be failed immediately. */

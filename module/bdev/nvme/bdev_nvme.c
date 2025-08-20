@@ -987,6 +987,17 @@ __bdev_nvme_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status s
 
 static void bdev_nvme_abort_retry_ios(struct nvme_bdev_channel *nbdev_ch);
 
+/* Helper to abort retry IOs on each nvme_bdev_channel for a given nvme_bdev. */
+static void
+_nvme_abort_retry_ios_on_ch(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct nvme_bdev_channel *nbdev_ch = spdk_io_channel_get_ctx(ch);
+
+	bdev_nvme_abort_retry_ios(nbdev_ch);
+	spdk_for_each_channel_continue(i, 0);
+}
+
 static void
 bdev_nvme_destroy_bdev_channel_cb(void *io_device, void *ctx_buf)
 {
@@ -2302,6 +2313,16 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Resetting controller failed.\n");
 		if (bdev_nvme_check_fast_io_fail_timeout(nvme_ctrlr)) {
 			nvme_ctrlr->fast_io_fail_timedout = true;
+
+			/* Proactively abort retry IOs on all nbdev channels associated with this
+			 * controller so completions are delivered before channel destruction. */
+			if (nvme_ctrlr->nbdev_ctrlr != NULL) {
+				struct nvme_bdev *nbdev;
+
+				TAILQ_FOREACH(nbdev, &nvme_ctrlr->nbdev_ctrlr->bdevs, tailq) {
+					spdk_for_each_channel(nbdev, _nvme_abort_retry_ios_on_ch, NULL, NULL);
+				}
+			}
 		}
 	} else {
 		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Resetting controller successful.\n");
