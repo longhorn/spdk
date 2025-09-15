@@ -6743,13 +6743,25 @@ spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 		return -EEXIST;
 	}
 
+    /*
+     * Note: If a volume is attached while a new NVMe disk is added concurrently,
+     * the poller may be configured incorrectly due to global transport type changes.
+     * To avoid this, we should eventually remove the dependency on g_nvme_trtype
+     * and implement a more robust solution (longhorn/longhorn#11662).
+	 *
+	 * Ref: https://github.com/longhorn/longhorn/issues/11761#issuecomment-3294459512
+     */
 	if (g_nvme_trtype == SPDK_NVME_TRANSPORT_CUSTOM) {
-		g_nvme_trtype = trid->trtype;
+		SPDK_NOTICELOG("Initializing global NVMe transport type (g_nvme_trtype) to %s (base-name: %s)\n",
+			       spdk_nvme_transport_id_trtype_str(trid->trtype),
+				   base_name);
 	} else if (g_nvme_trtype != trid->trtype) {
-		SPDK_ERRLOG("NVMe transport type %s is not supported.\n",
-			    spdk_nvme_transport_id_trtype_str(trid->trtype));
-		return -ENOTSUP;
+		SPDK_NOTICELOG("Updating global NVMe transport type (g_nvme_trtype) from %s to %s (base-name: %s)\n",
+			       spdk_nvme_transport_id_trtype_str(g_nvme_trtype),
+			       spdk_nvme_transport_id_trtype_str(trid->trtype),
+				   base_name);
 	}
+	g_nvme_trtype = trid->trtype;
 
 	len = strnlen(base_name, SPDK_CONTROLLER_NAME_MAX);
 
