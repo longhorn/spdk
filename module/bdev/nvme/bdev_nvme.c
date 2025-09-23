@@ -74,6 +74,8 @@
 #define SPDK_BDEV_NVME_DEFAULT_DELAY_CMD_SUBMIT true
 #define SPDK_BDEV_NVME_DEFAULT_KEEP_ALIVE_TIMEOUT_IN_MS	(10000)
 
+#define NVME_IOQ_INTERRUPT_POLL_PERIOD_US	(100)
+
 #define NSID_STR_LEN 10
 
 #define SPDK_CONTROLLER_NAME_MAX 512
@@ -200,7 +202,6 @@ struct spdk_thread *g_bdev_nvme_init_thread;
 static struct spdk_poller *g_hotplug_poller;
 static struct spdk_poller *g_hotplug_probe_poller;
 static struct spdk_nvme_probe_ctx *g_hotplug_probe_ctx;
-static enum spdk_nvme_transport_type g_nvme_trtype = SPDK_NVME_TRANSPORT_CUSTOM;
 
 static void nvme_ctrlr_populate_namespaces(struct nvme_ctrlr *nvme_ctrlr,
 		struct nvme_async_probe_ctx *ctx);
@@ -3797,18 +3798,16 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 		return -1;
 	}
 
-	period = spdk_interrupt_mode_is_enabled() ? 0 : g_opts.nvme_ioq_poll_period_us;
-	if (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype == SPDK_NVME_TRANSPORT_TCP)) {
-		/* For TCP transport in interrupt mode, the IO queue must be polled periodically
-		 * to flush data. Since TCP transport does not automatically push data to
-		 * the OS stack, we poll periodically to ensure timely processing of IO
-		 * commands.
-		 *
-		 * Unit is in milliseconds.
-		 * https://github.com/spdk/spdk/blob/3cb3145bfa22a650a01c1183332a9f8c5bd2f868/doc/jsonrpc.md?plain=1#L3995
-		 */
-		period = 100;
-	}
+	/* For interrupt mode, the IO queue must be polled periodically
+	 * to flush data. Since TCP transport does not automatically push data to
+	 * the OS stack, we poll periodically to ensure timely processing of IO
+	 * commands for any TCP controllers that might be added.
+	 *
+	 * Unit is in milliseconds.
+	 * https://github.com/spdk/spdk/blob/3cb3145bfa22a650a01c1183332a9f8c5bd2f868/doc/jsonrpc.md?plain=1#L3995
+	 */
+	period = spdk_interrupt_mode_is_enabled() ? NVME_IOQ_INTERRUPT_POLL_PERIOD_US : g_opts.nvme_ioq_poll_period_us;
+
 	group->poller = SPDK_POLLER_REGISTER(bdev_nvme_poll, group, period);
 
 	if (group->poller == NULL) {
@@ -3816,10 +3815,11 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 		return -1;
 	}
 
-	/* Skip interrupt registration for TCP transport as it still requires periodic
-	 * polling to check and flush the IO queue.
+	/* In mixed transport scenarios or when TCP is expected, use only periodic polling
+	 * to ensure TCP qpairs work correctly. TCP qpairs use socket groups which are
+	 * incompatible with interrupt mode polling.
 	 */
-	if (spdk_interrupt_mode_is_enabled() && g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP) {
+	if (spdk_interrupt_mode_is_enabled() && period == 0) {
 		spdk_poller_register_interrupt(group->poller, NULL, NULL);
 
 		fgrp = spdk_nvme_poll_group_get_fd_group(group->group);
@@ -5998,13 +5998,13 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
 	 *
 	 * This should ideally match or be shorter than nvme_ioq_poll_period_us.
 	 */
-	period = (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP)) ? period : 100;
+	period = (spdk_interrupt_mode_is_enabled() && (nvme_ctrlr->active_path_id->trid.trtype != SPDK_NVME_TRANSPORT_TCP)) ? period : 100;
 
 	SPDK_DEBUGLOG(bdev_nvme, "Registering admin poller for controller with poll period %" PRIu64 "\n", period);
 	nvme_ctrlr->adminq_timer_poller = SPDK_POLLER_REGISTER(bdev_nvme_poll_adminq, nvme_ctrlr,
 					  period);
 
-	if (spdk_interrupt_mode_is_enabled() && (g_nvme_trtype != SPDK_NVME_TRANSPORT_TCP)){
+	if (spdk_interrupt_mode_is_enabled() && (nvme_ctrlr->active_path_id->trid.trtype != SPDK_NVME_TRANSPORT_TCP)){
 		spdk_poller_register_interrupt(nvme_ctrlr->adminq_timer_poller, NULL, NULL);
 
 		fd = spdk_nvme_ctrlr_get_admin_qp_fd(nvme_ctrlr->ctrlr, &opts);
@@ -6742,26 +6742,6 @@ spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 			    "already exists.\n", trid->traddr, drv_opts->hostnqn);
 		return -EEXIST;
 	}
-
-    /*
-     * Note: If a volume is attached while a new NVMe disk is added concurrently,
-     * the poller may be configured incorrectly due to global transport type changes.
-     * To avoid this, we should eventually remove the dependency on g_nvme_trtype
-     * and implement a more robust solution (longhorn/longhorn#11662).
-	 *
-	 * Ref: https://github.com/longhorn/longhorn/issues/11761#issuecomment-3294459512
-     */
-	if (g_nvme_trtype == SPDK_NVME_TRANSPORT_CUSTOM) {
-		SPDK_NOTICELOG("Initializing global NVMe transport type (g_nvme_trtype) to %s (base-name: %s)\n",
-			       spdk_nvme_transport_id_trtype_str(trid->trtype),
-				   base_name);
-	} else if (g_nvme_trtype != trid->trtype) {
-		SPDK_NOTICELOG("Updating global NVMe transport type (g_nvme_trtype) from %s to %s (base-name: %s)\n",
-			       spdk_nvme_transport_id_trtype_str(g_nvme_trtype),
-			       spdk_nvme_transport_id_trtype_str(trid->trtype),
-				   base_name);
-	}
-	g_nvme_trtype = trid->trtype;
 
 	len = strnlen(base_name, SPDK_CONTROLLER_NAME_MAX);
 
