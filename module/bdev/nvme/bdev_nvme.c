@@ -2410,6 +2410,17 @@ bdev_nvme_reset_check_qpair_connected(void *ctx)
 	struct nvme_qpair *nvme_qpair = ctrlr_ch->qpair;
 	struct spdk_nvme_qpair *qpair;
 
+	/* Check if nvme_qpair or its controller was freed due to disconnect callback.
+	 * This can happen when ctrlr_ch was set to NULL and nvme_qpair was freed
+	 * in bdev_nvme_disconnected_qpair_cb() while this poller was still scheduled.
+	 * Just return and let the poller be cleaned up through normal channel destruction.
+	 */
+	if (nvme_qpair == NULL || nvme_qpair->ctrlr == NULL) {
+		SPDK_DEBUGLOG(bdev_nvme, "connect_poller: nvme_qpair=%p or ctrlr freed, "
+			      "returning (UAF avoided).\n", nvme_qpair);
+		return SPDK_POLLER_BUSY;
+	}
+
 	if (ctrlr_ch->reset_iter == NULL) {
 		/* qpair was already failed to connect and the reset sequence is being aborted. */
 		assert(ctrlr_ch->connect_poller == NULL);
@@ -3719,7 +3730,22 @@ bdev_nvme_destroy_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 		 * We need to poll it until it is actually disconnected.
 		 * Just detach the qpair from the deleting ctrlr_channel.
 		 */
+		if (ctrlr_ch->connect_poller) {
+			/* Unregister the connect poller to avoid it firing after this
+			 * ctrlr_channel context has been freed. The poller may still
+			 * be running if a connect/disconnect/reset sequence was in flight.
+			 */
+			NVME_CTRLR_INFOLOG(nvme_qpair->ctrlr,
+					   "Unregistering connect_poller %p during channel destroy "
+					   "(ctrlr_ch=%p, nvme_qpair=%p).\n",
+					   ctrlr_ch->connect_poller, ctrlr_ch, nvme_qpair);
+			spdk_poller_unregister(&ctrlr_ch->connect_poller);
+		}
+		NVME_CTRLR_DEBUGLOG(nvme_qpair->ctrlr,
+				    "Clearing ctrlr_ch->qpair pointer (ctrlr_ch=%p, nvme_qpair=%p).\n",
+				    ctrlr_ch, nvme_qpair);
 		nvme_qpair->ctrlr_ch = NULL;
+		ctrlr_ch->qpair = NULL;
 	} else {
 		assert(ctrlr_ch->reset_iter == NULL);
 
