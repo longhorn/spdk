@@ -146,6 +146,25 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
 }
 
 /*
+ * Finalize routine for the write-into-unmapped path, invoked on the
+ * bdev_io's owning spdk_thread (see ec_write_into_unmapped_bit_cleared
+ * for the thread hand-off).
+ */
+static void
+ec_write_into_unmapped_finalize(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
+
+	if (ec_io->stripe_claimed) {
+		ec_stripe_clear_dirty(ec, ec_io->stripe_claim_index);
+		ec_io->stripe_claimed = false;
+	}
+	ec_free_io_buffers(ec_io, ec);
+	spdk_bdev_io_complete(ec_io->bdev_io, ec_io->status);
+}
+
+/*
  * Bit-clear completion callback for the write-into-unmapped path.
  * Invoked from ec_submit_bit_clear_async's persist drainage after the
  * unmapped bit has been durably cleared (m+1 ack) -- the load-bearing
@@ -192,6 +211,27 @@ ec_write_into_unmapped_bit_cleared(void *cb_arg, int rc)
 	}
 
 	owner = spdk_bdev_io_get_thread(ec_io->bdev_io);
+	if (spdk_likely(owner == spdk_get_thread())) {
+		ec_write_into_unmapped_finalize(ec_io);
+	} else {
+		int send_rc = spdk_thread_send_msg(owner,
+						   ec_write_into_unmapped_finalize, ec_io);
+		if (send_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: cannot hand off bdev_io completion "
+				    "to owner thread '%s' (rc=%d %s) at stripe %" PRIu64 "; "
+				    "releasing EC-layer state, bdev_io stays in-flight "
+				    "until SPDK timeout fires\n",
+				    ec->bdev.name, spdk_thread_get_name(owner),
+				    send_rc, spdk_strerror(-send_rc), ec_io->stripe_claim_index);
+			if (ec_io->stripe_claimed) {
+				ec_stripe_clear_dirty(ec, ec_io->stripe_claim_index);
+				ec_io->stripe_claimed = false;
+			}
+			ec_free_io_buffers(ec_io, ec);
+			/* spdk_bdev_io_complete is owner-thread-only -- the
+			 * bdev_io cannot be completed from here. */
+		}
+	}
 }
 
 static void
@@ -1147,10 +1187,196 @@ error:
 	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 }
 
+/*
+ * Write-into-unmapped path. Used when ec_submit_write detects that the
+ * target stripe's unmapped bit is set.
+ *
+ * The LEP-described semantics: treat ANY write into an unmapped stripe
+ * as a full-stripe write regardless of payload size. The stripe is
+ * defined to be all-zero, so the "old data" is known without a read --
+ * no RMW read phase, no degraded reconstruction.
+ *
+ * Crash-safety ordering (load-bearing -- DO NOT REORDER):
+ *
+ *   1. Claim stripe-busy.                                  (here)
+ *   2. Allocate a zero-initialised full-stripe scratch.    (here)
+ *   3. Copy caller payload to its sub-stripe offset.       (here)
+ *   4. Skip the WIB. The stripe is logically zero, so a    (here)
+ *      torn fanout still reads as all-zero to consumers
+ *      (bitmap still says unmapped). No torn-RMW window
+ *      for the WIB to protect.
+ *   5. Encode parity, fan out k+m chunk writes.            (ec_full_write_fanout)
+ *   6. After ALL k+m chunk writes complete successfully,   (ec_child_io_complete)
+ *      submit a bit-clear via ec_submit_bit_clear_async.
+ *   7. After the bit-clear persist acks at m+1, apply      (ec_bit_clear_on_durable)
+ *      cleared bit to live stripe_unmapped_map.
+ *   8. ONLY THEN ack the bdev_io.                          (ec_write_into_unmapped_bit_cleared)
+ *
+ * Reordering -- in particular, clearing the bit before fan-out, or
+ * acking the bdev_io before the bit-clear persist acks -- opens a
+ * silent-corruption window. A crash between "bit cleared on disk"
+ * and "data on disk" would leave readers seeing "mapped" while the
+ * stripe is inconsistent (parity-mismatch, missing chunks, or both),
+ * and ISA-L reconstruction would surface undefined bytes.
+ *
+ * Crash windows under the correct ordering:
+ *
+ *   - Crash mid step 5: bitmap says unmapped; chunks partial; reads
+ *     synthesise zeros. Caller's write was never acked. Correct.
+ *   - Crash post step 5 / pre step 6: bitmap says unmapped; chunks
+ *     fully written with consistent parity; reads still synthesise
+ *     zeros. The committed data is masked but consistent. Correct.
+ *   - Crash mid step 6 / before m+1 ack: bitmap may have new-gen on
+ *     fewer than m+1 disks. Max-generation load picks the new-gen if
+ *     any disk has it (reads return real data) or the old-gen
+ *     otherwise (reads synthesise zeros). Either is consistent.
+ *   - Crash post step 7 / pre step 8: bitmap says mapped; data on
+ *     disk; caller may retry (didn't see ack) -- safe to repeat because
+ *     a future write into the now-MAPPED stripe will go through the
+ *     ordinary RMW or full-write path, not back through here.
+ *
+ * Concurrency: stripe-busy claim is held across the entire sequence
+ * (steps 1-8). RMW / UNMAP / scrub / rebuild defer on the same
+ * stripe. Reads are NOT serialised against this path -- they consult
+ * stripe_unmapped_map at their entry. Until step 7 flips the live
+ * bit, concurrent reads synthesise zeros; after step 7 they read
+ * real data; the in-between window (post step 7, pre step 8) is OK
+ * because data is durably on disk for them to find.
+ */
+static int
+ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	uint64_t        stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
+	uint64_t        stripe_offset_bytes;
+	uint64_t        payload_bytes;
+	bool            saved_is_zero_fill;
+	int             rc;
+
+	/*
+	 * Active-scrub guard. Mirrors the guard in ec_submit_full_write:
+	 * if the scrubber is at-or-behind this stripe's region, defer.
+	 * Without this guard, the scrubber could read stripe chunks, then
+	 * we write new chunks + parity, then the scrubber writes parity
+	 * derived from the stale read -- leaving new data with stale
+	 * parity. The bitmap-still-says-unmapped state masks the
+	 * inconsistency from current readers, but a future post-failure
+	 * degraded read (after the bit clears) would reconstruct using
+	 * stale parity and surface wrong bytes.
+	 *
+	 * Stripes the scrubber has already passed
+	 * (stripe_index < sctx->current_stripe) are safe -- the scrubber
+	 * will not revisit them.
+	 */
+	if (ec->scrub_ctx != NULL) {
+		struct ec_scrub_ctx *sctx   = ec->scrub_ctx;
+		uint32_t             region = ec_wib_stripe_to_region(stripe_idx);
+
+		if (region == sctx->current_region &&
+		    stripe_idx >= sctx->current_stripe) {
+			return -EAGAIN;
+		}
+		if (region > sctx->current_region &&
+		    ec_wib_region_is_dirty(ec, region)) {
+			return -EAGAIN;
+		}
+	}
+
+	/* 1. Claim stripe-busy. */
+	if (ec_stripe_is_dirty(ec, stripe_idx)) {
+		return -EAGAIN;
+	}
+	ec_stripe_set_dirty(ec, stripe_idx);
+	ec_io->stripe_claimed     = true;
+	ec_io->stripe_claim_index = stripe_idx;
+	ec_io->is_write_into_unmapped = true;
+
+	/*
+	 * 2. Allocate full-stripe scratch zero-initialised. We trick
+	 * ec_alloc_full_stripe into skipping the iov copy by temporarily
+	 * setting is_zero_fill = true; we then place the caller's payload
+	 * at the correct sub-stripe offset ourselves in step 3. The real
+	 * is_zero_fill is restored so the rest of the path (encode +
+	 * fanout + completion) sees the original value.
+	 */
+	saved_is_zero_fill   = ec_io->is_zero_fill;
+	ec_io->is_zero_fill  = true;
+	rc                   = ec_alloc_full_stripe(ec_io, ec);
+	ec_io->is_zero_fill  = saved_is_zero_fill;
+	if (rc != 0) {
+		ec_stripe_clear_dirty(ec, stripe_idx);
+		ec_io->stripe_claimed         = false;
+		ec_io->is_write_into_unmapped = false;
+		ec_free_io_buffers(ec_io, ec);
+		ec->writes_into_unmapped_failed++;
+		return rc;
+	}
+
+	/*
+	 * 3. Place caller payload at its sub-stripe offset. For
+	 * WRITE_ZEROES into an unmapped stripe the bounce is already zero
+	 * everywhere, so the copy is a no-op -- skip it. For a regular
+	 * sub-stripe write, copy the iovs starting at
+	 * (offset_blocks % stripe_blocks) * blocklen so the payload lands
+	 * at its true position within the stripe; the unwritten leading
+	 * and trailing regions stay zero.
+	 */
+	if (!saved_is_zero_fill) {
+		stripe_offset_bytes = (ec_io->offset_blocks % ec->stripe_blocks)
+				      * ec->bdev.blocklen;
+		payload_bytes       = ec_io->num_blocks * ec->bdev.blocklen;
+		spdk_copy_iovs_to_buf((uint8_t *)ec_io->bounce_buf + stripe_offset_bytes,
+				      payload_bytes,
+				      ec_io->iovs, ec_io->iovcnt);
+	}
+
+	/*
+	 * 4. Skip the WIB (no code). The stripe stays marked unmapped for the
+	 * whole fan-out, so a torn write reads back as zeros -- there is no
+	 * torn-write window for the WIB to guard (full crash-window analysis in
+	 * the function header above).
+	 */
+
+	/*
+	 * 5. Encode + fan out. ec_full_write_fanout uses
+	 * ec_stripe_base_lba(stripe_idx) for the child write offsets, so
+	 * passing a sub-stripe offset in ec_io->offset_blocks is harmless
+	 * (it gets resolved to the same stripe). On completion,
+	 * ec_child_io_complete sees is_write_into_unmapped and routes
+	 * through the bit-clear path instead of immediate bdev_io
+	 * completion.
+	 */
+	ec->writes_into_unmapped++;
+	ec_full_write_fanout(ec_io);
+	return 0;
+}
+
 int
 ec_submit_write(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+	/*
+	 * Unmapped-bitmap consultation. A write that lands on an unmapped
+	 * stripe is treated as a full-stripe write into all-zero "old
+	 * data" -- no RMW read, no WIB participation, with a load-bearing
+	 * bit-clear-and-persist after data lands. See
+	 * ec_submit_write_into_unmapped for the full ordering rationale
+	 * and crash-window analysis.
+	 *
+	 * Without this routing, a write into a trimmed range would go
+	 * through ordinary RMW: data lands on base, parity recomputed,
+	 * but the bitmap still says unmapped. The read-side bitmap check
+	 * (ec_submit_read) would then synthesise zeros over the written
+	 * data -- silent data loss.
+	 */
+	if (ec->stripe_unmapped_map != NULL) {
+		uint64_t stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
+
+		if (ec_stripe_is_unmapped(ec, stripe_idx)) {
+			return ec_submit_write_into_unmapped(ec_io);
+		}
+	}
 
 	/*
 	 * Full-stripe fast path: the I/O covers one or more complete stripes
