@@ -34,6 +34,22 @@ struct ec_all_tailq g_ec_bdev_list = TAILQ_HEAD_INITIALIZER(g_ec_bdev_list);
 static const struct spdk_bdev_fn_table g_ec_fn_table;
 
 /* =========================================================================
+ * Async descriptor cleanup context
+ * ========================================================================= */
+
+struct ec_base_bdev_cleanup_ctx {
+	struct ec_bdev         *ec;
+	uint32_t                slot;
+	struct spdk_io_channel *reset_ch;
+	bool                    quiesced;
+};
+
+static void ec_cleanup_close_descriptor(struct ec_base_bdev_cleanup_ctx *ctx);
+static void ec_cleanup_channel_cb(struct spdk_io_channel_iter *i, int status);
+static void ec_cleanup_reset_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
+static void ec_cleanup_quiesce_cb(void *cb_arg, int status);
+
+/* =========================================================================
  * Module init / ctx size
  * ========================================================================= */
 
@@ -144,6 +160,322 @@ ec_bdev_find(const char *name)
 		}
 	}
 	return NULL;
+}
+
+/* =========================================================================
+ * Async cleanup chain
+ * ========================================================================= */
+
+static void
+ec_cleanup_close_descriptor(struct ec_base_bdev_cleanup_ctx *ctx)
+{
+	struct ec_bdev *ec   = ctx->ec;
+	uint32_t        slot = ctx->slot;
+
+	if (ec->descs[slot]) {
+		SPDK_NOTICELOG("EC bdev %s: closing descriptor for failed slot %u\n",
+			       ec->bdev.name, slot);
+		spdk_bdev_close(ec->descs[slot]);
+		ec->descs[slot] = NULL;
+	}
+
+	if (ctx->quiesced) {
+		spdk_bdev_unquiesce(&ec->bdev, &ec_if, NULL, NULL);
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: async cleanup complete for slot %u\n",
+		       ec->bdev.name, slot);
+
+	free(ctx);
+}
+
+struct ec_cleanup_channel_ctx {
+	struct ec_base_bdev_cleanup_ctx *cleanup_ctx;
+};
+
+static void
+ec_cleanup_channel_iter_cb(struct spdk_io_channel_iter *i)
+{
+	struct ec_cleanup_channel_ctx   *cctx  = spdk_io_channel_iter_get_ctx(i);
+	struct ec_base_bdev_cleanup_ctx *ctx   = cctx->cleanup_ctx;
+	uint32_t                         slot  = ctx->slot;
+	struct spdk_io_channel          *ch    = spdk_io_channel_iter_get_channel(i);
+	struct ec_io_channel            *ec_ch = spdk_io_channel_get_ctx(ch);
+
+	if (ec_ch->base_chans[slot]) {
+		spdk_put_io_channel(ec_ch->base_chans[slot]);
+		ec_ch->base_chans[slot] = NULL;
+		SPDK_DEBUGLOG(bdev_ec,
+			"EC bdev %s: released base_chan[%u] on thread %s\n",
+			ctx->ec->bdev.name, slot,
+			spdk_thread_get_name(spdk_get_thread()));
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+ec_cleanup_channel_cb(struct spdk_io_channel_iter *i, int status)
+{
+	struct ec_cleanup_channel_ctx   *cctx = spdk_io_channel_iter_get_ctx(i);
+	struct ec_base_bdev_cleanup_ctx *ctx  = cctx->cleanup_ctx;
+
+	free(cctx);
+
+	if (status != 0) {
+		SPDK_WARNLOG("EC bdev %s: channel walk status %d; "
+			     "proceeding with descriptor close\n",
+			     ctx->ec->bdev.name, status);
+	}
+
+	ec_cleanup_close_descriptor(ctx);
+}
+
+static void
+ec_cleanup_reset_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_base_bdev_cleanup_ctx *ctx = cb_arg;
+	struct ec_bdev                  *ec  = ctx->ec;
+	struct ec_cleanup_channel_ctx   *cctx;
+
+	if (bdev_io) {
+		spdk_bdev_free_io(bdev_io);
+	}
+
+	if (ctx->reset_ch) {
+		spdk_put_io_channel(ctx->reset_ch);
+		ctx->reset_ch = NULL;
+	}
+
+	if (!success) {
+		SPDK_WARNLOG("EC bdev %s: reset of slot %u did not succeed "
+			     "(expected for dead device); continuing\n",
+			     ec->bdev.name, ctx->slot);
+	}
+
+	cctx = calloc(1, sizeof(*cctx));
+	if (!cctx) {
+		SPDK_ERRLOG("EC bdev %s: OOM for channel walk ctx; "
+			    "closing descriptor directly\n", ec->bdev.name);
+		ec_cleanup_close_descriptor(ctx);
+		return;
+	}
+
+	cctx->cleanup_ctx = ctx;
+
+	spdk_for_each_channel(ec,
+		ec_cleanup_channel_iter_cb,
+		cctx,
+		ec_cleanup_channel_cb);
+}
+
+static void
+ec_cleanup_quiesce_cb(void *cb_arg, int status)
+{
+	struct ec_base_bdev_cleanup_ctx *ctx  = cb_arg;
+	struct ec_bdev                  *ec   = ctx->ec;
+	uint32_t                         slot = ctx->slot;
+	int                              rc;
+
+	if (status != 0) {
+		SPDK_ERRLOG("EC bdev %s: quiesce failed (status %d); "
+			    "closing descriptor without full cleanup\n",
+			    ec->bdev.name, status);
+		if (ec->descs[slot]) {
+			spdk_bdev_close(ec->descs[slot]);
+			ec->descs[slot] = NULL;
+		}
+		free(ctx);
+		return;
+	}
+
+	ctx->quiesced = true;
+
+	if (!ec->descs[slot]) {
+		SPDK_WARNLOG("EC bdev %s: slot %u descriptor already NULL "
+			     "after quiesce; skipping reset\n",
+			     ec->bdev.name, slot);
+		ec_cleanup_reset_cb(NULL, true, ctx);
+		return;
+	}
+
+	ctx->reset_ch = spdk_bdev_get_io_channel(ec->descs[slot]);
+	if (!ctx->reset_ch) {
+		SPDK_WARNLOG("EC bdev %s: failed to get reset channel for "
+			     "slot %u; skipping to channel cleanup\n",
+			     ec->bdev.name, slot);
+		ec_cleanup_reset_cb(NULL, false, ctx);
+		return;
+	}
+
+	rc = spdk_bdev_reset(ec->descs[slot], ctx->reset_ch,
+			     ec_cleanup_reset_cb, ctx);
+	if (rc != 0) {
+		SPDK_WARNLOG("EC bdev %s: failed to submit reset for slot %u "
+			     "(rc=%d); skipping to channel cleanup\n",
+			     ec->bdev.name, slot, rc);
+		spdk_put_io_channel(ctx->reset_ch);
+		ctx->reset_ch = NULL;
+		ec_cleanup_reset_cb(NULL, false, ctx);
+	}
+}
+
+static void
+ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
+{
+	struct ec_base_bdev_cleanup_ctx *ctx;
+
+	SPDK_NOTICELOG("EC bdev %s: starting async cleanup for slot %u\n",
+		       ec->bdev.name, slot);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("EC bdev %s: OOM for cleanup ctx slot %u\n",
+			    ec->bdev.name, slot);
+		return;
+	}
+
+	ctx->ec       = ec;
+	ctx->slot     = slot;
+	ctx->quiesced = false;
+
+	spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
+}
+
+/* =========================================================================
+ * Failure detection
+ * ========================================================================= */
+
+static void
+ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
+{
+	uint32_t    i;
+	const char *bdev_name = spdk_bdev_get_name(bdev);
+
+	for (i = 0; i < ec->n; i++) {
+		if (ec->descs[i] && spdk_bdev_desc_get_bdev(ec->descs[i]) == bdev) {
+			if (ec->base_states[i] == EC_BASE_STATE_FAILED) {
+				SPDK_DEBUGLOG(bdev_ec,
+					"Base bdev %s (slot %u) already marked failed\n",
+					bdev_name, i);
+				return;
+			}
+
+			if (ec->base_states[i] == EC_BASE_STATE_REPLACING) {
+				/*
+				 * Replacement disk failed before rebuild finished.
+				 * Clear rebuild flags; allow a new replace.
+				 */
+				SPDK_WARNLOG("EC bdev %s: REPLACEMENT disk %s "
+					     "(slot %u) failed before rebuild; "
+					     "slot returns to FAILED\n",
+					     ec->bdev.name, bdev_name, i);
+				ec->needs_rebuild[i]    = false;
+				ec->replace_in_progress = false;
+				/*
+				 * If a rebuild is in progress for this slot,
+				 * it will fail on its next I/O and call
+				 * ec_rebuild_finish with a non-zero rc.
+				 * We do not abort it here; let the I/O error
+				 * path handle it naturally.
+				 */
+			} else {
+				ec->failed_count++;
+			}
+
+			ec->base_states[i] = EC_BASE_STATE_FAILED;
+
+			if (ec->failed_count > ec->m) {
+				SPDK_ERRLOG("EC bdev %s fault tolerance exceeded: "
+					    "%u/%u disks failed (max %u). OFFLINE.\n",
+					    ec->bdev.name, ec->failed_count, ec->n, ec->m);
+				ec->offline = true;
+			} else {
+				SPDK_WARNLOG("EC bdev %s: %s disk %s (slot %u/%u) failed "
+					     "(%u/%u disks failed, can tolerate %u more)\n",
+					     ec->bdev.name,
+					     i >= ec->k ? "PARITY" : "DATA",
+					     bdev_name, i, ec->n,
+					     ec->failed_count, ec->n,
+					     ec->m - ec->failed_count);
+			}
+
+			/*
+			 * Release WIB channel so the base bdev refcount drains.
+			 */
+			if (i >= ec->k) {
+				uint32_t parity_idx = i - ec->k;
+				if (ec->wib_chans[parity_idx]) {
+					spdk_put_io_channel(ec->wib_chans[parity_idx]);
+					ec->wib_chans[parity_idx] = NULL;
+				}
+			}
+
+			/*
+			 * Release bitmap channel for this slot so the base bdev
+			 * refcount drains. The bitmap touches every disk, so
+			 * every slot has a bitmap channel (not just parity).
+			 */
+			if (ec->bitmap_chans[i]) {
+				spdk_put_io_channel(ec->bitmap_chans[i]);
+				ec->bitmap_chans[i] = NULL;
+			}
+
+			/* Release scrub channel so the base bdev refcount drains. */
+			if (ec->scrub_ctx != NULL &&
+			    ec->scrub_ctx->scrub_chans[i] != NULL) {
+				SPDK_NOTICELOG("EC bdev %s: releasing scrub "
+					       "channel for failed slot %u\n",
+					       ec->bdev.name, i);
+				spdk_put_io_channel(ec->scrub_ctx->scrub_chans[i]);
+				ec->scrub_ctx->scrub_chans[i] = NULL;
+			}
+
+			/* Release rebuild channel similarly. */
+			if (ec->rebuild_ctx != NULL &&
+			    ec->rebuild_ctx->rebuild_chans[i] != NULL) {
+				SPDK_NOTICELOG("EC bdev %s: releasing rebuild "
+					       "channel for failed slot %u\n",
+					       ec->bdev.name, i);
+				spdk_put_io_channel(
+					ec->rebuild_ctx->rebuild_chans[i]);
+				ec->rebuild_ctx->rebuild_chans[i] = NULL;
+			}
+
+			ec_start_base_bdev_cleanup(ec, i);
+			return;
+		}
+	}
+
+	SPDK_WARNLOG("Failed to find descriptor for base bdev %s in EC bdev %s\n",
+		     bdev_name, ec->bdev.name);
+}
+
+static void
+ec_base_bdev_event_cb(enum spdk_bdev_event_type type,
+		      struct spdk_bdev *bdev, void *event_ctx)
+{
+	struct ec_bdev *ec = event_ctx;
+
+	switch (type) {
+	case SPDK_BDEV_EVENT_REMOVE:
+		SPDK_DEBUGLOG(bdev_ec, "Base bdev %s: SPDK_BDEV_EVENT_REMOVE on EC bdev %s\n",
+			      spdk_bdev_get_name(bdev), ec->bdev.name);
+		ec_handle_base_bdev_failure(ec, bdev);
+		break;
+	case SPDK_BDEV_EVENT_RESIZE:
+		SPDK_DEBUGLOG(bdev_ec, "Base bdev %s: SPDK_BDEV_EVENT_RESIZE on EC bdev %s\n",
+			      spdk_bdev_get_name(bdev), ec->bdev.name);
+		break;
+	case SPDK_BDEV_EVENT_MEDIA_MANAGEMENT:
+		SPDK_DEBUGLOG(bdev_ec, "Base bdev %s: SPDK_BDEV_EVENT_MEDIA_MANAGEMENT on EC bdev %s\n",
+			      spdk_bdev_get_name(bdev), ec->bdev.name);
+		break;
+	default:
+		SPDK_NOTICELOG("Base bdev %s: unknown event %d on EC bdev %s\n",
+			       spdk_bdev_get_name(bdev), type, ec->bdev.name);
+		break;
+	}
 }
 
 static void
@@ -1167,6 +1499,8 @@ ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "failed_count",       ec->failed_count);
 	spdk_json_write_named_bool(w,   "offline",            ec->offline);
 	spdk_json_write_named_bool(w,   "replace_in_progress", ec->replace_in_progress);
+
+	ec_write_io_stats_json(w, ec);
 
 	ec_write_base_bdevs_array_json(w, ec);
 
