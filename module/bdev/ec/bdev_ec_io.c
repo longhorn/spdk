@@ -675,6 +675,10 @@ ec_full_write_unwind(struct ec_bdev_io *ec_io, struct ec_bdev *ec)
 		ec_wib_region_inflight_dec(ec, ec_io->wib_region);
 		ec_io->wib_inflight_held = false;
 	}
+	if (ec_io->stripe_claimed) {
+		ec_stripe_clear_dirty(ec, ec_io->stripe_claim_index);
+		ec_io->stripe_claimed = false;
+	}
 	ec_free_io_buffers(ec_io, ec);
 }
 
@@ -761,6 +765,27 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 			ec->full_stripe_writes_deferred++;
 			return -EAGAIN;
 		}
+	}
+
+	/*
+	 * Stripe-busy interlock. Claim the stripe before submitting child
+	 * writes so a concurrent rebuild or UNMAP on the same stripe defers
+	 * via -EAGAIN. This closes a pre-existing race where an in-flight
+	 * rebuild on this stripe could read pre-write data from NORMAL
+	 * slots, reconstruct from it, and write the stale chunk to the
+	 * REPLACING slot after the foreground writes had already landed --
+	 * leaving the REPLACING slot inconsistent with the rest of the
+	 * array. ec_child_io_complete releases the claim on final completion.
+	 */
+	{
+		uint64_t stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
+
+		if (ec_stripe_is_dirty(ec, stripe_idx)) {
+			return -EAGAIN;
+		}
+		ec_stripe_set_dirty(ec, stripe_idx);
+		ec_io->stripe_claimed     = true;
+		ec_io->stripe_claim_index = stripe_idx;
 	}
 
 	/*

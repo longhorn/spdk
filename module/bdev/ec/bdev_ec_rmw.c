@@ -64,6 +64,8 @@ ec_rmw_complete(struct ec_rmw_ctx *mctx)
 	uint32_t region = ec_wib_stripe_to_region(mctx->stripe_index);
 	void (*cb_fn)(void *, enum spdk_bdev_io_status) = mctx->cb_fn;
 	void *cb_arg = mctx->cb_arg;
+
+	ec_stripe_clear_dirty(ec, mctx->stripe_index);
 	ec->rmw_in_flight--;
 	ec_wib_region_inflight_dec(ec, region);
 
@@ -572,6 +574,12 @@ ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
 {
 	uint32_t region = ec_wib_stripe_to_region(stripe_index);
 
+	/* Per-stripe serialisation: prior RMW to same stripe still in flight. */
+	if (ec_stripe_is_dirty(ec, stripe_index)) {
+		ec->rmw_deferred_inflight++;
+		return -EAGAIN;
+	}
+
 	return 0;
 }
 
@@ -698,6 +706,8 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 		mctx->chunk_iovs[disk].iov_base = mctx->chunk_bufs[disk];
 		mctx->chunk_iovs[disk].iov_len  = chunk_bytes;
 	}
+
+	ec_stripe_set_dirty(ec, stripe_index);
 	ec->rmw_in_flight++;
 
 	/*
@@ -752,6 +762,33 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 		} else {
 			reads_submitted++;
 		}
+	}
+
+	if (reads_submitted < ec->k) {
+		SPDK_ERRLOG("EC bdev %s: RMW only %u/%u reads submitted for "
+			    "stripe %" PRIu64 "\n",
+			    ec->bdev.name, reads_submitted, ec->k, stripe_index);
+
+		if (mctx->reads_remaining == 0) {
+			/*
+			 * All submits failed synchronously. No callbacks will
+			 * fire. Clean up the dirty state and context now,
+			 * including the wib_region_inflight decrement that
+			 * ec_rmw_complete would normally perform.
+			 */
+			ec_stripe_clear_dirty(ec, stripe_index);
+			ec->rmw_in_flight--;
+			ec_wib_region_inflight_dec(ec,
+				ec_wib_stripe_to_region(stripe_index));
+			ec_rmw_free_ctx(mctx, ec);
+			return -EIO;
+		}
+
+		/*
+		 * Some submits succeeded. Their callbacks will eventually
+		 * call ec_rmw_complete with the FAILED status we already set.
+		 */
+		mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 	}
 
 	return 0;

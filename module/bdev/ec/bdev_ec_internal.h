@@ -702,6 +702,29 @@ ec_only_parity_failed(const struct ec_bdev *ec)
 	return true;
 }
 
+/*
+ * Stripe dirty bitmap helpers. One bit per stripe, set during in-flight
+ * RMW. All operations O(1); no locking (single-threaded reactor).
+ */
+static inline void
+ec_stripe_set_dirty(struct ec_bdev *ec, uint64_t stripe_index)
+{
+	ec->stripe_dirty_map[stripe_index / 64] |= (UINT64_C(1) << (stripe_index % 64));
+}
+
+static inline void
+ec_stripe_clear_dirty(struct ec_bdev *ec, uint64_t stripe_index)
+{
+	ec->stripe_dirty_map[stripe_index / 64] &= ~(UINT64_C(1) << (stripe_index % 64));
+}
+
+static inline bool
+ec_stripe_is_dirty(const struct ec_bdev *ec, uint64_t stripe_index)
+{
+	return !!(ec->stripe_dirty_map[stripe_index / 64] &
+		  (UINT64_C(1) << (stripe_index % 64)));
+}
+
 /* WIB region dirty-bit helpers. Same single-thread O(1) discipline. */
 static inline uint32_t
 ec_wib_stripe_to_region(uint64_t stripe_index)
