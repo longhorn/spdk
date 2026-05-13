@@ -732,11 +732,55 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 
 	return 0;
 }
+
+int
 ec_submit_read(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
 	uint64_t        stripe_index, chunk_offset, base_lba;
 	uint32_t        chunk_idx;
+
+	/*
+	 * Unmapped-bitmap consultation. The EC bdev publishes
+	 * optimal_io_boundary = strip_size with split_on_optimal_io_boundary,
+	 * so every read arrives here within a single strip (and therefore
+	 * within a single stripe). Computing stripe_index from offset_blocks
+	 * alone is sufficient -- no per-stripe split needed.
+	 *
+	 * If the target stripe is marked unmapped, the read returns zeros
+	 * directly from the caller's iovs without touching any base bdev.
+	 * This is the load-bearing read-as-zero contract that decouples EC
+	 * correctness from whether the base bdev chain happens to honour
+	 * discard with zero-fill semantics. Without this short-circuit, a
+	 * read of a discarded range would return whatever bytes the base
+	 * bdev physically holds -- zero only by luck.
+	 *
+	 * Applies uniformly to all three branches below (parity-only-failed,
+	 * degraded, healthy) -- the bitmap is authoritative for the stripe's
+	 * content regardless of slot state. The degraded path additionally
+	 * benefits: an unmapped stripe needs no ISA-L reconstruction because
+	 * RS_encode(0,...,0) = (0,...,0) and the synthesised zeros are the
+	 * correct decode result anyway.
+	 *
+	 * ec_io->iovs is aliased to bdev_io->u.bdev.iovs (see
+	 * bdev_ec_io.c:145), so the memset writes directly into the caller's
+	 * destination buffers -- no bounce.
+	 */
+	if (ec->stripe_unmapped_map != NULL) {
+		stripe_index = ec_io->offset_blocks / ec->stripe_blocks;
+		if (ec_stripe_is_unmapped(ec, stripe_index)) {
+			int i;
+
+			for (i = 0; i < ec_io->iovcnt; i++) {
+				memset(ec_io->iovs[i].iov_base, 0,
+				       ec_io->iovs[i].iov_len);
+			}
+			ec->unmapped_reads_synthesized++;
+			spdk_bdev_io_complete(ec_io->bdev_io,
+					      SPDK_BDEV_IO_STATUS_SUCCESS);
+			return 0;
+		}
+	}
 
 	/* Parity-only failure -- all data disks healthy, direct read */
 	if (ec_only_parity_failed(ec)) {
