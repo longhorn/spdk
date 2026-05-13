@@ -549,6 +549,52 @@ ec_rmw_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 }
 
 /*
+ * Mark RMW backpressure as active. First call after a quiet period
+ * logs a NOTICE; later calls only refresh counter state. Callers
+ * pass the reason so the log line names the cause (active scrub vs.
+ * deferred-scrub guard).
+ */
+static void
+ec_rmw_backpressure_begin(struct ec_bdev *ec, const char *reason)
+{
+	if (ec->rmw_backpressure_active) {
+		return;
+	}
+	ec->rmw_backpressure_active           = true;
+	ec->rmw_backpressure_since_ticks      = spdk_get_ticks();
+	ec->rmw_backpressure_count_at_start   = ec->rmw_deferred_scrub +
+					        ec->rmw_deferred_dirty;
+	SPDK_NOTICELOG("EC bdev %s: RMW backpressure begun -- %s\n",
+		       ec->bdev.name, reason);
+}
+
+void
+ec_rmw_backpressure_end(struct ec_bdev *ec, const char *reason)
+{
+	uint64_t now;
+	uint64_t ticks_per_second;
+	uint64_t deferred;
+	uint64_t elapsed_milliseconds;
+
+	if (!ec->rmw_backpressure_active) {
+		return;
+	}
+
+	now = spdk_get_ticks();
+	ticks_per_second = spdk_get_ticks_hz();
+	deferred = (ec->rmw_deferred_scrub + ec->rmw_deferred_dirty) -
+		   ec->rmw_backpressure_count_at_start;
+	elapsed_milliseconds = (ticks_per_second > 0) ?
+		     ((now - ec->rmw_backpressure_since_ticks) * 1000 / ticks_per_second) : 0;
+
+	SPDK_NOTICELOG("EC bdev %s: RMW backpressure cleared (%s) -- "
+		       "%" PRIu64 " stripes deferred over %" PRIu64 "ms\n",
+		       ec->bdev.name, reason, deferred, elapsed_milliseconds);
+
+	ec->rmw_backpressure_active = false;
+}
+
+/*
  * Decide whether an RMW write to stripe_index may proceed right now.
  * Three guards apply:
  *
@@ -573,6 +619,49 @@ static int
 ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
 {
 	uint32_t region = ec_wib_stripe_to_region(stripe_index);
+
+	/*
+	 * Active-scrub guard: if scrub_ctx exists AND stripe_index is in
+	 * the region currently being scrubbed AND the stripe has not yet
+	 * been passed by the scrubber, requeue. Stripes already passed
+	 * are safe. Regions ahead of current_region that are still dirty
+	 * are also blocked.
+	 *
+	 * The race we are preventing: the scrubber reads old data, the
+	 * RMW writes new data + new parity, then the scrubber writes
+	 * parity computed from the old data -- overwriting the RMW's
+	 * correct parity with stale parity. Result: new data, old parity
+	 * -- exactly the write-hole the WIB exists to prevent.
+	 */
+	if (ec->scrub_ctx != NULL) {
+		struct ec_scrub_ctx *sctx = ec->scrub_ctx;
+
+		if (region == sctx->current_region &&
+		    stripe_index >= sctx->current_stripe) {
+			ec->rmw_deferred_scrub++;
+			ec_rmw_backpressure_begin(ec, "scrub active");
+			return -EAGAIN;
+		}
+		if (region > sctx->current_region &&
+		    ec_wib_region_is_dirty(ec, region)) {
+			ec->rmw_deferred_scrub++;
+			ec_rmw_backpressure_begin(ec, "scrub active");
+			return -EAGAIN;
+		}
+	}
+
+	/*
+	 * Deferred-scrub guard: scrub was not started at boot because a
+	 * data disk was FAILED (scrub_ctx == NULL but dirty regions
+	 * remain). A degraded RMW would reconstruct the missing chunk
+	 * using stale parity, then compute and persist wrong new parity.
+	 */
+	if (ec->scrub_ctx == NULL && ec->failed_count > 0 &&
+	    ec_wib_region_is_dirty(ec, region)) {
+		ec->rmw_deferred_dirty++;
+		ec_rmw_backpressure_begin(ec, "deferred scrub (degraded)");
+		return -EAGAIN;
+	}
 
 	/* Per-stripe serialisation: prior RMW to same stripe still in flight. */
 	if (ec_stripe_is_dirty(ec, stripe_index)) {

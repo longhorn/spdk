@@ -1708,6 +1708,11 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 	}
 
 	if (rc != 0) {
+		/*
+		 * -EAGAIN: RMW stripe dirty conflict -- requeue via NOMEM.
+		 * -ENOMEM: allocation failure -- requeue via NOMEM.
+		 * Other:   hard failure.
+		 */
 		if (rc == -EAGAIN || rc == -ENOMEM) {
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
 		} else {

@@ -871,6 +871,14 @@ void     ec_rmw_submit_writes(struct ec_rmw_ctx *mctx);
 void     ec_rmw_complete(struct ec_rmw_ctx *mctx);
 
 /*
+ * Backpressure transition logger. Called when the underlying condition
+ * that caused RMW deferral ends (scrub finish, scrub start after defer,
+ * rebuild restoring failed slots). Logs the "cleared" NOTICE and resets
+ * the active flag; no-op if backpressure was not active.
+ */
+void ec_rmw_backpressure_end(struct ec_bdev *ec, const char *reason);
+
+/*
  * Submit a sub-stripe RMW write. Called by ec_submit_write to handle
  * any write that doesn't cover one or more full stripes aligned.
  */
