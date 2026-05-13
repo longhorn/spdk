@@ -120,4 +120,15 @@ int ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, u
 
 void ec_bdev_delete(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_arg);
 
+/*
+ * Asynchronously replace the FAILED disk in slot with new_bdev_name.
+ * Transitions slot: FAILED -> REPLACING, opens channels on all threads.
+ * cb_fn NOT called on synchronous error return.
+ *
+ * Returns: 0, -ENODEV, -ENOENT, -EINVAL, -EBUSY, -ENOMEM
+ */
+int ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
+			      const char *new_bdev_name,
+			      ec_replace_cb_fn cb_fn, void *cb_arg);
+
 #endif /* SPDK_BDEV_EC_H */

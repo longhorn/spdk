@@ -150,6 +150,20 @@ enum ec_base_bdev_state {
 	EC_BASE_STATE_FAILED    = 1,  /* Base bdev has failed or been removed */
 	EC_BASE_STATE_REPLACING = 2,  /* Replacement inserted; rebuild pending */
 };
+
+/* =========================================================================
+ * Hot-swap replace context
+ * ========================================================================= */
+
+/* Carried through the async per-thread channel walk. Freed in ec_replace_finish(). */
+struct ec_replace_ctx {
+	struct ec_bdev        *ec;
+	uint32_t               slot;
+	char                   new_bdev_name[EC_BDEV_NAME_MAX];
+	struct spdk_bdev_desc *new_desc;
+	ec_replace_cb_fn       cb_fn;
+	void                  *cb_arg;
+};
 struct ec_bdev {
 	/* Generic SPDK bdev structure (must be first) */
 	struct spdk_bdev bdev;

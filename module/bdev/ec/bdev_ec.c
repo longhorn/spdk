@@ -1579,4 +1579,303 @@ ec_bdev_delete(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
 	}
 }
 
+/* =========================================================================
+ * ec_bdev_replace_base_bdev -- hot-swap a failed disk slot
+ * ========================================================================= */
+
+struct ec_replace_chan_ctx {
+	struct ec_replace_ctx *rctx;
+	int                    rc;   /* failure rc carried through the release walk */
+};
+
+static void ec_replace_acquire_chan_iter(struct spdk_io_channel_iter *i);
+static void ec_replace_chan_walk_done(struct spdk_io_channel_iter *i, int status);
+static void ec_replace_finish(struct ec_replace_ctx *rctx, int rc);
+static void ec_replace_start_channel_walk(struct ec_replace_ctx *rctx);
+static void ec_replace_release_chan_iter(struct spdk_io_channel_iter *i);
+static void ec_replace_release_done(struct spdk_io_channel_iter *i, int status);
+static void ec_replace_finish_failed(struct ec_replace_ctx *rctx, int rc);
+
+
+static void
+ec_replace_finish(struct ec_replace_ctx *rctx, int rc)
+{
+	struct ec_bdev *ec   = rctx->ec;
+	uint32_t        slot = rctx->slot;
+
+	ec->replace_in_progress = false;
+
+	if (rc == 0) {
+		SPDK_NOTICELOG("EC bdev %s: slot %u hot-swap complete -- "
+			       "disk '%s' is REPLACING; needs_rebuild=true. "
+			       "Run bdev_ec_start_rebuild to restore NORMAL.\n",
+			       ec->bdev.name, slot, rctx->new_bdev_name);
+		rctx->cb_fn(rctx->cb_arg, rc);
+		free(rctx);
+		return;
+	}
+
+	SPDK_ERRLOG("EC bdev %s: hot-swap of slot %u failed (rc=%d); "
+		    "releasing channels and reverting to FAILED\n",
+		    ec->bdev.name, slot, rc);
+
+	/*
+	 * The acquire walk may have set base_chans[slot] on threads it visited
+	 * before failing. Those channels reference rctx->new_desc; release them
+	 * on every thread before closing the descriptor. Closing a descriptor
+	 * with live channels leaves the next replace's acquire iter putting a
+	 * freed channel (use-after-free), so the close must wait for the walk.
+	 */
+	{
+		struct ec_replace_chan_ctx *cctx = calloc(1, sizeof(*cctx));
+
+		if (cctx != NULL) {
+			cctx->rctx = rctx;
+			cctx->rc   = rc;
+			spdk_for_each_channel(ec, ec_replace_release_chan_iter,
+					      cctx, ec_replace_release_done);
+			return;
+		}
+	}
+
+	/*
+	 * Best-effort fallback if even the tiny release-walk ctx cannot be
+	 * allocated (vanishingly unlikely during an already-failing replace):
+	 * close synchronously and accept the rare dangling per-thread channel.
+	 */
+	SPDK_ERRLOG("EC bdev %s: OOM for replace release walk on slot %u; "
+		    "closing descriptor best-effort\n", ec->bdev.name, slot);
+	ec_replace_finish_failed(rctx, rc);
+}
+
+/*
+ * Put base_chans[slot] on the running thread, if the acquire walk had set it,
+ * so the descriptor can be closed safely once the walk completes.
+ */
+static void
+ec_replace_release_chan_iter(struct spdk_io_channel_iter *i)
+{
+	struct ec_replace_chan_ctx *cctx  = spdk_io_channel_iter_get_ctx(i);
+	uint32_t                    slot  = cctx->rctx->slot;
+	struct spdk_io_channel     *ch    = spdk_io_channel_iter_get_channel(i);
+	struct ec_io_channel       *ec_ch = spdk_io_channel_get_ctx(ch);
+
+	if (ec_ch->base_chans[slot]) {
+		spdk_put_io_channel(ec_ch->base_chans[slot]);
+		ec_ch->base_chans[slot] = NULL;
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+ec_replace_release_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct ec_replace_chan_ctx *cctx = spdk_io_channel_iter_get_ctx(i);
+	struct ec_replace_ctx      *rctx = cctx->rctx;
+	int                         rc   = cctx->rc;
+
+	(void)status;
+	free(cctx);
+	ec_replace_finish_failed(rctx, rc);
+}
+
+/* Close the replacement descriptor, revert the slot to FAILED, report rc. */
+static void
+ec_replace_finish_failed(struct ec_replace_ctx *rctx, int rc)
+{
+	struct ec_bdev *ec   = rctx->ec;
+	uint32_t        slot = rctx->slot;
+
+	/*
+	 * descs[slot] is the sole owner of new_desc (set in
+	 * ec_replace_start_channel_walk). A NULL here means the failure-cleanup
+	 * chain for a replacement disk that died mid-replace already closed it --
+	 * closing new_desc again would double-close.
+	 */
+	if (ec->descs[slot] != NULL) {
+		spdk_bdev_close(ec->descs[slot]);
+		ec->descs[slot] = NULL;
+	}
+
+	ec->base_states[slot]   = EC_BASE_STATE_FAILED;
+	ec->needs_rebuild[slot] = false;
+
+	rctx->cb_fn(rctx->cb_arg, rc);
+	free(rctx);
+}
+
+static void
+ec_replace_chan_walk_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct ec_replace_chan_ctx *cctx = spdk_io_channel_iter_get_ctx(i);
+	struct ec_replace_ctx      *rctx = cctx->rctx;
+
+	free(cctx);
+	ec_replace_finish(rctx, status);
+}
+
+static void
+ec_replace_acquire_chan_iter(struct spdk_io_channel_iter *i)
+{
+	struct ec_replace_chan_ctx *cctx  = spdk_io_channel_iter_get_ctx(i);
+	struct ec_replace_ctx      *rctx  = cctx->rctx;
+	struct ec_bdev             *ec    = rctx->ec;
+	uint32_t                    slot  = rctx->slot;
+	struct spdk_io_channel     *ch    = spdk_io_channel_iter_get_channel(i);
+	struct ec_io_channel       *ec_ch = spdk_io_channel_get_ctx(ch);
+
+	if (ec_ch->base_chans[slot]) {
+		spdk_put_io_channel(ec_ch->base_chans[slot]);
+		ec_ch->base_chans[slot] = NULL;
+	}
+
+	ec_ch->base_chans[slot] = spdk_bdev_get_io_channel(ec->descs[slot]);
+	if (!ec_ch->base_chans[slot]) {
+		SPDK_ERRLOG("EC bdev %s: failed to get channel for replacement "
+			    "slot %u on thread %s\n",
+			    ec->bdev.name, slot,
+			    spdk_thread_get_name(spdk_get_thread()));
+		spdk_for_each_channel_continue(i, -ENOMEM);
+		return;
+	}
+
+	SPDK_DEBUGLOG(bdev_ec,
+		"EC bdev %s: acquired channel for replacement slot %u "
+		"on thread %s\n", ec->bdev.name, slot,
+		spdk_thread_get_name(spdk_get_thread()));
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+int
+ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
+			  const char *new_bdev_name,
+			  ec_replace_cb_fn cb_fn, void *cb_arg)
+{
+	struct ec_bdev        *ec;
+	struct ec_replace_ctx *rctx;
+	struct spdk_bdev      *new_bdev;
+	struct spdk_bdev      *orig_bdev;
+	uint32_t               i;
+	int                    rc;
+
+	ec = ec_bdev_find(ec_name);
+	if (!ec) {
+		return -ENODEV;
+	}
+
+	if (slot >= ec->n) {
+		return -ENOENT;
+	}
+
+	if (ec->base_states[slot] != EC_BASE_STATE_FAILED) {
+		return -EINVAL;
+	}
+
+	if (ec->replace_in_progress) {
+		return -EBUSY;
+	}
+
+	if (ec->rebuild_ctx != NULL) {
+		/*
+		 * A rebuild walks the REPLACING slots forward from a fixed
+		 * start slot and, on completion, transitions every slot it
+		 * believes it rebuilt (identified via needs_rebuild[]). Letting
+		 * a new replacement appear mid-rebuild would let
+		 * ec_rebuild_finish mark a slot NORMAL that this session never
+		 * walked, silently exposing un-rebuilt data. Reject; the caller
+		 * retries once the in-progress rebuild completes.
+		 */
+		return -EBUSY;
+	}
+
+	rctx = calloc(1, sizeof(*rctx));
+	if (!rctx) {
+		return -ENOMEM;
+	}
+	rctx->ec     = ec;
+	rctx->slot   = slot;
+	rctx->cb_fn  = cb_fn;
+	rctx->cb_arg = cb_arg;
+
+	if (strnlen(new_bdev_name, EC_BDEV_NAME_MAX) >= EC_BDEV_NAME_MAX) {
+		free(rctx);
+		return -EINVAL;
+	}
+	snprintf(rctx->new_bdev_name, sizeof(rctx->new_bdev_name),
+		 "%s", new_bdev_name);
+
+	rc = spdk_bdev_open_ext(new_bdev_name, true,
+				ec_base_bdev_event_cb, ec,
+				&rctx->new_desc);
+	if (rc != 0) {
+		free(rctx);
+		return rc;
+	}
+
+	new_bdev = spdk_bdev_desc_get_bdev(rctx->new_desc);
+
+	if (new_bdev->blocklen != ec->bdev.blocklen) {
+		spdk_bdev_close(rctx->new_desc);
+		free(rctx);
+		return -EINVAL;
+	}
+
+	orig_bdev = NULL;
+	for (i = 0; i < ec->n; i++) {
+		if (ec->base_states[i] == EC_BASE_STATE_NORMAL && ec->descs[i]) {
+			orig_bdev = spdk_bdev_desc_get_bdev(ec->descs[i]);
+			break;
+		}
+	}
+	if (orig_bdev != NULL && new_bdev->blockcnt < orig_bdev->blockcnt) {
+		spdk_bdev_close(rctx->new_desc);
+		free(rctx);
+		return -EINVAL;
+	}
+
+	ec->replace_in_progress = true;
+
+	ec_replace_start_channel_walk(rctx);
+	return 0;
+}
+
+static void
+ec_replace_start_channel_walk(struct ec_replace_ctx *rctx)
+{
+	struct ec_bdev             *ec   = rctx->ec;
+	uint32_t                    slot = rctx->slot;
+	struct ec_replace_chan_ctx *cctx;
+
+	ec->descs[slot]         = rctx->new_desc;
+	ec->base_states[slot]   = EC_BASE_STATE_REPLACING;
+	ec->needs_rebuild[slot] = true;
+
+	SPDK_NOTICELOG("EC bdev %s: slot %u -> REPLACING with '%s'; "
+		       "walking channels\n",
+		       ec->bdev.name, slot, rctx->new_bdev_name);
+
+	cctx = calloc(1, sizeof(*cctx));
+	if (!cctx) {
+		SPDK_ERRLOG("EC bdev %s: OOM for channel walk ctx; "
+			    "rolling slot %u back from REPLACING to FAILED\n",
+			    ec->bdev.name, slot);
+		ec->descs[slot]         = NULL;
+		ec->base_states[slot]   = EC_BASE_STATE_FAILED;
+		ec->needs_rebuild[slot] = false;
+		ec->replace_in_progress = false;
+		spdk_bdev_close(rctx->new_desc);
+		rctx->cb_fn(rctx->cb_arg, -ENOMEM);
+		free(rctx);
+		return;
+	}
+	cctx->rctx = rctx;
+
+	spdk_for_each_channel(ec,
+		ec_replace_acquire_chan_iter,
+		cctx,
+		ec_replace_chan_walk_done);
+}
+
 SPDK_LOG_REGISTER_COMPONENT(bdev_ec)
