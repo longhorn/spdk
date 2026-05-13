@@ -776,3 +776,30 @@ ec_wib_load_async(struct ec_bdev *ec, ec_bdev_create_cb_fn done_fn, void *done_a
 
 	ec_wib_load_async_continue(ctx);
 }
+
+/*
+ * Returns -ENODEV if the named EC bdev does not exist.
+ * Returns 0 on success.
+ *
+ * dirty_regions is the count of region bits currently set in wib_region_map.
+ */
+int
+ec_bdev_get_wib_status(const char *ec_name,
+		       uint32_t   *num_regions,
+		       uint32_t   *dirty_regions,
+		       uint32_t   *generation,
+		       bool       *persist_pending)
+{
+	struct ec_bdev *ec = ec_bdev_find(ec_name);
+
+	if (!ec) {
+		return -ENODEV;
+	}
+
+	*num_regions     = ec->wib_num_regions;
+	*dirty_regions   = ec_wib_count_dirty(ec);
+	*generation      = ec->wib_generation;
+	*persist_pending = ec->wib_persist_in_flight;
+
+	return 0;
+}
