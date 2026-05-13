@@ -885,6 +885,30 @@ void ec_rmw_backpressure_end(struct ec_bdev *ec, const char *reason);
 int ec_submit_rmw_write(struct ec_bdev_io *ec_io);
 
 /*
+ * Submit a sub-stripe RMW zero-fill on an explicit (offset, length)
+ * range within a single stripe, with caller-supplied completion. The
+ * range must satisfy num_blocks > 0, num_blocks <= ec->stripe_blocks,
+ * and (offset_blocks, offset_blocks + num_blocks) entirely within one
+ * stripe (i.e., the same stripe_index for both endpoints).
+ *
+ * The ec_io's offset_blocks / num_blocks / is_zero_fill / iovs are
+ * NOT read; this entry point lets the multi-segment UNMAP dispatcher
+ * zero-fill the partial-stripe head and tail fragments of an
+ * unaligned multi-stripe UNMAP without synthesizing a child bdev_io.
+ * ec_io is still used for the I/O channel (ec_io->ch).
+ *
+ * cb_fn is invoked exactly once with the aggregated status when the
+ * RMW completes. On non-zero return (-EAGAIN / -ENOMEM / -EINVAL) the
+ * cb_fn is NOT invoked -- the caller owns completion accounting.
+ */
+int ec_submit_rmw_zero_fill_range(struct ec_bdev_io *ec_io,
+				  uint64_t offset_blocks,
+				  uint64_t num_blocks,
+				  void (*cb_fn)(void *cb_arg,
+						enum spdk_bdev_io_status status),
+				  void *cb_arg);
+
+/*
  * I/O entry points defined in bdev_ec_io.c and dispatched from
  * ec_submit_request in bdev_ec.c.
  */

@@ -898,3 +898,50 @@ ec_submit_rmw_write(struct ec_bdev_io *ec_io)
 				  ec_io->is_zero_fill,
 				  NULL, NULL);
 }
+
+/*
+ * Internal sub-stripe zero-fill entry point used by the multi-segment
+ * UNMAP dispatcher. The range must lie within a single stripe; the
+ * dispatcher guarantees that by construction (head/tail fragments are
+ * each at most stripe_blocks-1 blocks and bounded by a stripe
+ * boundary). A defensive assertion catches future misuse.
+ *
+ * is_zero_fill is implicit in the entry-point name and hard-wired to
+ * true on the ctx; the iov fields of ec_io are NOT consulted.
+ */
+int
+ec_submit_rmw_zero_fill_range(struct ec_bdev_io *ec_io,
+			      uint64_t offset_blocks,
+			      uint64_t num_blocks,
+			      void (*cb_fn)(void *cb_arg,
+					    enum spdk_bdev_io_status status),
+			      void *cb_arg)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	uint64_t        end_blocks;
+
+	if (num_blocks == 0 || num_blocks > ec->stripe_blocks) {
+		SPDK_ERRLOG("EC bdev %s: zero-fill range invalid "
+			    "(offset=%" PRIu64 " num_blocks=%" PRIu64 " stripe_blocks=%" PRIu64 ")\n",
+			    ec->bdev.name, offset_blocks, num_blocks,
+			    ec->stripe_blocks);
+		return -EINVAL;
+	}
+
+	end_blocks = offset_blocks + num_blocks;
+	if (offset_blocks / ec->stripe_blocks !=
+	    (end_blocks - 1) / ec->stripe_blocks) {
+		SPDK_ERRLOG("EC bdev %s: zero-fill range straddles stripe "
+			    "boundary (offset=%" PRIu64 " num_blocks=%" PRIu64 " "
+			    "stripe_blocks=%" PRIu64 ")\n",
+			    ec->bdev.name, offset_blocks, num_blocks,
+			    ec->stripe_blocks);
+		return -EINVAL;
+	}
+
+	return ec_rmw_submit_core(ec_io,
+				  offset_blocks,
+				  num_blocks,
+				  true /* is_zero_fill */,
+				  cb_fn, cb_arg);
+}
