@@ -57,25 +57,51 @@ ec_free_io_buffers(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 		ec_io->bounce_buf = NULL;
 	}
 
-	if (ec_io->parity_bufs) {
-		for (i = 0; i < ec->m; i++) {
-			if (ec_io->parity_bufs[i]) {
-				spdk_dma_free(ec_io->parity_bufs[i]);
-			}
+	for (i = 0; i < ec->m; i++) {
+		if (ec_io->parity_bufs[i]) {
+			spdk_dma_free(ec_io->parity_bufs[i]);
+			ec_io->parity_bufs[i] = NULL;
 		}
-		free(ec_io->parity_bufs);
-		ec_io->parity_bufs = NULL;
+	}
+}
+
+static int
+ec_alloc_full_stripe(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
+{
+	uint32_t i;
+	uint64_t chunk_bytes       = ec->strip_size * ec->bdev.blocklen;
+	uint64_t total_data_bytes  = ec->stripe_blocks * ec->bdev.blocklen;
+
+	ec_io->bounce_buf = spdk_dma_zmalloc(total_data_bytes, EC_DMA_ALIGN, NULL);
+	if (!ec_io->bounce_buf) {
+		return -ENOMEM;
 	}
 
-	if (ec_io->parity_iovs) {
-		free(ec_io->parity_iovs);
-		ec_io->parity_iovs = NULL;
+	/*
+	 * WRITE_ZEROES fast path: spdk_dma_zmalloc already returned a zeroed
+	 * buffer, so the data chunks are zero and the parity (RS_encode of all
+	 * zeros) is also zero. Skip the iov copy.
+	 */
+	if (!ec_io->is_zero_fill) {
+		spdk_copy_iovs_to_buf(ec_io->bounce_buf, total_data_bytes,
+				      ec_io->iovs, ec_io->iovcnt);
 	}
 
-	if (ec_io->data_iovs) {
-		free(ec_io->data_iovs);
-		ec_io->data_iovs = NULL;
+	for (i = 0; i < ec->k; i++) {
+		ec_io->data_iovs[i].iov_base = (uint8_t *)ec_io->bounce_buf + (i * chunk_bytes);
+		ec_io->data_iovs[i].iov_len  = chunk_bytes;
 	}
+
+	for (i = 0; i < ec->m; i++) {
+		ec_io->parity_bufs[i] = spdk_dma_zmalloc(chunk_bytes, EC_DMA_ALIGN, NULL);
+		if (!ec_io->parity_bufs[i]) {
+			return -ENOMEM;
+		}
+		ec_io->parity_iovs[i].iov_base = ec_io->parity_bufs[i];
+		ec_io->parity_iovs[i].iov_len  = chunk_bytes;
+	}
+
+	return 0;
 }
 
 /* =========================================================================
@@ -106,10 +132,8 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
 	ec_io->base_io_remaining = 0;
 	ec_io->status            = SPDK_BDEV_IO_STATUS_SUCCESS;
 
-	ec_io->data_iovs   = NULL;
-	ec_io->parity_iovs = NULL;
-	ec_io->parity_bufs = NULL;
 	ec_io->bounce_buf  = NULL;
+	memset(ec_io->parity_bufs, 0, sizeof(ec_io->parity_bufs));
 
 	ec_io->stripe_claimed     = false;
 	ec_io->stripe_claim_index = 0;
@@ -585,8 +609,203 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 	return ec_submit_direct_read(ec_io, chunk_idx, base_lba);
 }
 
+/* =========================================================================
+ * Full-stripe write path
+ * ========================================================================= */
+
+static void ec_full_write_fanout(struct ec_bdev_io *ec_io);
+
+/*
+ * Release the resources a full-stripe write holds on an error path: the
+ * WIB-region inflight count, the stripe-busy claim, and the chunk buffers.
+ * Each guard is idempotent, so callers just complete (or return) afterward.
+ */
+static void
+ec_full_write_unwind(struct ec_bdev_io *ec_io, struct ec_bdev *ec)
+{
+	ec_free_io_buffers(ec_io, ec);
+}
+
+static int
+ec_submit_full_write(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	int             rc = 0;
+
+	/*
+	 * This function runs on the home thread because the WIB persist
+	 * below (ec_wib_persist) uses ec->wib_chans[], which are owned by
+	 * that thread.
+	 *
+	 * Routing the call to home when entered from a different thread is
+	 * deferred to the multi-reactor follow-up. It would mean replacing
+	 * the synchronous error returns here (-EAGAIN for retry, or a hard
+	 * failure that rolls back the WIB dirty bit and completes the
+	 * bdev_io as FAILED) with cb-delivered SPDK_BDEV_IO_STATUS_NOMEM
+	 * completions; the UNMAP and RMW paths need the same change.
+	 *
+	 * Only single-reactor SPDK targets are supported. The assert
+	 * catches accidental cross-thread use; without it the persist
+	 * would dispatch I/O on a channel it doesn't own.
+	 */
+	assert(spdk_get_thread() == ec->home_thread);
+
+	/*
+	 * ec_submit_full_write handles exactly one stripe per call.
+	 * ec_alloc_full_stripe copies exactly stripe_blocks * blocklen bytes
+	 * from the caller's iovecs, so a multi-stripe call would silently
+	 * process only the first stripe and lose the rest.
+	 *
+	 * ec_submit_write only routes here when num_blocks is a non-zero
+	 * multiple of stripe_blocks and the offset is stripe-aligned. With
+	 * optimal_io_boundary = strip_size and split_on_optimal_io_boundary,
+	 * the upper layer never sends a write larger than one strip, so
+	 * num_blocks == stripe_blocks is the only realistic case today.
+	 *
+	 * If that invariant is ever violated (e.g. a raw bdev caller bypasses
+	 * splitting), fail loudly rather than silently corrupt data.
+	 */
+	if (ec_io->num_blocks != ec->stripe_blocks) {
+		SPDK_ERRLOG("EC bdev %s: ec_submit_full_write called with "
+			    "num_blocks=%" PRIu64 " but stripe_blocks=%" PRIu64
+			    "; splitter bypass detected\n",
+			    ec->bdev.name,
+			    ec_io->num_blocks, ec->stripe_blocks);
+		rc = -EINVAL;
+		goto error;
+	}
+
+	rc = ec_alloc_full_stripe(ec_io, ec);
+	if (rc != 0) {
+		goto error;
+	}
+
+	ec_full_write_fanout(ec_io);
+	return 0;
+
+error:
+	ec_full_write_unwind(ec_io, ec);
+	return rc;
+}
+
+/*
+ * Encode parity and fan out the k+m child writes. Reached either
+ * directly from ec_submit_full_write (region was already dirty on
+ * disk) or via ec_full_write_wib_set_cb after a WIB persist completes
+ * (region transitioned clean -> dirty). The bdev_io is completed
+ * asynchronously via ec_child_io_complete once all child writes have
+ * finished.
+ */
+static void
+ec_full_write_fanout(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec   = ec_from_bdev_io(ec_io->bdev_io);
+	uint32_t        i;
+	uint64_t        chunk_blocks = ec->strip_size;
+	uint64_t        chunk_bytes  = chunk_blocks * ec->bdev.blocklen;
+	unsigned char  *data_ptrs[EC_MAX_BASE_BDEVS];
+	unsigned char  *parity_ptrs[EC_MAX_BASE_BDEVS];
+	uint64_t        stripe_index;
+	uint64_t        offset_in_disk;
+	uint32_t        writable_count;
+	int             rc;
+
+	for (i = 0; i < ec->k; i++) {
+		data_ptrs[i] = ec_io->data_iovs[i].iov_base;
+	}
+	for (i = 0; i < ec->m; i++) {
+		parity_ptrs[i] = ec_io->parity_iovs[i].iov_base;
+	}
+
+	ec_encode_data(chunk_bytes, ec->k, ec->m, ec->g_tbls, data_ptrs, parity_ptrs);
+
+	/* Full-stripe write touches every chunk, so only the stripe index is
+	 * needed (not the per-chunk mapping); the base LBA is the same for all. */
+	stripe_index   = ec_io->offset_blocks / ec->stripe_blocks;
+	offset_in_disk = ec_stripe_base_lba(ec, stripe_index);
+
+	writable_count = 0;
+	for (i = 0; i < ec->n; i++) {
+		if (ec_slot_is_writable(ec, i)) {
+			writable_count++;
+		}
+	}
+
+	ec_io->base_io_remaining = writable_count;
+	ec_io->status = SPDK_BDEV_IO_STATUS_SUCCESS;
+
+	if (ec_io->base_io_remaining == 0) {
+		SPDK_ERRLOG("EC bdev %s: full-stripe write to stripe %" PRIu64 " has no "
+			    "writable slots (%u of %u disks unavailable); "
+			    "completing FAILED\n",
+			    ec->bdev.name, stripe_index,
+			    ec->n - writable_count, ec->n);
+		goto error;
+	}
+
+	for (i = 0; i < ec->k; i++) {
+		if (!ec_slot_is_writable(ec, i)) {
+			continue;
+		}
+		rc = spdk_bdev_writev_blocks(ec->descs[i],
+			ec_io->ch->base_chans[i],
+			&ec_io->data_iovs[i], 1,
+			offset_in_disk, chunk_blocks,
+			ec_child_io_complete, ec_io);
+		if (rc != 0) {
+			ec_io->base_io_remaining--;
+			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
+		}
+	}
+
+	for (i = 0; i < ec->m; i++) {
+		uint32_t bdev_idx = ec->k + i;
+		if (!ec_slot_is_writable(ec, bdev_idx)) {
+			continue;
+		}
+		rc = spdk_bdev_writev_blocks(ec->descs[bdev_idx],
+			ec_io->ch->base_chans[bdev_idx],
+			&ec_io->parity_iovs[i], 1,
+			offset_in_disk, chunk_blocks,
+			ec_child_io_complete, ec_io);
+		if (rc != 0) {
+			ec_io->base_io_remaining--;
+			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
+		}
+	}
+
+	if (ec_io->base_io_remaining == 0) {
+		goto error;
+	}
+
+	return;
+
+error:
+	ec_full_write_unwind(ec_io, ec);
+	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+}
+
 int
 ec_submit_write(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+	/*
+	 * Full-stripe fast path: the I/O covers one or more complete stripes
+	 * with no partial leading or trailing data.
+	 *
+	 * write_unit_size=1 means any size/offset is legal. With
+	 * split_on_optimal_io_boundary=true (boundary = strip_size) the
+	 * upper layer splits on strip boundaries, so in practice
+	 * num_blocks <= strip_size always. A write of exactly stripe_blocks
+	 * at a stripe-aligned offset is the only case that reaches here as a
+	 * full stripe; all other cases go to RMW.
+	 *
+	 * We keep the condition general (multiple of stripe_blocks, aligned)
+	 * in case the caller issues a larger aligned write without splitting.
+	 */
+	if (ec_io->num_blocks % ec->stripe_blocks == 0 &&
+	    ec_io->offset_blocks % ec->stripe_blocks == 0) {
+		return ec_submit_full_write(ec_io);
+	}
 }

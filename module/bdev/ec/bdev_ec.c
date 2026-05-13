@@ -1556,6 +1556,9 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 	case SPDK_BDEV_IO_TYPE_READ:
 		rc = ec_submit_read(ec_io);
 		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		rc = ec_submit_write(ec_io);
+		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);

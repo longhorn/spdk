@@ -418,9 +418,16 @@ struct ec_bdev_io {
 	 * writes need.
 	 */
 	void *bounce_buf;
-	struct iovec *data_iovs;
-	struct iovec *parity_iovs;
-	void **parity_bufs;
+	/*
+	 * Inline scratch for full-stripe writes. Bounded by k+m
+	 * <= EC_MAX_BASE_BDEVS, so each ec_bdev_io carries its own slots
+	 * without three per-submission callocs (parity bdev pointers come
+	 * from ec_alloc_full_stripe, the iovs are filled from the bounce
+	 * buffer). Read and RMW paths leave these unused.
+	 */
+	struct iovec data_iovs[EC_MAX_BASE_BDEVS];
+	struct iovec parity_iovs[EC_MAX_BASE_BDEVS];
+	void        *parity_bufs[EC_MAX_BASE_BDEVS];
 
 	/*
 	 * Stripe-dirty claim release info. Set by ec_submit_full_write when
