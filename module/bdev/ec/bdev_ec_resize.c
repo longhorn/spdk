@@ -1,0 +1,349 @@
+/*   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright (C) 2026 Longhorn Authors.
+ *   All rights reserved.
+ */
+
+/*
+ * bdev_ec_resize.c -- in-place capacity expansion for EC bdevs.
+ *
+ * Triggered after the underlying base bdevs have been resized externally.
+ * k, m, and the encode tables are unchanged; only the EC bdev's blockcnt,
+ * num_stripes, WIB region count, and per-stripe bitmaps change.
+ *
+ * The WIB and bitmap regions live at fixed front offsets that never move
+ * on resize. Resize is mostly in-memory arithmetic: its only metadata write
+ * is re-stamping the unmapped bitmap at the new geometry. There is no
+ * on-disk relocation and no rollback path; an OOM mid-realloc clamps
+ * geometry back to the old size in place. The async control flow and
+ * per-step detail are documented at ec_bdev_resize / ec_resize_quiesce_cb.
+ */
+
+#include "bdev_ec_internal.h"
+#include "spdk/log.h"
+
+/* =========================================================================
+ * In-place resize (same k/m, bigger disks)
+ * ========================================================================= */
+
+/*
+ * Terminal handler -- clean up context, unquiesce, call user callback.
+ */
+static void
+ec_resize_finish(struct ec_resize_ctx *ctx, int rc)
+{
+	struct ec_bdev *ec = ctx->ec;
+	uint64_t quiesced_blockcnt = ctx->old_blockcnt;
+	uint64_t committed_blockcnt = ec->num_stripes * ec->stripe_blocks;
+	int notify_rc;
+
+	ec->resize_ctx = NULL;
+
+	/*
+	 * Commit the final size to the bdev layer now that the geometry is
+	 * settled. blockcnt still holds the old value here, so notify fires
+	 * the resize event and updates blockcnt on a successful grow; it is a
+	 * no-op when an OOM clamp left num_stripes (and thus
+	 * committed_blockcnt) at the old geometry.
+	 */
+	notify_rc = spdk_bdev_notify_blockcnt_change(&ec->bdev, committed_blockcnt);
+	if (notify_rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: resize -- blockcnt notify failed (rc=%d)\n",
+			    ec->bdev.name, notify_rc);
+	}
+
+	/*
+	 * Unquiesce the exact range we quiesced. We pass quiesced_blockcnt
+	 * (the old size) rather than calling plain spdk_bdev_unquiesce,
+	 * because after a successful resize bdev.blockcnt has already grown
+	 * and would no longer match the quiesced range.
+	 *
+	 * We don't check the return value on purpose. If the earlier quiesce
+	 * succeeded, this unquiesce can't fail -- we're releasing the exact
+	 * range we're still holding. The case that does return an error is
+	 * when the quiesce itself failed and we still ended up here (via
+	 * ec_resize_quiesce_cb): nothing was ever quiesced, so no I/O is stuck,
+	 * and SPDK already logs it. Either way there's nothing for us to do
+	 * with the return value.
+	 */
+	spdk_bdev_unquiesce_range(&ec->bdev, &ec_if,
+				  0, quiesced_blockcnt, NULL, NULL);
+
+	ctx->cb_fn(ctx->cb_arg, rc);
+	free(ctx);
+}
+
+/*
+ * Reallocate the WIB region arrays for the new (larger) geometry. On OOM the
+ * new arrays are discarded and num_stripes is clamped to what the existing WIB
+ * coverage supports. wib_buf itself is not reallocated (it is one strip,
+ * geometry-invariant). The WIB is reset to clean on grow (the old dirty bits
+ * are intentionally not carried forward) -- see the realloc below for why.
+ */
+static void
+ec_resize_realloc_wib_arrays(struct ec_resize_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+	uint32_t  new_wib_regions = (uint32_t)
+		((ec->num_stripes + EC_WIB_REGION_STRIPES - 1) /
+		 EC_WIB_REGION_STRIPES);
+	uint32_t  new_wib_words   = EC_BITMAP_WORDS(new_wib_regions);
+
+	uint64_t *new_region_map      = calloc(new_wib_words, sizeof(uint64_t));
+	uint32_t *new_region_inflight = calloc(new_wib_regions, sizeof(uint32_t));
+	uint64_t *new_region_dirty_ts = calloc(new_wib_regions, sizeof(uint64_t));
+
+	if (new_region_map && new_region_inflight && new_region_dirty_ts) {
+		/*
+		 * Reset the in-memory WIB to clean on grow -- do NOT carry the old
+		 * dirty bits forward (new_region_map is calloc'd, already zero).
+		 *
+		 * The on-disk WIB stays in the old geometry until the next persist,
+		 * so the next restart rejects it (num_regions mismatch in
+		 * ec_wib_validate_buf) and loads all-clean. Carrying the bits
+		 * forward in memory would leave a region marked dirty with no
+		 * loadable on-disk record; since the RMW / full-stripe paths skip
+		 * the WIB persist for an already-dirty region, a post-resize write
+		 * into it would issue data with no recoverable write-intent -- a
+		 * write-hole if it tears before the next persist re-stamps the WIB.
+		 * Resetting to clean matches what a restart reconstructs and forces
+		 * the next write into each region to re-persist its intent in the
+		 * new geometry. Dropping the old bits is safe because resize
+		 * quiesced I/O and runs only on a healthy array (guards reject an
+		 * in-progress scrub or any failed disk), so every set bit was an
+		 * already-completed write with consistent parity -- nothing to scrub.
+		 */
+		free(ec->wib_region_map);
+		free(ec->wib_region_inflight);
+		free(ec->wib_region_dirty_ticks);
+
+		ec->wib_region_map      = new_region_map;
+		ec->wib_region_inflight = new_region_inflight;
+		ec->wib_region_dirty_ticks = new_region_dirty_ts;
+		ec->wib_num_regions     = new_wib_regions;
+	} else {
+		/*
+		 * OOM -- free partial allocations and clamp geometry back to
+		 * the exact old size, mirroring the per-stripe OOM path. The
+		 * WIB arrays remain at their old (smaller) size, and
+		 * wib_num_regions is unchanged (still the old value), which
+		 * matches the restored num_stripes.
+		 */
+		free(new_region_map);
+		free(new_region_inflight);
+		free(new_region_dirty_ts);
+
+		SPDK_WARNLOG("EC bdev %s: resize -- OOM for WIB "
+			     "arrays; clamping capacity to existing "
+			     "WIB coverage\n", ec->bdev.name);
+
+		ec->num_stripes = ctx->old_blockcnt / ec->stripe_blocks;
+	}
+}
+
+/*
+ * Called after the EC bdev has been quiesced. Performs the actual resize:
+ *   1. Update num_stripes. The bdev blockcnt is committed last, in
+ *      ec_resize_finish, once the reallocs below have succeeded.
+ *   2. Reallocate the WIB region arrays. WIB position on disk is a
+ *      function of strip_size + bitmap reservation (both fixed-max), so no
+ *      relocation is needed -- on a future persist, the idle poller writes
+ *      the new region map to the same on-disk LBAs.
+ *   3. Reallocate per-stripe bitmaps (ec_resize_realloc_stripe_bitmaps) and
+ *      finish.
+ *
+ * Either reallocation may OOM. Both clamp capacity in place without an
+ * async unwind: the WIB realloc clamps to the existing WIB coverage; the
+ * per-stripe realloc clamps num_stripes back to the old geometry. A
+ * partial expansion would leave one map sized for new and the other for
+ * old, with OOB heap access on the very next I/O.
+ */
+static void
+ec_resize_quiesce_cb(void *cb_arg, int status)
+{
+	struct ec_resize_ctx *ctx = cb_arg;
+	struct ec_bdev       *ec  = ctx->ec;
+	uint64_t              new_blockcnt    = ctx->new_blockcnt;
+	uint64_t              new_num_stripes = ctx->new_num_stripes;
+
+	if (status != 0) {
+		SPDK_ERRLOG("EC bdev %s: resize quiesce failed (rc=%d)\n",
+			    ec->bdev.name, status);
+		ec_resize_finish(ctx, status);
+		return;
+	}
+
+	/*
+	 * Step 1: Update num_stripes. Must happen before the WIB realloc so
+	 * that the new wib_num_regions is derived from new_num_stripes.
+	 *
+	 * The bdev blockcnt is deliberately NOT committed here. It is deferred
+	 * to ec_resize_finish (via spdk_bdev_notify_blockcnt_change) so the
+	 * resize event fires to consumers only after the fallible WIB / bitmap
+	 * reallocs have succeeded, and so an OOM rollback never has to shrink
+	 * blockcnt back -- which the open-descriptor guard would reject.
+	 */
+	ec->num_stripes = new_num_stripes;
+
+	SPDK_NOTICELOG("EC bdev %s: resize -- blockcnt %" PRIu64 " -> %" PRIu64 ", "
+		       "num_stripes %" PRIu64 "\n",
+		       ec->bdev.name, ctx->old_blockcnt, new_blockcnt,
+		       new_num_stripes);
+
+	/*
+	 * Step 2: Grow the WIB region arrays for the larger volume. More
+	 * stripes means more WIB regions, so region_map / region_inflight /
+	 * region_dirty_ticks are reallocated to the new region count and reset
+	 * to all-clean -- the old dirty bits are intentionally not carried
+	 * forward (see ec_resize_realloc_wib_arrays for why).
+	 * On OOM the new arrays are dropped and num_stripes is clamped back
+	 * to what the old arrays already cover.
+	 *
+	 * This does not touch wib_buf: it is one strip regardless of volume
+	 * size, which is what lets resize run without interlocking the WIB
+	 * idle poller (see the concurrency note atop ec_bdev_resize).
+	 */
+	ec_resize_realloc_wib_arrays(ctx);
+}
+
+/*
+ * Expands the EC bdev in-place after the underlying base bdevs have been
+ * resized externally. k, m, and encode tables are unchanged.
+ *
+ * Returns 0 and kicks off the async resize (cb_fn called on completion).
+ * Returns negative errno on validation failure.
+ */
+int
+ec_bdev_resize(const char *ec_name,
+	       ec_resize_cb_fn cb_fn, void *cb_arg)
+{
+	struct ec_bdev       *ec;
+	struct ec_resize_ctx *ctx;
+	uint64_t              min_blockcnt = UINT64_MAX;
+	uint64_t              old_effective, new_effective;
+	uint64_t              new_total_physical_stripes;
+	uint64_t              new_num_stripes, new_blockcnt;
+	uint32_t              i;
+	int                   quiesce_rc;
+
+	/* Step 1: Find EC bdev */
+	ec = ec_bdev_find(ec_name);
+	if (!ec) {
+		return -ENODEV;
+	}
+
+	/* Step 2: Guard conditions */
+	if (ec->rebuild_ctx != NULL ||
+	    ec->resize_ctx != NULL) {
+		SPDK_ERRLOG("EC bdev %s: resize rejected -- "
+			    "another operation in progress\n", ec_name);
+		return -EBUSY;
+	}
+	if (ec->scrub_ctx != NULL) {
+		SPDK_ERRLOG("EC bdev %s: resize rejected -- "
+			    "scrub in progress\n", ec_name);
+		return -EBUSY;
+	}
+	if (ec->failed_count != 0) {
+		SPDK_ERRLOG("EC bdev %s: resize rejected -- "
+			    "%u failed disks\n", ec_name, ec->failed_count);
+		return -EBUSY;
+	}
+	if (ec->offline) {
+		return -EIO;
+	}
+	/*
+	 * No interlock with the WIB idle poller is required. Resize does
+	 * not reallocate wib_buf (size is geometry-invariant), so an
+	 * in-flight persist's DMA reads remain valid throughout.
+	 * ec_wib_fill_buf captures wib_region_map and wib_num_regions
+	 * synchronously before submitting I/O; later reallocs in
+	 * ec_resize_quiesce_cb do not affect the in-flight DMA. The
+	 * persist's on-disk LBA is fixed (function of strip_size + bitmap
+	 * reservation, both unchanged across resize).
+	 */
+
+	/* Step 3: Find minimum base bdev size. The failed_count != 0 guard
+	 * above already excludes any non-NORMAL slot, so every descs[i] is
+	 * non-NULL here. */
+	for (i = 0; i < ec->n; i++) {
+		struct spdk_bdev *base = spdk_bdev_desc_get_bdev(ec->descs[i]);
+
+		if (base->blockcnt < min_blockcnt) {
+			min_blockcnt = base->blockcnt;
+		}
+	}
+
+	/*
+	 * Step 4: Validate growth.
+	 *
+	 * Both metadata reservations (bitmap + WIB) are fixed-max and at the
+	 * front of every disk; only the trailing user region grows on resize.
+	 * new_num_stripes is the post-resize physical stripe count minus the
+	 * same data_offset_stripes reservation that ec_compute_geometry carved
+	 * out. old_effective and new_effective are both measured in user-region
+	 * blocks, so the growth check below compares them in the same units.
+	 */
+	old_effective = ec->num_stripes * ec->strip_size;
+	new_total_physical_stripes = min_blockcnt / ec->strip_size;
+
+	if (new_total_physical_stripes <= ec->data_offset_stripes) {
+		/*
+		 * Hard geometry error, not a benign no-op: the disks are too
+		 * small to hold even the front metadata reservation. Return
+		 * -ERANGE (not -EALREADY) so the caller does not mistake it for
+		 * the idempotent "have not grown" retry below.
+		 */
+		SPDK_ERRLOG("EC bdev %s: resize -- base bdevs too small to "
+			    "hold the in-band bitmap reservation "
+			    "(physical stripes=%" PRIu64 ", reservation=%" PRIu64 ")\n",
+			    ec_name, new_total_physical_stripes,
+			    ec->data_offset_stripes);
+		return -ERANGE;
+	}
+
+	new_num_stripes = new_total_physical_stripes - ec->data_offset_stripes;
+	new_effective   = new_num_stripes * ec->strip_size;
+
+	if (new_effective <= old_effective) {
+		SPDK_NOTICELOG("EC bdev %s: resize -- base bdevs have not "
+			       "grown (old_effective=%" PRIu64 ", new_effective=%" PRIu64 ")\n",
+			       ec_name, old_effective, new_effective);
+		return -EALREADY;
+	}
+
+	/* Step 5: Compute new geometry */
+	new_blockcnt = new_num_stripes * ec->stripe_blocks;
+
+	SPDK_NOTICELOG("EC bdev %s: resize requested -- blockcnt %" PRIu64 " -> %" PRIu64 ", "
+		       "stripes %" PRIu64 " -> %" PRIu64 "; about to quiesce I/O\n",
+		       ec_name, ec->bdev.blockcnt, new_blockcnt,
+		       ec->num_stripes, new_num_stripes);
+
+	/* Step 6: Allocate context */
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+
+	ctx->ec              = ec;
+	ctx->cb_fn           = cb_fn;
+	ctx->cb_arg          = cb_arg;
+	ctx->new_blockcnt    = new_blockcnt;
+	ctx->new_num_stripes = new_num_stripes;
+	ctx->old_blockcnt    = ec->bdev.blockcnt;
+
+	/* Step 7: Quiesce and proceed in callback */
+	ec->resize_ctx = ctx;
+
+	quiesce_rc = spdk_bdev_quiesce(&ec->bdev, &ec_if,
+				ec_resize_quiesce_cb, ctx);
+	if (quiesce_rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: resize -- failed to quiesce "
+			    "(rc=%d)\n", ec_name, quiesce_rc);
+		ec->resize_ctx = NULL;
+		free(ctx);
+		return quiesce_rc;
+	}
+
+	return 0;
+}

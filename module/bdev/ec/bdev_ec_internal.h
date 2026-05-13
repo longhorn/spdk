@@ -354,6 +354,28 @@ struct ec_scrub_ctx {
 };
 
 /* =========================================================================
+ * In-place resize context
+ * ========================================================================= */
+
+/*
+ * One instance per ec_bdev_resize() call. Freed in ec_resize_finish().
+ * Updates blockcnt / num_stripes / WIB region arrays / per-stripe bitmaps.
+ * No data movement, no parity recomputation, no encode table changes,
+ * and no on-disk WIB relocation -- the WIB sits at a fixed front offset
+ * that is a pure function of strip_size and the bitmap reservation.
+ */
+struct ec_resize_ctx {
+	struct ec_bdev     *ec;
+	ec_resize_cb_fn     cb_fn;
+	void               *cb_arg;
+
+	/* New geometry values (computed at entry, applied under quiesce). */
+	uint64_t            new_blockcnt;
+	uint64_t            new_num_stripes;
+	uint64_t            old_blockcnt;
+};
+
+/* =========================================================================
  * ec_bdev -- main EC bdev instance
  * ========================================================================= */
 

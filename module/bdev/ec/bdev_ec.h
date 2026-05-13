@@ -174,4 +174,15 @@ int ec_bdev_set_rebuild_qos(const char *ec_name,
  */
 int ec_bdev_stop_rebuild(const char *ec_name);
 
+/*
+ * Expand the EC bdev in-place after base bdevs have grown.
+ * The WIB and unmapped-bitmap reservations sit at fixed front offsets and do
+ * not move; resize only grows the user-data region, updating blockcnt, stripe
+ * count, and the dirty bitmap.
+ *
+ * Returns: 0, -ENODEV, -EBUSY, -EIO, -EALREADY, -ENOMEM
+ */
+int ec_bdev_resize(const char *ec_name,
+		   ec_resize_cb_fn cb_fn, void *cb_arg);
+
 #endif /* SPDK_BDEV_EC_H */
