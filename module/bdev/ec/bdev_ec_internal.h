@@ -175,6 +175,45 @@ struct ec_replace_ctx {
 	ec_replace_cb_fn       cb_fn;
 	void                  *cb_arg;
 };
+
+/* =========================================================================
+ * Write-Intent Bitmap (WIB)
+ *
+ * Protects against the RMW write-hole. One dirty bit per region of
+ * EC_WIB_REGION_STRIPES stripes, stored on-disk as two alternating
+ * front-placed copies on every parity disk, immediately after the
+ * unmapped-bitmap reservation. See bdev_ec_wib.c for the on-disk layout
+ * and persist protocol.
+ * ========================================================================= */
+
+/* Stripes per WIB region -- one dirty bit covers this many stripes. */
+#define EC_WIB_REGION_STRIPES   1024u
+
+/* Region idle threshold before the region bit is cleared on disk (ms). */
+#define EC_WIB_IDLE_MS          500u
+
+/* Poller period for the WIB region-clear scan (us). */
+#define EC_WIB_POLL_PERIOD_US   100000u   /* 100 ms */
+
+/* Magic number in each on-disk WIB copy header. */
+#define EC_WIB_MAGIC   UINT64_C(0x45432057494230)   /* "EC WIB0" */
+
+/*
+ * On-disk WIB header version. ec_wib_validate_buf rejects any non-matching
+ * version, so a stale blob fails the load path loudly instead of being read
+ * against the wrong layout.
+ */
+#define EC_WIB_VERSION 1u
+
+/* On-disk WIB copy header; region_bits[] follows immediately after. */
+struct ec_wib_header {
+	uint64_t magic;
+	uint32_t version;
+	uint32_t generation;   /* only ever increases across persist calls */
+	uint32_t num_regions;
+	uint32_t _pad;
+	/* uint64_t region_bits[] follows in the DMA buffer */
+};
 struct ec_bdev {
 	/* Generic SPDK bdev structure (must be first) */
 	struct spdk_bdev bdev;
@@ -554,6 +593,69 @@ ec_only_parity_failed(const struct ec_bdev *ec)
 	return true;
 }
 
+/* WIB region dirty-bit helpers. Same single-thread O(1) discipline. */
+static inline uint32_t
+ec_wib_stripe_to_region(uint64_t stripe_index)
+{
+	return (uint32_t)(stripe_index / EC_WIB_REGION_STRIPES);
+}
+
+static inline bool
+ec_wib_region_is_dirty(const struct ec_bdev *ec, uint32_t region)
+{
+	return !!(ec->wib_region_map[region / 64] &
+		  (UINT64_C(1) << (region % 64)));
+}
+
+static inline void
+ec_wib_region_set_dirty(struct ec_bdev *ec, uint32_t region)
+{
+	ec->wib_region_map[region / 64] |= (UINT64_C(1) << (region % 64));
+}
+
+static inline void
+ec_wib_region_clear_dirty(struct ec_bdev *ec, uint32_t region)
+{
+	ec->wib_region_map[region / 64] &= ~(UINT64_C(1) << (region % 64));
+}
+
+/*
+ * Bracket the in-flight write counter for a single WIB region. Two
+ * paths inc it: ec_submit_rmw_write (sub-stripe RMW) and
+ * ec_submit_full_write (full-stripe write). Each inc must be
+ * balanced by exactly one dec -- for RMW, in ec_rmw_complete or the
+ * synchronous read-submit failure cleanup; for full-stripe writes,
+ * in ec_child_io_complete via ec_bdev_io.wib_inflight_held. The dec
+ * guards against underflow defensively; underflow indicates a
+ * balance bug higher up the chain.
+ */
+static inline void
+ec_wib_region_inflight_inc(struct ec_bdev *ec, uint32_t region)
+{
+	ec->wib_region_inflight[region]++;
+}
+
+static inline void
+ec_wib_region_inflight_dec(struct ec_bdev *ec, uint32_t region)
+{
+	if (ec->wib_region_inflight[region] > 0) {
+		ec->wib_region_inflight[region]--;
+	} else {
+		SPDK_ERRLOG("EC bdev %s: wib_region_inflight[%u] underflow\n",
+			    ec->bdev.name, region);
+	}
+}
+
+/* =========================================================================
+ * Cross-file internal API
+ *
+ * Non-inline functions defined in one .c file of the module and called
+ * from another. Static helpers used by only one .c file stay in that file.
+ * ========================================================================= */
+
+/* Helpers for diagnostics; loop-based, not worth inlining. */
+uint32_t ec_wib_count_dirty(const struct ec_bdev *ec);
+
 /* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
 int ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
@@ -564,6 +666,61 @@ int ec_reconstruct_multi_data(const struct ec_bdev *ec,
 			      uint8_t *out_bufs[],
 			      const uint32_t failed_data_slots[],
 			      uint32_t f, uint64_t chunk_len);
+
+/* =========================================================================
+ * WIB <-> RMW protocol
+ *
+ * RMW and WIB live in separate files (bdev_ec_rmw.c and bdev_ec_wib.c)
+ * but share state in struct ec_bdev: wib_persist_in_flight,
+ * wib_repersist_needed, wib_deferred_writes, and the wib_region_*
+ * arrays. Two function calls bridge them:
+ *
+ *   bdev_ec_rmw.c -> bdev_ec_wib.c
+ *     ec_rmw_persist_and_submit calls ec_wib_persist to set a region's
+ *     on-disk dirty bit before the data + parity writes go out. When
+ *     a persist is already in flight, the RMW context is queued on
+ *     wib_deferred_writes and wib_repersist_needed is set.
+ *
+ *   bdev_ec_wib.c -> bdev_ec_rmw.c
+ *     ec_wib_persist_write_cb, on the final write completion, drains
+ *     wib_deferred_writes via ec_wib_deferred_drain, which calls
+ *     ec_rmw_submit_writes for each queued context.
+ *
+ * Both bridge functions (ec_wib_persist and ec_rmw_submit_writes) are
+ * declared in the section immediately below.
+ * ========================================================================= */
+
+/*
+ * LBA of WIB copy 0 or 1 on a parity disk.
+ *
+ * Per-disk layout:
+ *   [ bitmap region: bitmap_reservation_stripes strips ]
+ *   [ WIB copy 0:    1 strip                           ]
+ *   [ WIB copy 1:    1 strip                           ]
+ *   [ user data:     num_stripes strips                ]
+ *
+ * Pure arithmetic over strip_size and the bitmap reservation, both
+ * fixed-max at create time -- no I/O, no descriptor lookups.
+ */
+static inline uint64_t
+ec_wib_lba(const struct ec_bdev *ec, uint8_t copy)
+{
+	/*
+	 * Two alternating front-placed copies. At this commit there is no
+	 * other front-placed reservation, so copy 0 starts at LBA 0 and
+	 * copy 1 starts one strip later. Once the in-band unmapped bitmap
+	 * lands (c19), this offset shifts behind it via
+	 * ec_bitmap_reservation_stripes(), but the two-copies-back-to-back
+	 * layout is preserved.
+	 */
+	return ((uint64_t)copy) * ec->strip_size;
+}
+
+/* WIB helpers needed by the resize and scrub chains, plus the
+ * RMW->WIB bridge ec_wib_persist documented above. */
+int      ec_wib_persist(struct ec_bdev *ec,
+			void (*cb)(void *cb_arg, int rc), void *cb_arg);
+int      ec_wib_idle_poller_cb(void *arg);
 
 /*
  * I/O entry points defined in bdev_ec_io.c and dispatched from

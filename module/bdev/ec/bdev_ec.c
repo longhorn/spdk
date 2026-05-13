@@ -162,6 +162,33 @@ ec_bdev_find(const char *name)
 	return NULL;
 }
 
+/* Population count over `words` uint64_t entries. */
+static uint64_t
+ec_count_set_bits(const uint64_t *map, uint64_t words)
+{
+	uint64_t count = 0;
+	uint64_t i;
+
+	if (map == NULL) {
+		return 0;
+	}
+	for (i = 0; i < words; i++) {
+		count += __builtin_popcountll(map[i]);
+	}
+	return count;
+}
+
+/* Count the number of set bits in the dirty map (for diagnostics). */
+static uint64_t
+ec_stripe_count_dirty(const struct ec_bdev *ec)
+{
+	if (ec->stripe_dirty_map == NULL) {
+		return 0;
+	}
+	return ec_count_set_bits(ec->stripe_dirty_map,
+				 EC_BITMAP_WORDS(ec->num_stripes));
+}
+
 /* =========================================================================
  * Async cleanup chain
  * ========================================================================= */
@@ -1454,6 +1481,10 @@ void
 ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 {
 	spdk_json_write_named_uint32(w, "rmw_in_flight", ec->rmw_in_flight);
+	if (ec->stripe_dirty_map) {
+		spdk_json_write_named_uint64(w, "dirty_stripes",
+					     ec_stripe_count_dirty(ec));
+	}
 	spdk_json_write_named_uint64(w, "rmw_total",
 				     ec->rmw_total);
 	spdk_json_write_named_uint64(w, "rmw_deferred_scrub",
@@ -1503,6 +1534,17 @@ ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	ec_write_io_stats_json(w, ec);
 
 	ec_write_base_bdevs_array_json(w, ec);
+
+	spdk_json_write_named_uint32(w, "wib_num_regions",     ec->wib_num_regions);
+	spdk_json_write_named_uint32(w, "wib_generation",      ec->wib_generation);
+	/* JSON key remains "wib_persist_pending" for wire compatibility;
+	 * the C field is wib_persist_in_flight (true until persist completes
+	 * end-to-end). */
+	spdk_json_write_named_bool(w,   "wib_persist_pending",  ec->wib_persist_in_flight);
+	if (ec->wib_region_map) {
+		spdk_json_write_named_uint32(w, "wib_dirty_regions",
+					     ec_wib_count_dirty(ec));
+	}
 
 	spdk_json_write_object_end(w);
 	return 0;

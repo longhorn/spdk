@@ -504,7 +504,55 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 		return -EINVAL;
 	}
 
-	/* Case C: target chunk lives on a failed data slot -> degraded reconstruct */
+	/*
+	 * Case C: target data chunk is unavailable -> ISA-L reconstruction.
+	 *
+	 * This path handles up to m simultaneous disk failures
+	 * (any combination of data and parity). We only need to reconstruct
+	 * the ONE target chunk -- we do not need to reconstruct the other failed
+	 * data slots. ec_reconstruct_data_chunk picks k readable rows from the
+	 * encode_matrix (which includes parity rows), inverts the kxk submatrix,
+	 * and extracts the decode vector for the target slot. The MDS property
+	 * of Reed-Solomon guarantees this inversion succeeds as long as at least
+	 * k readable disks remain (i.e. failed_count <= m <= n-k).
+	 *
+	 * Dirty-region guard: if the target stripe's WIB region is still dirty
+	 * (either because the startup scrub is running and has not yet cleared
+	 * this region, or because the scrub was deferred due to a failed data
+	 * disk), parity on disk may be stale relative to the data chunks.
+	 * Reconstruction uses parity as an input; stale parity produces a
+	 * result that is neither the pre-crash nor the post-crash value --
+	 * silently wrong bytes. Return -EIO rather than serve garbage.
+	 * The caller surfaces this as a hard I/O error; the data in this
+	 * region is indeterminate until the scrub completes.
+	 */
+	if (ec_wib_region_is_dirty(ec, ec_wib_stripe_to_region(stripe_index))) {
+		/*
+		 * Region-level guard: conservative by design. The WIB marks
+		 * an entire 1024-stripe region dirty even if only one stripe
+		 * was mid-RMW at the crash, so this EIO fires for all stripes
+		 * in the region, not just the one with stale parity.
+		 *
+		 * Future refinement: when scrub_ctx is active, stripes with
+		 * stripe_index < sctx->current_stripe have already been
+		 * re-encoded by the scrubber and are safe to reconstruct.
+		 * Not implemented here because the EIO window is typically
+		 * well under one second per region on local NVMe (one region =
+		 * k x strip_size_kb x 1024 bytes; e.g. 64 MiB for k=2/32KB,
+		 * 256 MiB for k=4/64KB), and real availability impact has not
+		 * been observed. Add the sctx->current_stripe range check if
+		 * production data shows this window is wide enough to matter.
+		 */
+		/*
+		 * Production signal: ec->degraded_read_eio_dirty is the
+		 * counter exposed via bdev_get_bdevs / bdev_ec_get_bdevs.
+		 * No per-I/O log -- a sustained read-storm in the brief
+		 * scrub window would flood the system log otherwise.
+		 */
+		ec->degraded_read_eio_dirty++;
+		return -EIO;
+	}
+
 	ec->degraded_reads_reconstructed++;
 
 	dctx = calloc(1, sizeof(*dctx));
@@ -623,7 +671,36 @@ static void ec_full_write_fanout(struct ec_bdev_io *ec_io);
 static void
 ec_full_write_unwind(struct ec_bdev_io *ec_io, struct ec_bdev *ec)
 {
+	if (ec_io->wib_inflight_held) {
+		ec_wib_region_inflight_dec(ec, ec_io->wib_region);
+		ec_io->wib_inflight_held = false;
+	}
 	ec_free_io_buffers(ec_io, ec);
+}
+
+/*
+ * Callback fired by ec_wib_persist when the WIB region bit for this
+ * full-stripe write has been persisted to disk. On success, continues
+ * the submission chain by encoding parity and fanning out child writes.
+ * On failure, releases the stripe-busy claim and the WIB inflight count,
+ * then completes the bdev_io with FAILED status.
+ */
+static void
+ec_full_write_wib_set_cb(void *cb_arg, int rc)
+{
+	struct ec_bdev_io *ec_io = cb_arg;
+	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
+
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: full-stripe WIB persist failed (rc=%d) "
+			    "before write fan-out at stripe %" PRIu64 "\n",
+			    ec->bdev.name, rc, ec_io->stripe_claim_index);
+		ec_full_write_release(ec_io, ec);
+		spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	ec_full_write_fanout(ec_io);
 }
 
 static int
@@ -651,6 +728,42 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	assert(spdk_get_thread() == ec->home_thread);
 
 	/*
+	 * Active-scrub guard: a full-stripe write encodes parity from the new
+	 * data it supplies, then writes both. If the startup scrubber is
+	 * concurrently reading the same stripe's old data to re-encode parity,
+	 * this sequence produces a race:
+	 *   1. Scrubber reads (D0_old ... Dk_old).
+	 *   2. Full-stripe write lands: data becomes (D0_new ... Dk_new),
+	 *      parity becomes encode(D0_new ... Dk_new).
+	 *   3. Scrubber writes encode(D0_old ... Dk_old), overwriting step 2's
+	 *      correct parity with parity derived from stale data.
+	 * Result: new data, old parity -- exactly the write-hole the WIB exists
+	 * to prevent.
+	 *
+	 * The guard mirrors the active-scrub check in ec_submit_rmw_write:
+	 * block stripes not yet passed by the scrubber in the current region,
+	 * and all stripes in dirty regions ahead of it. Stripes the scrubber
+	 * has already processed (stripe_index < sctx->current_stripe) are safe
+	 * because the scrubber will not revisit them.
+	 */
+	if (ec->scrub_ctx != NULL) {
+		struct ec_scrub_ctx *sctx        = ec->scrub_ctx;
+		uint64_t             stripe_idx  = ec_io->offset_blocks / ec->stripe_blocks;
+		uint32_t             region      = ec_wib_stripe_to_region(stripe_idx);
+
+		if (region == sctx->current_region &&
+		    stripe_idx >= sctx->current_stripe) {
+			ec->full_stripe_writes_deferred++;
+			return -EAGAIN;
+		}
+		if (region > sctx->current_region &&
+		    ec_wib_region_is_dirty(ec, region)) {
+			ec->full_stripe_writes_deferred++;
+			return -EAGAIN;
+		}
+	}
+
+	/*
 	 * ec_submit_full_write handles exactly one stripe per call.
 	 * ec_alloc_full_stripe copies exactly stripe_blocks * blocklen bytes
 	 * from the caller's iovecs, so a multi-stripe call would silently
@@ -673,6 +786,87 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 			    ec_io->num_blocks, ec->stripe_blocks);
 		rc = -EINVAL;
 		goto error;
+	}
+
+	/*
+	 * WIB region marking. A crash partway through the fan-out can
+	 * leave a subset of the k+m chunks at the new value and the rest
+	 * at the old value. Without a WIB bit, recovery has no record
+	 * that this stripe was mid-write, so no scrub runs and parity
+	 * stays inconsistent with whatever data did land -- a later disk
+	 * failure would reconstruct using stale parity and surface
+	 * silently wrong bytes (the same write-hole the WIB prevents for
+	 * RMW). The mark + inflight + dirty_ts trio mirrors the RMW and
+	 * UNMAP submit paths exactly; the idle WIB poller is gated by
+	 * all three so the bit cannot be cleared mid-fanout.
+	 */
+	{
+		uint64_t stripe_idx = ec_io->stripe_claim_index;
+		uint32_t region     = ec_wib_stripe_to_region(stripe_idx);
+		bool     any_was_clean = false;
+
+		if (!ec_wib_region_is_dirty(ec, region)) {
+			ec_wib_region_set_dirty(ec, region);
+			any_was_clean = true;
+		}
+		ec_wib_region_inflight_inc(ec, region);
+		ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
+
+		ec_io->wib_region        = region;
+		ec_io->wib_inflight_held = true;
+
+		/*
+		 * Persist decision tree mirrors the RMW / UNMAP submit
+		 * paths. wib_persist_in_flight must be consulted on every
+		 * branch -- even when the in-memory bit was already dirty,
+		 * an in-flight persist may be *clearing* the bit (initiated
+		 * by the idle poller before our setter ran). Proceeding
+		 * straight to fan-out in that window would let a crash
+		 * leave on-disk WIB clean while the stripe is mid-write.
+		 */
+		if (ec->wib_persist_in_flight) {
+			ec->wib_repersist_needed = true;
+			ec->full_stripe_writes_deferred++;
+			rc = -EAGAIN;
+			goto error;
+		}
+
+		/*
+		 * Past every reject (-EINVAL) and defer (-EAGAIN) gate: the
+		 * write is now accepted and will fan out. Count it here so a
+		 * deferred-then-retried write is not counted on each attempt and
+		 * an invalid request is not counted at all.
+		 */
+		ec->full_stripe_writes++;
+
+		if (any_was_clean) {
+			int persist_rc;
+
+			rc = ec_alloc_full_stripe(ec_io, ec);
+			if (rc != 0) {
+				/*
+				 * We set this region's WIB bit above, but no
+				 * persist will record it and the error path does
+				 * not clear it. Roll it back so the in-memory bit
+				 * never outlives its on-disk record: otherwise the
+				 * NOMEM retry would see the region already dirty,
+				 * skip the WIB persist, and fan out data with no
+				 * recoverable write-intent. Safe -- no fan-out
+				 * happened, so nothing needs scrubbing.
+				 */
+				ec_wib_region_clear_dirty(ec, region);
+				goto error;
+			}
+
+			persist_rc = ec_wib_persist(ec, ec_full_write_wib_set_cb, ec_io);
+			if (persist_rc != 0) {
+				/* Same rollback as the alloc-failure path above. */
+				ec_wib_region_clear_dirty(ec, region);
+				rc = persist_rc;
+				goto error;
+			}
+			return 0;
+		}
 	}
 
 	rc = ec_alloc_full_stripe(ec_io, ec);
