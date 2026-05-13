@@ -1697,6 +1697,18 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		rc = ec_submit_write(ec_io);
 		break;
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		/*
+		 * Defensive: ec_io_type_supported returns false for
+		 * WRITE_ZEROES so the bdev layer always emulates it as
+		 * WRITE. Reaching here means that contract changed and the
+		 * RMW heap-overflow regression is back -- fail loudly
+		 * instead of corrupting memory.
+		 */
+		SPDK_ERRLOG("EC bdev %s: unexpected native WRITE_ZEROES "
+			    "(emulation not engaged)\n", ec->bdev.name);
+		rc = -EINVAL;
+		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);

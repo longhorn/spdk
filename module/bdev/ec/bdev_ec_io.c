@@ -121,13 +121,14 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
 	ec_io->iovcnt        = bdev_io->u.bdev.iovcnt;
 
 	/*
-	 * WRITE_ZEROES has no user payload; the full-stripe and RMW modify
-	 * steps consult is_zero_fill to skip the iov copy and treat the
-	 * modified region as zero. SPDK emulates UNMAP as WRITE_ZEROES when
-	 * io_type_supported(UNMAP) is false, so UNMAP requests reach the
-	 * native zero-fill path through this flag too.
+	 * is_zero_fill defaults to false on entry. Internal zero-fill paths
+	 * flip it to true after init -- ec_submit_unmap's single-stripe
+	 * shortcut and ec_submit_write_into_unmapped's pre-fill save/restore
+	 * dance. WRITE_ZEROES is not advertised by ec_io_type_supported, so
+	 * the bdev layer always emulates it as a buffer-backed WRITE and
+	 * never enters here with bdev_io->type == WRITE_ZEROES.
 	 */
-	ec_io->is_zero_fill  = (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES);
+	ec_io->is_zero_fill  = false;
 
 	ec_io->base_io_remaining = 0;
 	ec_io->status            = SPDK_BDEV_IO_STATUS_SUCCESS;
