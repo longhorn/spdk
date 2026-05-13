@@ -1287,6 +1287,183 @@ def bdev_error_delete(client, name):
     return client.call('bdev_error_delete', params)
 
 
+def bdev_ec_create(client, name, strip_size_kb, data_chunk_count, parity_chunk_count, base_bdevs, uuid=None,
+                   salvage_requested=None):
+    """Construct an erasure-coded bdev.
+    Args:
+        name: name of the EC bdev
+        strip_size_kb: strip size in KiB (power of two)
+        data_chunk_count: k (number of data chunks)
+        parity_chunk_count: m (number of parity chunks)
+        base_bdevs: list of base bdev names, length = k + m
+        uuid: optional UUID string
+        salvage_requested: assert the base bdevs hold an existing array to
+            recover; if no valid on-disk bitmap is found, fail instead of
+            fresh-creating. Defaults to false (fresh create).
+    Returns:
+        True on success.
+    """
+    params = dict()
+    params['name'] = name
+    params['strip_size_kb'] = strip_size_kb
+    params['data_chunk_count'] = data_chunk_count
+    params['parity_chunk_count'] = parity_chunk_count
+    params['base_bdevs'] = base_bdevs
+    if uuid is not None:
+        params['uuid'] = uuid
+    if salvage_requested is not None:
+        params['salvage_requested'] = salvage_requested
+    return client.call('bdev_ec_create', params)
+
+
+def bdev_ec_delete(client, name):
+    """Delete an EC bdev.
+    Args:
+        name: name of EC bdev
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_ec_delete', params)
+
+
+def bdev_ec_get_bdevs(client):
+    """Get information about all EC bdevs.
+    Returns:
+        Array of EC bdev information including per-slot state.
+    """
+    return client.call('bdev_ec_get_bdevs')
+
+
+def bdev_ec_replace_base_bdev(client, ec_name, slot, new_bdev_name):
+    """Hot-swap a failed disk in an EC bdev.
+    Args:
+        ec_name: name of the EC bdev
+        slot: slot index of the failed disk to replace
+        new_bdev_name: name of the replacement bdev
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    params['slot'] = slot
+    params['new_bdev_name'] = new_bdev_name
+    return client.call('bdev_ec_replace_base_bdev', params)
+
+
+def bdev_ec_start_rebuild(client, ec_name):
+    """Start background rebuild for all REPLACING slots in an EC bdev.
+
+    Responds immediately; rebuild runs asynchronously. Poll
+    bdev_ec_get_rebuild_progress to monitor progress.
+
+    Args:
+        ec_name: name of the EC bdev
+    Returns:
+        Object with ec_name, num_stripes, and first_slot.
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    return client.call('bdev_ec_start_rebuild', params)
+
+
+def bdev_ec_get_rebuild_progress(client, ec_name):
+    """Get background rebuild progress for an EC bdev.
+
+    Args:
+        ec_name: name of the EC bdev
+    Returns:
+        Object with ec_name, current_slot, current_stripe, num_stripes,
+        stripes_rebuilt, slots_to_rebuild, and percent_complete.
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    return client.call('bdev_ec_get_rebuild_progress', params)
+
+
+def bdev_ec_resize(client, ec_name):
+    """Resize an EC bdev in-place after its underlying base bdevs have grown.
+
+    The EC geometry (k, m) stays the same; only blockcnt increases.
+
+    Args:
+        ec_name: name of the EC bdev
+    Returns:
+        Object with ec_name, old_blockcnt, and new_blockcnt.
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    return client.call('bdev_ec_resize', params)
+
+
+def bdev_ec_get_wib_status(client, ec_name):
+    """Get write-intent bitmap (WIB) status for an EC bdev.
+
+    Args:
+        ec_name: name of the EC bdev
+    Returns:
+        Object with ec_name, num_regions, dirty_regions, generation,
+        and persist_pending.
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    return client.call('bdev_ec_get_wib_status', params)
+
+
+def bdev_ec_get_unmap_status(client, ec_name):
+    """Get unmap-bitmap status for an EC bdev.
+
+    Args:
+        ec_name: name of the EC bdev
+    Returns:
+        Object with ec_name, num_stripes, unmapped_stripes, blob_bytes,
+        generation, active_copy, and persist_pending.
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    return client.call('bdev_ec_get_unmap_status', params)
+
+
+def bdev_ec_set_rebuild_qos(client, ec_name, max_stripes_per_sec=None, paused=None):
+    """Set QoS parameters for an in-progress EC rebuild.
+
+    Args:
+        ec_name: name of the EC bdev
+        max_stripes_per_sec: optional rate limit (0 = unlimited)
+        paused: optional bool to pause/resume rebuild
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    if max_stripes_per_sec is not None:
+        params['max_stripes_per_sec'] = max_stripes_per_sec
+    if paused is not None:
+        params['paused'] = paused
+    return client.call('bdev_ec_set_rebuild_qos', params)
+
+
+def bdev_ec_stop_rebuild(client, ec_name):
+    """Stop an in-progress EC rebuild.
+
+    Args:
+        ec_name: name of the EC bdev
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    return client.call('bdev_ec_stop_rebuild', params)
+
+
+def bdev_ec_get_scrub_progress(client, ec_name):
+    """Get startup scrub progress for an EC bdev.
+
+    Args:
+        ec_name: name of the EC bdev
+    Returns:
+        Object with ec_name, current_region, num_regions, current_stripe,
+        stripes_scrubbed, regions_scrubbed, and percent_complete.
+        Returns error -ENOENT if no scrub is in progress.
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    return client.call('bdev_ec_get_scrub_progress', params)
+
+
 @deprecated_method
 def bdev_iscsi_set_options(client, timeout_sec=None):
     """Set options for the bdev iscsi.

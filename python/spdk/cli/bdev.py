@@ -963,6 +963,125 @@ def add_parser(subparsers):
     p.add_argument('name', help='error bdev name')
     p.set_defaults(func=bdev_error_delete)
 
+    def bdev_ec_create(args):
+        print_json(args.client.bdev_ec_create(
+                                           name=args.name,
+                                           strip_size_kb=args.strip_size_kb,
+                                           data_chunk_count=args.data_chunk_count,
+                                           parity_chunk_count=args.parity_chunk_count,
+                                           base_bdevs=args.base_bdevs,
+                                           uuid=args.uuid,
+                                           salvage_requested=args.salvage_requested))
+
+    p = subparsers.add_parser('bdev_ec_create', help='Create an erasure-coded bdev')
+    p.add_argument('-n', '--name', help='Name for the EC bdev', required=True)
+    p.add_argument('--strip-size-kb', help='Strip size in KiB (power of two)', required=True, type=int)
+    p.add_argument('--data-chunk-count', help='Number of data chunks (k)', required=True, type=int)
+    p.add_argument('--parity-chunk-count', help='Number of parity chunks (m)', required=True, type=int)
+    p.add_argument('-b', '--base-bdevs', nargs='+', help='List of base bdev names (k + m)', required=True)
+    p.add_argument('--uuid', help='Optional UUID string')
+    p.add_argument('--salvage-requested',
+                   help='Recover an existing array; fail if no valid on-disk bitmap is found instead of fresh-creating',
+                   action='store_true', default=None)
+    p.set_defaults(func=bdev_ec_create)
+
+    def bdev_ec_delete(args):
+        args.client.bdev_ec_delete(name=args.name)
+
+    p = subparsers.add_parser('bdev_ec_delete', help='Delete an erasure-coded bdev')
+    p.add_argument('-n', '--name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_delete)
+
+    def bdev_ec_get_bdevs(args):
+        print_dict(args.client.bdev_ec_get_bdevs())
+
+    p = subparsers.add_parser('bdev_ec_get_bdevs', help='Get information about EC bdevs')
+    p.set_defaults(func=bdev_ec_get_bdevs)
+
+    def bdev_ec_replace_base_bdev(args):
+        print_dict(args.client.bdev_ec_replace_base_bdev(
+                                                      ec_name=args.ec_name,
+                                                      slot=args.slot,
+                                                      new_bdev_name=args.new_bdev_name))
+
+    p = subparsers.add_parser('bdev_ec_replace_base_bdev', help='Hot-swap a failed disk in an EC bdev')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.add_argument('--slot', help='Slot index of the failed disk', type=int, required=True)
+    p.add_argument('--new-bdev-name', help='Name of the replacement bdev', required=True)
+    p.set_defaults(func=bdev_ec_replace_base_bdev)
+
+    def bdev_ec_start_rebuild(args):
+        print_dict(args.client.bdev_ec_start_rebuild(ec_name=args.ec_name))
+
+    p = subparsers.add_parser('bdev_ec_start_rebuild',
+                              help='Start background rebuild for all REPLACING slots')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_start_rebuild)
+
+    def bdev_ec_get_rebuild_progress(args):
+        print_dict(args.client.bdev_ec_get_rebuild_progress(ec_name=args.ec_name))
+
+    p = subparsers.add_parser('bdev_ec_get_rebuild_progress',
+                              help='Get background rebuild progress')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_get_rebuild_progress)
+
+    def bdev_ec_resize(args):
+        print_dict(args.client.bdev_ec_resize(ec_name=args.ec_name))
+
+    p = subparsers.add_parser('bdev_ec_resize',
+                              help='Resize an EC bdev in-place after base bdevs grew')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_resize)
+
+    def bdev_ec_get_wib_status(args):
+        print_dict(args.client.bdev_ec_get_wib_status(ec_name=args.ec_name))
+
+    p = subparsers.add_parser('bdev_ec_get_wib_status',
+                              help='Get write-intent bitmap status')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_get_wib_status)
+
+    def bdev_ec_get_unmap_status(args):
+        print_dict(args.client.bdev_ec_get_unmap_status(ec_name=args.ec_name))
+
+    p = subparsers.add_parser('bdev_ec_get_unmap_status',
+                              help='Get unmap-bitmap status')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_get_unmap_status)
+
+    def bdev_ec_set_rebuild_qos(args):
+        paused = None if args.paused is None else args.paused == 'true'
+        print_dict(args.client.bdev_ec_set_rebuild_qos(
+            ec_name=args.ec_name,
+            max_stripes_per_sec=args.max_stripes_per_sec,
+            paused=paused))
+
+    p = subparsers.add_parser('bdev_ec_set_rebuild_qos',
+                              help='Set QoS parameters for an in-progress rebuild')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.add_argument('--max-stripes-per-sec', help='Rate limit in stripes/sec (0=unlimited)',
+                   type=int, required=False)
+    p.add_argument('--paused', help='Pause (true) or resume (false) rebuild',
+                   type=str.lower, choices=['true', 'false'], required=False)
+    p.set_defaults(func=bdev_ec_set_rebuild_qos)
+
+    def bdev_ec_stop_rebuild(args):
+        print_dict(args.client.bdev_ec_stop_rebuild(ec_name=args.ec_name))
+
+    p = subparsers.add_parser('bdev_ec_stop_rebuild',
+                              help='Stop an in-progress rebuild')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_stop_rebuild)
+
+    def bdev_ec_get_scrub_progress(args):
+        print_dict(args.client.bdev_ec_get_scrub_progress(ec_name=args.ec_name))
+
+    p = subparsers.add_parser('bdev_ec_get_scrub_progress',
+                              help='Get startup scrub progress')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.set_defaults(func=bdev_ec_get_scrub_progress)
+
     def bdev_iscsi_set_options(args):
         args.client.bdev_iscsi_set_options(timeout_sec=args.timeout_sec)
 
