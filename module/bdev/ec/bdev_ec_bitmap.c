@@ -374,6 +374,17 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 	 */
 	ec->bitmap_persist_in_flight = false;
 
+	/*
+	 * If write-into-unmapped completions queued bit-clears while this
+	 * persist was in flight (whether THIS persist was their kick or it
+	 * was somebody else's, e.g., UNMAP), fire a single follow-up
+	 * persist covering all of them. The kick must come BEFORE any
+	 * cb_drained that might itself enqueue new bit-clears recursively;
+	 * if it does, those land on pending_bit_clears and the next persist
+	 * drainout picks them up -- the recursion is naturally bounded.
+	 */
+	ec_bit_clear_flush_if_pending(ec);
+
 	if (!ctx->acked) {
 		/*
 		 * Threshold was never reached. Report the failure via
@@ -820,4 +831,260 @@ ec_count_unmapped_stripes(const struct ec_bdev *ec)
 		total += __builtin_popcountll(ec->stripe_unmapped_map[i]);
 	}
 	return total;
+}
+
+/* =========================================================================
+ * Bit-clear waiter queue
+ *
+ * Used by the write-into-unmapped path to clear stripe_unmapped_map
+ * bits after data has landed. The two-list design (pending vs in_flight)
+ * lets new clears queue while a previous persist is still draining, and
+ * coalesces a burst into one follow-up persist per roundtrip.
+ *
+ * Visibility ordering mirrors UNMAP's staged_map pattern:
+ *   - clear_staged_map = copy of live with target bits cleared
+ *   - on cb_durable (m+1 ack): apply cleared bits to live, invoke waiters
+ *   - on cb_drained (persist fully settled): kick next persist if any
+ *
+ * The in-memory live map is updated ONLY after the persist acks. This is
+ * what makes the post-crash recovery story work: if we crashed between
+ * staging and ack, the on-disk bitmap still reads as "unmapped" for those
+ * stripes, reads synthesise zeros, and the unacked writes are correctly
+ * lost. Updating live before ack would let readers see "mapped" before
+ * the on-disk bitmap recorded it -- a crash window where reads return
+ * real data that may not survive recovery.
+ * ========================================================================= */
+
+static void ec_bit_clear_flush(struct ec_bdev *ec);
+
+static void
+ec_bit_clear_on_durable(void *arg, int rc)
+{
+	struct ec_bdev              *ec = arg;
+	struct ec_pending_bit_clear *w, *tmp;
+
+	/*
+	 * Drain the in_flight list. On success, apply the bit-clear to live
+	 * (the persist's bytes already reflect the cleared state). On
+	 * failure, leave live untouched -- the on-disk bitmap is also
+	 * unchanged, so stripes remain unmapped and reads continue to
+	 * synthesise zeros. The waiter's cb_fn propagates the failure up.
+	 */
+	TAILQ_FOREACH_SAFE(w, &ec->in_flight_bit_clears, link, tmp) {
+		TAILQ_REMOVE(&ec->in_flight_bit_clears, w, link);
+		if (rc == 0) {
+			ec_stripe_clear_unmapped(ec, w->stripe_index);
+		}
+		if (w->cb_fn) {
+			w->cb_fn(w->cb_arg, rc);
+		}
+		free(w);
+	}
+}
+
+static void
+ec_bit_clear_on_drained(void *arg, int rc)
+{
+	struct ec_bdev *ec = arg;
+
+	/*
+	 * Persist committed (rc == 0) or terminally failed (on_durable already
+	 * propagated the failure to waiters). Free the shadow and kick a fresh
+	 * persist if new waiters arrived during drainout. Freeing here -- not
+	 * earlier -- is what makes ec_bit_clear_flush_if_pending's NULL-shadow
+	 * precondition hold for the post-drain kick.
+	 */
+	free(ec->clear_staged_map);
+	ec->clear_staged_map = NULL;
+
+	if (!ec->bitmap_persist_in_flight && !TAILQ_EMPTY(&ec->pending_bit_clears)) {
+		ec_bit_clear_flush(ec);
+	}
+
+	(void)rc;
+}
+
+/*
+ * Move every waiter from pending_bit_clears to in_flight_bit_clears,
+ * build clear_staged_map by copying live and clearing the in-flight
+ * bits, and submit a single persist for the whole batch.
+ *
+ * Precondition: bitmap_persist_in_flight == false, pending list non-empty.
+ *
+ * On submit failure, the in_flight list is drained with the error and
+ * the staged map is freed; clear_staged_map is reset to NULL so the
+ * next kick can start clean.
+ */
+static void
+ec_bit_clear_flush(struct ec_bdev *ec)
+{
+	struct ec_pending_bit_clear *w;
+	uint64_t                     map_words;
+	int                          rc;
+
+	/*
+	 * Home-thread only: touches pending_bit_clears, clear_staged_map, and
+	 * submits a persist via ec_bitmap_persist_async. The legitimate callers
+	 * are the routed enqueue (ec_bit_clear_enqueue_on_home) and the
+	 * waiter-queue follow-up hook (ec_bit_clear_flush_if_pending).
+	 */
+	assert(spdk_get_thread() == ec->home_thread);
+
+	assert(!ec->bitmap_persist_in_flight);
+	assert(!TAILQ_EMPTY(&ec->pending_bit_clears));
+	assert(TAILQ_EMPTY(&ec->in_flight_bit_clears));
+	assert(ec->clear_staged_map == NULL);
+
+	map_words = EC_BITMAP_WORDS(ec->num_stripes);
+	ec->clear_staged_map = calloc(map_words, sizeof(uint64_t));
+	if (!ec->clear_staged_map) {
+		/*
+		 * Allocation failure -- drain waiters with -ENOMEM so callers
+		 * release stripe-busy and the bdev_io fails loudly rather than
+		 * stalling forever. Next kick will retry from scratch.
+		 */
+		while ((w = TAILQ_FIRST(&ec->pending_bit_clears)) != NULL) {
+			TAILQ_REMOVE(&ec->pending_bit_clears, w, link);
+			if (w->cb_fn) {
+				w->cb_fn(w->cb_arg, -ENOMEM);
+			}
+			free(w);
+		}
+		return;
+	}
+
+	memcpy(ec->clear_staged_map, ec->stripe_unmapped_map,
+	       map_words * sizeof(uint64_t));
+
+	/* Move pending -> in_flight, applying each clear to the shadow. */
+	while ((w = TAILQ_FIRST(&ec->pending_bit_clears)) != NULL) {
+		TAILQ_REMOVE(&ec->pending_bit_clears, w, link);
+		ec_bitmap_word_clear(ec->clear_staged_map, w->stripe_index);
+		TAILQ_INSERT_TAIL(&ec->in_flight_bit_clears, w, link);
+	}
+
+	rc = ec_bitmap_persist_async(ec, ec->clear_staged_map,
+				     ec_bit_clear_on_durable, ec,
+				     ec_bit_clear_on_drained, ec);
+	if (rc != 0) {
+		SPDK_WARNLOG("EC bdev %s: bit-clear persist submit failed "
+			     "(rc=%d); draining waiters\n",
+			     ec->bdev.name, rc);
+		ec_bit_clear_on_durable(ec, rc);
+		/* Sync submit failure: cb_drained will not fire, so free the shadow map here. */
+		free(ec->clear_staged_map);
+		ec->clear_staged_map = NULL;
+	}
+}
+
+void
+ec_bit_clear_flush_if_pending(struct ec_bdev *ec)
+{
+	/*
+	 * Home-thread only: fires from the bit-clear persist's write_cb chain,
+	 * which runs on the channel-owning thread. Same invariant as
+	 * ec_bit_clear_flush.
+	 */
+	assert(spdk_get_thread() == ec->home_thread);
+
+	if (ec->bitmap_persist_in_flight) {
+		/*
+		 * Another persist already in flight (race-free in the
+		 * single-reactor model -- this hook is called only from a
+		 * persist's own write_cb where pending was just set to false,
+		 * but a nested invocation pattern could in theory re-set it).
+		 * Bail; the next persist's drainout will retry.
+		 */
+		return;
+	}
+	if (ec->clear_staged_map != NULL) {
+		/*
+		 * A bit-clear persist's cb_drained hasn't fired yet -- our
+		 * own staged shadow is still set. This hook ran from inside
+		 * ec_bitmap_persist_write_cb between "pending = false" and
+		 * cb_drained, which is the natural ordering. cb_drained will
+		 * free the shadow and then kick any new waiters that arrived
+		 * during this persist. Bailing here avoids tripping the
+		 * "clear_staged_map == NULL" precondition in ec_bit_clear_flush.
+		 */
+		return;
+	}
+	if (TAILQ_EMPTY(&ec->pending_bit_clears)) {
+		return;
+	}
+	ec_bit_clear_flush(ec);
+}
+
+/*
+ * Home-thread half of ec_submit_bit_clear_async. ec_submit_bit_clear_async
+ * runs on the submitter thread, allocates the waiter (so -ENOMEM stays
+ * synchronous), and then calls this -- inline if it already is the home
+ * thread, otherwise via spdk_thread_send_msg. The queue insert and the
+ * persist trigger both mutate home-thread state.
+ */
+static void
+ec_bit_clear_enqueue_on_home(void *arg)
+{
+	struct ec_pending_bit_clear *w  = arg;
+	struct ec_bdev              *ec = w->ec;
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	TAILQ_INSERT_TAIL(&ec->pending_bit_clears, w, link);
+	if (!ec->bitmap_persist_in_flight) {
+		ec_bit_clear_flush(ec);
+	}
+}
+
+int
+ec_submit_bit_clear_async(struct ec_bdev *ec, uint64_t stripe_index,
+			  void (*cb_fn)(void *cb_arg, int rc),
+			  void *cb_arg)
+{
+	struct ec_pending_bit_clear *w;
+
+	if (stripe_index >= ec->num_stripes) {
+		return -EINVAL;
+	}
+
+	w = calloc(1, sizeof(*w));
+	if (!w) {
+		return -ENOMEM;
+	}
+	w->ec           = ec;
+	w->stripe_index = stripe_index;
+	w->cb_fn        = cb_fn;
+	w->cb_arg       = cb_arg;
+
+	/*
+	 * Route the enqueue + flush trigger to the home thread.
+	 * write-into-unmapped, which drives this, completes on the bdev_io
+	 * owner thread (nvmf poll group, raid child, ...) -- which differs
+	 * from the EC creation thread under a multi-reactor SPDK target.
+	 * pending_bit_clears, bitmap_persist_in_flight, and bitmap_chans[] are
+	 * all home-thread state.
+	 *
+	 * Fast path: when the caller already is the home thread (single-reactor
+	 * or any home-thread caller), skip send_msg and run inline -- no added
+	 * latency.
+	 *
+	 * See "why route, not per-channel" above ec_bitmap_persist_async.
+	 */
+	if (spdk_get_thread() == ec->home_thread) {
+		ec_bit_clear_enqueue_on_home(w);
+	} else {
+		int rc = spdk_thread_send_msg(ec->home_thread,
+					      ec_bit_clear_enqueue_on_home, w);
+		if (rc != 0) {
+			free(w);
+			return rc;
+		}
+	}
+	/*
+	 * Return 0 means "enqueued; cb_fn will fire later" -- NOT that the bit
+	 * has been cleared. If a persist is in flight, the waiter sits on
+	 * pending until that persist's drainout fires
+	 * ec_bit_clear_flush_if_pending.
+	 */
+	return 0;
 }

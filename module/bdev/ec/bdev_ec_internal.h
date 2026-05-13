@@ -1135,6 +1135,69 @@ int ec_bitmap_persist_both_copies(struct ec_bdev *ec,
 void ec_bitmap_load_async(struct ec_bdev *ec,
 			  ec_bdev_create_cb_fn done_fn, void *done_arg);
 
+/*
+ * Per-stripe bit-clear waiter. One entry per call to
+ * ec_submit_bit_clear_async. Lives on either ec->pending_bit_clears
+ * (queued, not yet persisting) or ec->in_flight_bit_clears (included
+ * in the current persist).
+ */
+struct ec_pending_bit_clear {
+	/*
+	 * Back-pointer to the owning EC bdev. The waiter is allocated on the
+	 * submitter thread and routed to the home thread via
+	 * spdk_thread_send_msg, which only passes one void argument; this
+	 * lets the home-thread handler recover ec.
+	 */
+	struct ec_bdev                     *ec;
+	uint64_t                            stripe_index;
+	void                              (*cb_fn)(void *cb_arg, int rc);
+	void                               *cb_arg;
+	TAILQ_ENTRY(ec_pending_bit_clear)   link;
+};
+
+/*
+ * ec_submit_bit_clear_async -- request that one stripe's unmapped bit be
+ * cleared and the bitmap re-persisted. Used by the write-into-unmapped
+ * path AFTER all k+m chunk writes for the stripe have landed.
+ *
+ * Ordering invariant (load-bearing -- see write-into-unmapped helper):
+ *   1. Data must be on disk on at least the k+m chunks.
+ *   2. THEN call this function.
+ *   3. cb_fn fires only after the bit-clear persist acks at m+1.
+ *   4. Caller acks its bdev_io ONLY after cb_fn fires.
+ *
+ * Reordering -- clearing the bit before data lands -- opens a silent
+ * corruption window. A crash between bit-clear-persist and data-land
+ * leaves on-disk bitmap saying "mapped" while chunks are inconsistent
+ * or absent, and reads return undefined bytes instead of the
+ * synthesise-zero contract.
+ *
+ * Coalescing: if a bitmap persist is already in flight (UNMAP or a
+ * prior bit-clear), this call queues onto pending_bit_clears and
+ * returns 0 (async). On that persist's drainout, a single follow-up
+ * persist fires for ALL queued bits at once -- worst-case post-trim
+ * write throughput is capped at one extra persist per roundtrip rather
+ * than one persist per write.
+ *
+ * Returns 0 on enqueue. cb_fn fires later with rc == 0 on success or
+ * a negative errno on persist failure (caller should fail the bdev_io
+ * and release stripe-busy).
+ *
+ * Single-reactor model: caller and callback run on the same thread; no
+ * locking around the queues.
+ */
+int ec_submit_bit_clear_async(struct ec_bdev *ec, uint64_t stripe_index,
+			      void (*cb_fn)(void *cb_arg, int rc),
+			      void *cb_arg);
+
+/*
+ * Internal: invoked from ec_bitmap_persist_write_cb after
+ * bitmap_persist_in_flight is cleared. If the bit-clear pending queue is
+ * non-empty, kicks a new persist covering all queued bits. Not for
+ * caller use.
+ */
+void ec_bit_clear_flush_if_pending(struct ec_bdev *ec);
+
 /* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
 int ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],

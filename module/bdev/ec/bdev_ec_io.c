@@ -145,6 +145,55 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
 	ec_io->is_write_into_unmapped = false;
 }
 
+/*
+ * Bit-clear completion callback for the write-into-unmapped path.
+ * Invoked from ec_submit_bit_clear_async's persist drainage after the
+ * unmapped bit has been durably cleared (m+1 ack) -- the load-bearing
+ * step that flips the bdev_io from "data on disk but masked by bitmap"
+ * to "data visible to readers." Only NOW is it safe to ack the caller.
+ *
+ * Failure (rc != 0): the on-disk bitmap still says unmapped, so reads
+ * will continue synthesising zeros -- the just-written data is
+ * effectively lost. We fail the bdev_io so the caller knows; they may
+ * retry, which will land back through ec_submit_write_into_unmapped and
+ * attempt the bit-clear again.
+ *
+ * Thread hand-off: ec->bitmap_chans[] are owned by the EC bdev's
+ * creation spdk_thread (typically the app main thread), so the bitmap
+ * persist completion fires there. The WRITE bdev_io we are about to
+ * complete is owned by whichever spdk_thread submitted it (an nvmf
+ * poll group, a raid child, etc.). spdk_bdev_io_complete asserts that
+ * the caller thread == spdk_bdev_io_get_thread(bdev_io); calling it
+ * cross-thread aborts the process. We send the finalize routine to
+ * the bdev_io's owner thread via spdk_thread_send_msg.
+ *
+ * The existing UNMAP path does not need this because its bitmap-persist
+ * completion is followed by a fan-out to the base bdevs whose
+ * completions naturally land on the bdev_io's owner thread (the same
+ * thread that opened the per-channel base_chans the fan-out uses).
+ * Write-into-unmapped has no equivalent post-persist fan-out: the data
+ * writes already completed before the bit-clear started, so the
+ * persist-completion thread is the last hop before the caller ack.
+ */
+static void
+ec_write_into_unmapped_bit_cleared(void *cb_arg, int rc)
+{
+	struct ec_bdev_io  *ec_io = cb_arg;
+	struct ec_bdev     *ec    = ec_from_bdev_io(ec_io->bdev_io);
+	struct spdk_thread *owner;
+
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: write-into-unmapped bit-clear persist "
+			    "failed (rc=%d) at stripe %" PRIu64 "; failing bdev_io. "
+			    "Data is on disk but masked by bitmap.\n",
+			    ec->bdev.name, rc, ec_io->stripe_claim_index);
+		ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
+		ec->writes_into_unmapped_failed++;
+	}
+
+	owner = spdk_bdev_io_get_thread(ec_io->bdev_io);
+}
+
 static void
 ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 {
@@ -158,6 +207,55 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 	}
 
 	ec_io->base_io_remaining--;
+
+	if (ec_io->base_io_remaining == 0) {
+		if (ec_io->wib_inflight_held) {
+			ec_wib_region_inflight_dec(ec, ec_io->wib_region);
+			ec_io->wib_inflight_held = false;
+		}
+
+		/*
+		 * Write-into-unmapped routing: data has landed (success) or
+		 * partially failed. On success, defer bdev_io completion until
+		 * the bit-clear persist acks at m+1. On failure, fall through
+		 * to immediate completion with the failed status -- skipping
+		 * the bit-clear is correct because the on-disk data is
+		 * inconsistent and the bitmap-still-says-unmapped state is
+		 * exactly what masks the bad chunks from readers.
+		 *
+		 * The bit-clear submit can itself fail synchronously (-ENOMEM
+		 * on the waiter alloc, -EINVAL on bad args). Treat that the
+		 * same as a fanout failure: leave the bitmap saying unmapped,
+		 * fail the bdev_io. The stripe-busy and buffers are torn down
+		 * in the fall-through.
+		 */
+		if (ec_io->is_write_into_unmapped &&
+		    ec_io->status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+			int rc;
+
+			rc = ec_submit_bit_clear_async(ec,
+						       ec_io->stripe_claim_index,
+						       ec_write_into_unmapped_bit_cleared,
+						       ec_io);
+			if (rc == 0) {
+				/* Async path: cb fires later, do not complete. */
+				return;
+			}
+			SPDK_ERRLOG("EC bdev %s: write-into-unmapped bit-clear "
+				    "submit failed (rc=%d) at stripe %" PRIu64 "\n",
+				    ec->bdev.name, rc,
+				    ec_io->stripe_claim_index);
+			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
+			ec->writes_into_unmapped_failed++;
+		}
+
+		if (ec_io->stripe_claimed) {
+			ec_stripe_clear_dirty(ec, ec_io->stripe_claim_index);
+			ec_io->stripe_claimed = false;
+		}
+		ec_free_io_buffers(ec_io, ec);
+		spdk_bdev_io_complete(ec_io->bdev_io, ec_io->status);
+	}
 }
 
 /* =========================================================================
