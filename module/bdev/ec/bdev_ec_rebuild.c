@@ -653,3 +653,191 @@ ec_rebuild_poller_cb(void *arg)
 
 	return SPDK_POLLER_BUSY;
 }
+
+int
+ec_bdev_start_rebuild(const char *ec_name,
+		      ec_rebuild_cb_fn cb_fn, void *cb_arg)
+{
+	struct ec_bdev        *ec;
+	struct ec_rebuild_ctx *ctx;
+	uint32_t               i;
+	uint32_t               first_slot = UINT32_MAX;
+	uint32_t               slots_to_rebuild = 0;
+
+	ec = ec_bdev_find(ec_name);
+	if (!ec) {
+		SPDK_ERRLOG("bdev_ec_start_rebuild: EC bdev '%s' not found\n",
+			    ec_name);
+		return -ENODEV;
+	}
+
+	/* Reject if a rebuild or resize is already in progress. */
+	if (ec->rebuild_ctx != NULL || ec->resize_ctx != NULL) {
+		SPDK_ERRLOG("EC bdev %s: rebuild rejected -- "
+			    "rebuild or resize already in progress\n",
+			    ec->bdev.name);
+		return -EBUSY;
+	}
+
+	/* Count REPLACING slots that still need a rebuild. */
+	for (i = 0; i < ec->n; i++) {
+		if (ec->base_states[i] == EC_BASE_STATE_REPLACING &&
+		    ec->needs_rebuild[i]) {
+			slots_to_rebuild++;
+			if (first_slot == UINT32_MAX) {
+				first_slot = i;
+			}
+		}
+	}
+	if (slots_to_rebuild == 0) {
+		SPDK_NOTICELOG("EC bdev %s: rebuild rejected -- "
+			       "no REPLACING slots\n", ec->bdev.name);
+		return -ENOENT;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+
+	ctx->ec                   = ec;
+	ctx->current_slot         = first_slot;
+	ctx->current_stripe       = 0;
+	ctx->num_stripes = ec->bdev.blockcnt / ec->stripe_blocks;
+	ctx->chunk_bytes = ec->strip_size * ec->bdev.blocklen;
+	ctx->io_in_flight = false;
+	ctx->stripes_rebuilt = 0;
+	ctx->slots_to_rebuild = slots_to_rebuild;
+	ctx->start_ticks = spdk_get_ticks();
+	ctx->last_heartbeat_ticks = ctx->start_ticks;
+	ctx->next_heartbeat_percent = EC_REBUILD_HEARTBEAT_PERCENT_STEP;
+	ctx->stripe_claimed = false;
+	ctx->draining_deferred_stripes = false;
+	TAILQ_INIT(&ctx->deferred_stripes);
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	/* Open dedicated I/O channels for each live disk. */
+	for (i = 0; i < ec->n; i++) {
+		if (!ec->descs[i]) {
+			ctx->rebuild_chans[i] = NULL;
+			continue;
+		}
+		ctx->rebuild_chans[i] = spdk_bdev_get_io_channel(ec->descs[i]);
+		if (!ctx->rebuild_chans[i]) {
+			SPDK_ERRLOG("EC bdev %s: rebuild -- failed to open "
+				    "channel for slot %u\n",
+				    ec->bdev.name, i);
+			ec_rebuild_free_resources(ctx);
+			free(ctx);
+			return -ENOMEM;
+		}
+	}
+
+	/* Allocate DMA buffers (reused for every stripe). */
+	for (i = 0; i < ec->n; i++) {
+		ctx->chunk_bufs[i] = spdk_dma_zmalloc(ctx->chunk_bytes,
+						       EC_DMA_ALIGN, NULL);
+		if (!ctx->chunk_bufs[i]) {
+			SPDK_ERRLOG("EC bdev %s: rebuild -- OOM for chunk buf "
+				    "slot %u\n",
+				    ec->bdev.name, i);
+			ec_rebuild_free_resources(ctx);
+			free(ctx);
+			return -ENOMEM;
+		}
+		ctx->chunk_iovs[i].iov_base = ctx->chunk_bufs[i];
+		ctx->chunk_iovs[i].iov_len  = ctx->chunk_bytes;
+	}
+
+	/* Register the poller and publish the context. */
+	ec->rebuild_ctx = ctx;
+
+	ctx->poller = spdk_poller_register(ec_rebuild_poller_cb, ctx,
+					   EC_REBUILD_POLL_PERIOD_US);
+	if (!ctx->poller) {
+		SPDK_ERRLOG("EC bdev %s: rebuild -- failed to register poller\n",
+			    ec->bdev.name);
+		ec_rebuild_free_resources(ctx);
+		ec->rebuild_ctx = NULL;
+		free(ctx);
+		return -ENOMEM;
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: rebuild started -- %" PRIu64 " stripes, "
+		       "first slot %u\n",
+		       ec->bdev.name, ctx->num_stripes, first_slot);
+
+	return 0;
+}
+
+int
+ec_bdev_stop_rebuild(const char *ec_name)
+{
+	struct ec_bdev *ec = ec_bdev_find(ec_name);
+
+	if (!ec) {
+		return -ENODEV;
+	}
+	if (!ec->rebuild_ctx) {
+		return -ENOENT;
+	}
+
+	ec->rebuild_ctx->cancel_requested = true;
+
+	SPDK_NOTICELOG("EC bdev %s: rebuild cancel requested\n",
+		       ec->bdev.name);
+
+	return 0;
+}
+
+int
+ec_bdev_set_rebuild_qos(const char *ec_name,
+			uint32_t max_stripes_per_sec,
+			bool paused)
+{
+	struct ec_bdev *ec = ec_bdev_find(ec_name);
+
+	if (!ec) {
+		return -ENODEV;
+	}
+	if (!ec->rebuild_ctx) {
+		return -ENOENT;
+	}
+
+	ec->rebuild_ctx->max_stripes_per_sec = max_stripes_per_sec;
+	ec->rebuild_ctx->paused              = paused;
+
+	SPDK_NOTICELOG("EC bdev %s: rebuild QoS updated -- "
+		       "max_stripes_per_sec=%u paused=%s\n",
+		       ec->bdev.name, max_stripes_per_sec,
+		       paused ? "true" : "false");
+
+	return 0;
+}
+
+int
+ec_bdev_get_rebuild_progress(const char *ec_name,
+			     uint32_t *current_slot,
+			     uint64_t *current_stripe,
+			     uint64_t *num_stripes,
+			     uint64_t *stripes_rebuilt,
+			     uint32_t *slots_to_rebuild)
+{
+	struct ec_bdev *ec = ec_bdev_find(ec_name);
+
+	if (!ec) {
+		return -ENODEV;
+	}
+	if (!ec->rebuild_ctx) {
+		return -ENOENT;
+	}
+
+	*current_slot     = ec->rebuild_ctx->current_slot;
+	*current_stripe   = ec->rebuild_ctx->current_stripe;
+	*num_stripes      = ec->rebuild_ctx->num_stripes;
+	*stripes_rebuilt  = ec->rebuild_ctx->stripes_rebuilt;
+	*slots_to_rebuild = ec->rebuild_ctx->slots_to_rebuild;
+
+	return 0;
+}

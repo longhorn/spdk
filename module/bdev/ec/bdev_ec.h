@@ -88,6 +88,8 @@ struct ec_bdev *ec_bdev_find(const char *name);
  */
 void ec_write_base_bdevs_array_json(struct spdk_json_write_ctx *w,
 				    const struct ec_bdev *ec);
+void ec_write_rebuild_progress_json(struct spdk_json_write_ctx *w,
+				    const struct ec_bdev *ec);
 void ec_write_io_stats_json(struct spdk_json_write_ctx *w,
 			    const struct ec_bdev *ec);
 
@@ -130,5 +132,37 @@ void ec_bdev_delete(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_ar
 int ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
 			      const char *new_bdev_name,
 			      ec_replace_cb_fn cb_fn, void *cb_arg);
+
+/*
+ * Start background rebuild for all REPLACING slots in ec_name.
+ * cb_fn NOT called on synchronous error return.
+ *
+ * Returns: 0, -ENODEV, -EBUSY, -ENOENT, -ENOMEM
+ */
+int ec_bdev_start_rebuild(const char *ec_name,
+			  ec_rebuild_cb_fn cb_fn, void *cb_arg);
+
+/* Query live rebuild progress. Returns -ENODEV or -ENOENT on error. */
+int ec_bdev_get_rebuild_progress(const char *ec_name,
+				 uint32_t *current_slot,
+				 uint64_t *current_stripe,
+				 uint64_t *num_stripes,
+				 uint64_t *stripes_rebuilt,
+				 uint32_t *slots_to_rebuild);
+
+/*
+ * Set rebuild QoS parameters on a running rebuild.
+ * max_stripes_per_sec: 0 = unlimited. paused: true = pause rebuild.
+ * Returns -ENODEV, -ENOENT (no rebuild running).
+ */
+int ec_bdev_set_rebuild_qos(const char *ec_name,
+			    uint32_t max_stripes_per_sec,
+			    bool paused);
+
+/*
+ * Cancel a running rebuild. Slots remain in REPLACING state.
+ * Returns -ENODEV, -ENOENT (no rebuild running).
+ */
+int ec_bdev_stop_rebuild(const char *ec_name);
 
 #endif /* SPDK_BDEV_EC_H */

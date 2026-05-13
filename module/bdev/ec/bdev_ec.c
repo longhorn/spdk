@@ -1568,6 +1568,25 @@ ec_write_base_bdevs_array_json(struct spdk_json_write_ctx *w,
 }
 
 /*
+ * ec_write_rebuild_progress_json -- write the named "rebuild_progress"
+ * object describing a live rebuild_ctx. Caller must have verified
+ * ec->rebuild_ctx != NULL.
+ */
+void
+ec_write_rebuild_progress_json(struct spdk_json_write_ctx *w,
+			       const struct ec_bdev *ec)
+{
+	const struct ec_rebuild_ctx *rctx = ec->rebuild_ctx;
+
+	spdk_json_write_named_object_begin(w, "rebuild_progress");
+	spdk_json_write_named_uint32(w, "current_slot",    rctx->current_slot);
+	spdk_json_write_named_uint64(w, "current_stripe",  rctx->current_stripe);
+	spdk_json_write_named_uint64(w, "num_stripes",     rctx->num_stripes);
+	spdk_json_write_named_uint64(w, "stripes_rebuilt", rctx->stripes_rebuilt);
+	spdk_json_write_object_end(w);
+}
+
+/*
  * ec_write_io_stats_json -- write the RMW / full-stripe-write / UNMAP /
  * degraded-read counter run shared verbatim by ec_dump_info_json and the
  * bdev_ec_get_bdevs RPC. Only this common, identically-ordered run is
@@ -1628,6 +1647,11 @@ ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_bool(w,   "replace_in_progress", ec->replace_in_progress);
 
 	ec_write_io_stats_json(w, ec);
+
+	spdk_json_write_named_bool(w, "rebuild_in_progress", ec->rebuild_ctx != NULL);
+	if (ec->rebuild_ctx) {
+		ec_write_rebuild_progress_json(w, ec);
+	}
 
 	ec_write_base_bdevs_array_json(w, ec);
 
