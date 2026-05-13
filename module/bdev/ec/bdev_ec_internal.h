@@ -570,16 +570,46 @@ struct ec_bdev {
 	 */
 	uint64_t degraded_read_eio_dirty;        /* reads rejected: dirty WIB region */
 	uint64_t degraded_reads_reconstructed;   /* reads served via reconstruction  */
+	/*
+	 * RMW / full-stripe write accounting. Unlike the UNMAP cluster
+	 * below, these counters do NOT form a closed-bucket identity:
+	 * accepted submissions whose bdev_io completes successfully are
+	 * NOT counted again at completion (the SPDK bdev layer owns that
+	 * accounting via spdk_bdev_io_complete). What is counted is:
+	 *   - <path>_total / <path>_writes    : a submission was accepted
+	 *                                        past every gate.
+	 *   - <path>_deferred_*               : the submission returned
+	 *                                        -EAGAIN at this specific
+	 *                                        gate; SPDK requeues via
+	 *                                        NOMEM and the next attempt
+	 *                                        is a fresh accepted++ bump.
+	 *
+	 * Useful derived quantity (steady state):
+	 *   accepted_and_completed = <path>_total - sum(<path>_deferred_*)
+	 * counts submissions that made it past all defer gates. It does
+	 * not distinguish success from terminal failure -- those land on
+	 * the bdev_io owner thread via spdk_bdev_io_complete, not here.
+	 */
 	uint64_t rmw_total;                      /* sub-stripe writes accepted       */
 	uint64_t rmw_deferred_scrub;             /* RMW EAGAIN: scrub-active region  */
 	uint64_t rmw_deferred_dirty;             /* RMW EAGAIN: deferred-scrub guard */
 	uint64_t rmw_deferred_inflight;          /* RMW EAGAIN: stripe already dirty */
 	uint64_t full_stripe_writes;             /* full-stripe writes accepted      */
 	uint64_t full_stripe_writes_deferred;    /* full-stripe EAGAIN: scrub guard  */
-	uint64_t unmaps_submitted;               /* all UNMAP submit attempts        */
-	uint64_t unmaps_completed;               /* native UNMAP requests succeeded  */
+	/*
+	 * UNMAP accounting. Every parent UNMAP request lands in exactly one
+	 * of: native fan-out (-> unmaps_completed on parent success), write-
+	 * zeros fast path for single-stripe UNMAPs (-> unmaps_via_write_zeros),
+	 * deferred-busy NOMEM retry (-> unmaps_deferred_busy), or a rejection
+	 * (-EINVAL / -ENOMEM at submit). The invariant
+	 *   submitted = completed + via_zeros + deferred + rejected
+	 * holds in both single- and multi-reactor configurations and is used
+	 * by the integration test to detect silent rejections.
+	 */
+	uint64_t unmaps_submitted;               /* parent UNMAP submits (once per request) */
+	uint64_t unmaps_completed;               /* native fan-out completed successfully */
 	uint64_t unmaps_deferred_busy;           /* UNMAP EAGAIN: stripe-busy/persist */
-	uint64_t unmaps_via_write_zeros;         /* UNMAP routed to write-zeros path */
+	uint64_t unmaps_via_write_zeros;         /* single-stripe UNMAP -> RMW zero-fill */
 	uint64_t unmap_fanout_misses;            /* per-disk spdk_bdev_unmap_blocks
 						  * failure -- physical space not
 						  * reclaimed on that disk; not a
@@ -593,6 +623,14 @@ struct ec_bdev {
 						  * is firing -- if this stays at 0
 						  * after fstrim activity, the
 						  * read-path hookup is broken. */
+	/*
+	 * Write-into-unmapped accounting. Closed identity (steady state):
+	 *   writes_into_unmapped == succeeded + writes_into_unmapped_failed
+	 * where succeeded is implicit (not counted -- it is the residual
+	 * after subtracting the explicit _failed bucket). A growing
+	 * _failed counter without a corresponding stuck bdev_io is the
+	 * production signal for stripe-alloc / bit-clear-persist trouble.
+	 */
 	uint64_t writes_into_unmapped;           /* writes routed through the
 						  * write-into-unmapped full-stripe
 						  * path (skip-WIB, zero-fill old
