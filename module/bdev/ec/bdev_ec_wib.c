@@ -469,3 +469,271 @@ ec_wib_validate_buf(const struct ec_bdev *ec, const void *buf, uint32_t *gen_out
 	*gen_out = hdr->generation;
 	return 0;
 }
+
+/*
+ * ec_wib_load_async context.
+ *
+ * Drives a callback chain: for each parity disk, reads copy 0 then copy 1
+ * without blocking the reactor, picks the copy with the higher generation,
+ * ORs its region_bits into ec->wib_region_map, then advances to the next disk.
+ *
+ * After all m disks are processed, ec->wib_region_map reflects the union of
+ * the valid copies: a region is dirty if any parity disk's valid copy has
+ * the bit set. If every copy on every disk is invalid (first boot or
+ * corrupt header/CRC), the in-memory map stays all-zeros -- safe because
+ * there is nothing to scrub.
+ *
+ * Called from ec_bdev_create on the EC bdev's home thread before the bdev is
+ * registered, so no other I/O competes on wib_chans[].
+ *
+ * done_fn is always called. rc is 0 once the async read chain starts (per-disk
+ * read failures are non-fatal and skipped); rc is -ENOMEM if context or
+ * DMA-buffer allocation fails before the chain starts.
+ */
+struct ec_wib_load_async_ctx {
+	struct ec_bdev      *ec;
+	void                *scratch;    /* DMA buffer: 2 x buf_bytes        */
+	size_t               buf_bytes;
+	void                *bufa;       /* copy 0 target (== scratch)        */
+	void                *bufb;       /* copy 1 target (scratch+buf_bytes) */
+	uint32_t             parity_idx;
+	/* per-disk state, reset for each parity disk */
+	uint32_t             gen_a, gen_b;
+	bool                 valid_a, valid_b;
+	/* overall */
+	bool                 any_valid;
+	/* completion */
+	ec_bdev_create_cb_fn done_fn;
+	void                *done_arg;
+};
+
+/* -------------------------------------------------------------------------
+ * ec_wib_load_async -- non-blocking WIB load driven by callback chain.
+ *
+ * Submits each read via spdk_bdev_read and advances through parity disks
+ * entirely from I/O completion callbacks -- the reactor thread is never held.
+ *
+ * Sequence for each parity disk:
+ *   advance() -> submit read(copy 0) -> copy0_cb()
+ *             -> submit read(copy 1) -> copy1_cb()
+ *             -> merge_disk() -> advance to next disk -> ...
+ *   when parity_idx == m: finish() -> done_fn(done_arg, rc)
+ *
+ * done_fn is always called. rc is 0 on success, including when individual
+ * per-disk reads fail and are skipped (a missed merge means a missed scrub
+ * at most -- non-fatal). rc is -ENOMEM if context or buffer allocation
+ * fails synchronously below, before the chain starts.
+ * ------------------------------------------------------------------------- */
+
+static void ec_wib_load_async_continue(struct ec_wib_load_async_ctx *ctx);
+
+static void
+ec_wib_load_async_finish(struct ec_wib_load_async_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+	ec_bdev_create_cb_fn done_fn = ctx->done_fn;
+	void *done_arg = ctx->done_arg;
+	bool any_valid = ctx->any_valid;
+
+	spdk_dma_free(ctx->scratch);
+	free(ctx);
+
+	if (any_valid) {
+		SPDK_NOTICELOG("EC bdev %s: WIB loaded -- %u/%u regions dirty\n",
+			       ec->bdev.name, ec_wib_count_dirty(ec),
+			       ec->wib_num_regions);
+	} else {
+		SPDK_NOTICELOG("EC bdev %s: no valid WIB found -- assuming clean\n",
+			       ec->bdev.name);
+	}
+
+	done_fn(done_arg, 0);
+}
+
+/*
+ * Merge the best valid copy for disk ctx->parity_idx into ec->wib_region_map.
+ */
+static void
+ec_wib_load_async_merge_disk(struct ec_wib_load_async_ctx *ctx)
+{
+	struct ec_bdev *ec        = ctx->ec;
+	uint32_t        map_words = EC_BITMAP_WORDS(ec->wib_num_regions);
+
+	if (!ctx->valid_a && !ctx->valid_b) {
+		SPDK_WARNLOG("EC bdev %s: no valid WIB copy on parity "
+			     "disk %u -- treating as clean\n",
+			     ec->bdev.name, ec->k + ctx->parity_idx);
+		return;
+	}
+
+	{
+		bool pick_b = ctx->valid_b &&
+			      (!ctx->valid_a || ctx->gen_b >= ctx->gen_a);
+		const void *best = pick_b ? ctx->bufb : ctx->bufa;
+		const struct ec_wib_header *hdr = (const struct ec_wib_header *)best;
+		const uint64_t             *bits = (const uint64_t *)(hdr + 1);
+		uint32_t                    best_gen = pick_b ? ctx->gen_b : ctx->gen_a;
+		uint32_t                    w;
+
+		/*
+		 * The OR-merge below bypasses ec_wib_region_set_dirty's
+		 * release-store discipline. Safe by the same logic as
+		 * ec_bitmap_apply_buf: this runs in the ec_wib_load_async
+		 * chain during ec_bdev_create_async, before the create-RPC
+		 * returns. The bdev is registered before the async load
+		 * starts, but the only reader that can reach it in the
+		 * register-to-load-finished window is SPDK examine -- which
+		 * runs on the register thread (= home), so it serializes
+		 * with the merge here on home. Workload (cross-reactor)
+		 * readers cannot reach the bdev until the create-RPC
+		 * returns, which waits for spdk_bdev_wait_for_examine after
+		 * the load completes. By the time any non-home reader runs
+		 * acquire-load on wib_region_map, this merge is published
+		 * by the post-create release barriers SPDK inserts when the
+		 * bdev becomes visible to consumers.
+		 */
+		for (w = 0; w < map_words; w++) {
+			ec->wib_region_map[w] |= bits[w];
+		}
+
+		if (best_gen > ec->wib_generation) {
+			ec->wib_generation  = best_gen;
+			ec->wib_active_copy = pick_b ? 1 : 0;
+		}
+		ctx->any_valid = true;
+	}
+}
+
+static void
+ec_wib_load_async_copy1_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_wib_load_async_ctx *ctx = cb_arg;
+	struct ec_bdev               *ec  = ctx->ec;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success && ec_wib_validate_buf(ec, ctx->bufb, &ctx->gen_b) == 0) {
+		ctx->valid_b = true;
+	}
+
+	ec_wib_load_async_merge_disk(ctx);
+
+	ctx->parity_idx++;
+	ec_wib_load_async_continue(ctx);
+}
+
+static void
+ec_wib_load_async_copy0_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_wib_load_async_ctx *ctx   = cb_arg;
+	struct ec_bdev               *ec    = ctx->ec;
+	uint32_t                      pslot = ec->k + ctx->parity_idx;
+	int                           rc;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success && ec_wib_validate_buf(ec, ctx->bufa, &ctx->gen_a) == 0) {
+		ctx->valid_a = true;
+	}
+
+	/* Read copy 1 -- failure is non-fatal, merge proceeds with copy 0 only */
+	rc = spdk_bdev_read(ec->descs[pslot],
+			    ec->wib_chans[ctx->parity_idx],
+			    ctx->bufb,
+			    ec_wib_lba(ec, 1) * ec->bdev.blocklen,
+			    ctx->buf_bytes,
+			    ec_wib_load_async_copy1_cb,
+			    ctx);
+	if (rc != 0) {
+		SPDK_WARNLOG("EC bdev %s: failed to submit WIB copy 1 read "
+			     "for parity disk %u (rc=%d) -- using copy 0 only\n",
+			     ec->bdev.name, pslot, rc);
+		ec_wib_load_async_merge_disk(ctx);
+		ctx->parity_idx++;
+		ec_wib_load_async_continue(ctx);
+	}
+}
+
+/*
+ * Find the next available parity disk and submit a copy-0 read.
+ * Called at startup and from copy1_cb to advance to the next disk.
+ * When all disks are processed, calls ec_wib_load_async_finish().
+ */
+static void
+ec_wib_load_async_continue(struct ec_wib_load_async_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+
+	while (ctx->parity_idx < ec->m) {
+		uint32_t pslot = ec->k + ctx->parity_idx;
+		int      rc;
+
+		if (!ec->descs[pslot] || !ec->wib_chans[ctx->parity_idx]) {
+			ctx->parity_idx++;
+			continue;
+		}
+
+		/* Reset per-disk state */
+		ctx->gen_a   = 0;
+		ctx->gen_b   = 0;
+		ctx->valid_a = false;
+		ctx->valid_b = false;
+
+		rc = spdk_bdev_read(ec->descs[pslot],
+				    ec->wib_chans[ctx->parity_idx],
+				    ctx->bufa,
+				    ec_wib_lba(ec, 0) * ec->bdev.blocklen,
+				    ctx->buf_bytes,
+				    ec_wib_load_async_copy0_cb,
+				    ctx);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: failed to submit WIB copy 0 read "
+				     "for parity disk %u (rc=%d) -- skipping disk\n",
+				     ec->bdev.name, pslot, rc);
+			ctx->parity_idx++;
+			continue;
+		}
+
+		return;  /* I/O submitted; callback drives the next step */
+	}
+
+	/* All parity disks processed */
+	ec_wib_load_async_finish(ctx);
+}
+
+void
+ec_wib_load_async(struct ec_bdev *ec, ec_bdev_create_cb_fn done_fn, void *done_arg)
+{
+	struct ec_wib_load_async_ctx *ctx;
+	size_t  buf_bytes = (size_t)ec->strip_size * ec->bdev.blocklen;
+	void   *scratch;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("EC bdev %s: OOM for async WIB load ctx\n",
+			    ec->bdev.name);
+		done_fn(done_arg, -ENOMEM);
+		return;
+	}
+
+	scratch = spdk_dma_zmalloc(2 * buf_bytes, EC_DMA_ALIGN, NULL);
+	if (!scratch) {
+		SPDK_ERRLOG("EC bdev %s: OOM for WIB load scratch buffer\n",
+			    ec->bdev.name);
+		free(ctx);
+		done_fn(done_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->ec         = ec;
+	ctx->scratch    = scratch;
+	ctx->buf_bytes  = buf_bytes;
+	ctx->bufa       = scratch;
+	ctx->bufb       = (uint8_t *)scratch + buf_bytes;
+	ctx->parity_idx = 0;
+	ctx->any_valid  = false;
+	ctx->done_fn    = done_fn;
+	ctx->done_arg   = done_arg;
+
+	ec_wib_load_async_continue(ctx);
+}

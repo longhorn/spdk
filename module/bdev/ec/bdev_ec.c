@@ -1188,14 +1188,54 @@ ec_bdev_create_unregister_done(void *cb_arg, int unregister_rc)
 	free(ctx);
 	done_fn(done_arg, rc);
 }
-static int
+
+static void
+ec_bdev_create_wib_done(void *cb_arg, int rc)
+{
+	struct ec_bdev_create_async_ctx *ctx = cb_arg;
+	struct ec_bdev                  *ec  = ctx->ec;
+
+	if (rc != 0) {
+		/*
+		 * The WIB could not be loaded (allocation failure). The startup
+		 * scrub cannot run, and the degraded-read guard would see an
+		 * empty (all-clean) in-memory WIB -- so any region left torn by a
+		 * prior crash would be reconstructed from stale parity instead of
+		 * rejected. Fail the create rather than expose the volume with its
+		 * write-hole protection silently disabled. The on-disk write-intent
+		 * is left intact (teardown never writes the WIB), so a retry loads
+		 * and scrubs it. This matches how every other create-time
+		 * allocation failure is handled.
+		 */
+		SPDK_ERRLOG("EC bdev %s: WIB load failed (rc=%d); failing create "
+			    "to preserve on-disk write-intent for a retry\n",
+			    ec->bdev.name, rc);
+		ctx->deferred_rc = rc;
+		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
+				     ctx);
+		return;
+	}
+}
+
+/*
+ * Non-blocking EC bdev creation. All synchronous steps (geometry,
+ * wib_chans, bdev_register) complete on the caller's stack; the async
+ * WIB read is driven by ec_wib_load_async and done_fn is called once
+ * the bdev is fully ready.
+ *
+ * Returns 0 if the async operation was started (done_fn WILL be called).
+ * Returns negative errno on immediate failure (done_fn is NOT called).
+ */
+int
 ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, uint32_t m,
 		     const char **base_bdev_names, const struct spdk_uuid *uuid,
+		     bool salvage_requested,
 		     ec_bdev_create_cb_fn done_fn, void *done_arg)
 {
 	struct ec_bdev                  *ec;
 	struct ec_bdev_create_async_ctx *ctx;
 	int      rc;
+	uint32_t i, j;
 	bool     io_device_registered = false;
 
 	rc = _ec_bdev_create(name, strip_size_kb, k, m, uuid, &ec);
@@ -1233,10 +1273,60 @@ ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, uint3
 		goto error_cleanup;
 	}
 
+	/* Open dedicated WIB channels for each parity disk. */
+	for (j = 0; j < ec->m; j++) {
+		uint32_t pslot = ec->k + j;
+
+		if (!ec->descs[pslot]) {
+			ec->wib_chans[j] = NULL;
+			continue;
+		}
+		ec->wib_chans[j] = spdk_bdev_get_io_channel(ec->descs[pslot]);
+		if (!ec->wib_chans[j]) {
+			SPDK_ERRLOG("EC bdev %s: failed to open WIB channel "
+				    "for parity slot %u\n", name, pslot);
+			rc = -ENOMEM;
+			goto error_cleanup;
+		}
+	}
+
+	/*
+	 * Open dedicated bitmap channels for every disk. The in-band
+	 * unmapped bitmap is raw-replicated to all n disks (unlike the
+	 * WIB which lives only on the m parity disks), so the channel
+	 * array is n entries wide.
+	 */
+	for (i = 0; i < ec->n; i++) {
+		if (!ec->descs[i]) {
+			ec->bitmap_chans[i] = NULL;
+			continue;
+		}
+		ec->bitmap_chans[i] = spdk_bdev_get_io_channel(ec->descs[i]);
+		if (!ec->bitmap_chans[i]) {
+			SPDK_ERRLOG("EC bdev %s: failed to open bitmap channel "
+				    "for slot %u\n", name, i);
+			rc = -ENOMEM;
+			goto error_cleanup;
+		}
+	}
+
+	ec->wib_poller = spdk_poller_register(ec_wib_idle_poller_cb, ec,
+					      EC_WIB_POLL_PERIOD_US);
+	if (!ec->wib_poller) {
+		SPDK_ERRLOG("EC bdev %s: failed to register WIB poller\n", name);
+		rc = -ENOMEM;
+		goto error_cleanup;
+	}
+
 	spdk_io_device_register(ec, ec_create_ch, ec_destroy_ch,
 				sizeof(struct ec_io_channel), name);
 	io_device_registered = true;
 
+	/*
+	 * Allocate the create context before spdk_bdev_register, so a calloc
+	 * failure cannot leave a registered bdev without the async load chain
+	 * that drives the fresh-create vs. salvage-fail decision.
+	 */
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		SPDK_ERRLOG("EC bdev %s: OOM for create ctx\n", name);
@@ -1258,11 +1348,17 @@ ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, uint3
 	}
 	ec->bdev_registered = true;
 
-	ctx->ec       = ec;
-	ctx->done_fn  = done_fn;
-	ctx->done_arg = done_arg;
+	ctx->ec                = ec;
+	ctx->done_fn           = done_fn;
+	ctx->done_arg          = done_arg;
+	ctx->salvage_requested = salvage_requested;
 
-	ec_bdev_create_finalize(ctx);
+	/*
+	 * Hand off to the async WIB load. The reactor is free to process
+	 * other RPCs while the parity disk reads complete.
+	 * done_fn is called from ec_bdev_create_wib_done().
+	 */
+	ec_wib_load_async(ec, ec_bdev_create_wib_done, ctx);
 	return 0;
 
 error_cleanup:

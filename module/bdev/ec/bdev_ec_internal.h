@@ -721,6 +721,8 @@ ec_wib_lba(const struct ec_bdev *ec, uint8_t copy)
 int      ec_wib_persist(struct ec_bdev *ec,
 			void (*cb)(void *cb_arg, int rc), void *cb_arg);
 int      ec_wib_idle_poller_cb(void *arg);
+void     ec_wib_load_async(struct ec_bdev *ec,
+			   ec_bdev_create_cb_fn done_fn, void *done_arg);
 
 /*
  * I/O entry points defined in bdev_ec_io.c and dispatched from
