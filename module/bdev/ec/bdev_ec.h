@@ -104,7 +104,7 @@ void ec_write_io_stats_json(struct spdk_json_write_ctx *w,
  *   - false: fresh-create path. If the on-disk bitmap is missing or
  *            unreadable, persist a fresh all-mapped bitmap to both
  *            slots on every online disk (chained via the persist
- *            chain's cb_drained), then proceed. Stomping both slots
+ *            chain's cb_drained), then proceed. Overwriting both copies
  *            up front ensures a stale blob from a reused base bdev
  *            cannot out-rank our fresh bitmap on a future load.
  *   - true:  recreate path. If the on-disk bitmap is missing,

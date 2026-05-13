@@ -1194,12 +1194,9 @@ ec_bdev_create_unregister_done(void *cb_arg, int unregister_rc)
 
 
 /*
- * Bootstrap-persist completion: fires after the SECOND fresh-create
- * persist has fully drained, meaning both slots on every online disk
- * now hold a fresh CRC-valid blob (gen 1 in slot 1 from the first
- * persist, gen 2 in slot 0 from the second). Any structurally valid
- * stale blob the base bdevs may have held from a previous lifetime
- * has been stomped on every slot a load could pick.
+ * Fresh-create bitmap persist completion: both bitmap slots (and both commit slots) now
+ * hold our generations, so a stale blob on a reused base bdev cannot out-rank
+ * ours on a later load.
  */
 static void
 ec_bdev_create_bitmap_persist_done(void *cb_arg, int rc)
@@ -1208,11 +1205,10 @@ ec_bdev_create_bitmap_persist_done(void *cb_arg, int rc)
 	struct ec_bdev                  *ec  = ctx->ec;
 
 	if (rc != 0) {
-		SPDK_ERRLOG("EC bdev %s: fresh-create second-slot bitmap "
-			    "persist failed (rc=%d); refusing to expose -- "
-			    "slot 0 may still hold stale base-bdev bytes that "
-			    "could out-rank the gen 1 in slot 1 on a future "
-			    "load\n", ec->bdev.name, rc);
+		SPDK_ERRLOG("EC bdev %s: fresh-create both-copy bitmap persist "
+			    "failed (rc=%d); refusing to expose -- a slot may "
+			    "still hold stale base-bdev bytes that could out-rank "
+			    "our fresh copy on a future load\n", ec->bdev.name, rc);
 		ctx->deferred_rc = rc;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
 				     ctx);
@@ -1226,28 +1222,43 @@ ec_bdev_create_bitmap_persist_done(void *cb_arg, int rc)
 }
 
 /*
- * First-slot bootstrap-persist completion: fires after the first
- * fresh-create persist has fully drained (cb_drained, not cb_durable
- * -- starting the second persist before all writes from the first
- * have completed would let stragglers from the first overwrite the
- * second, defeating the whole point of the two-slot bootstrap).
+ * Bitmap-load completion: pick the post-load path based on whether
+ * load found a valid copy and whether salvage_requested is set.
  *
- * The first persist wrote gen 1 to next_copy (=1, since active_copy
- * starts at 0). On success the second persist now writes the OTHER
- * slot (slot 0) at gen 2; cb_drained chains into
- * ec_bdev_create_bitmap_persist_done above for the final
- * finalize/fail decision.
+ *   load found a copy -> bitmap is established, proceed.
+ *   no copy + salvage_requested=false -> fresh create. Persist an
+ *     all-mapped bitmap (stripe_unmapped_map is calloc'd to zero) to
+ *     both slots on every disk so the next load sees a valid blob.
+ *   no copy + salvage_requested=true -> the operator asked us to
+ *     recreate an established volume but the on-disk bitmap is gone
+ *     or unreadable. Fail loudly rather than silently inventing an
+ *     all-mapped state, which would resurrect stale non-zero data on
+ *     read.
+ *
+ * ec_bitmap_load_async always passes rc == 0 (load failure is
+ * non-fatal at that layer); the "did we find anything" signal is
+ * ec->bitmap_generation, which is 0 when no committed copy was applied.
  */
 static void
-ec_bdev_create_bitmap_first_persist_done(void *cb_arg, int rc)
+ec_bdev_create_bitmap_load_done(void *cb_arg, int rc)
 {
 	struct ec_bdev_create_async_ctx *ctx = cb_arg;
 	struct ec_bdev                  *ec  = ctx->ec;
-	int                              persist_rc;
 
 	if (rc != 0) {
-		SPDK_ERRLOG("EC bdev %s: fresh-create first-slot bitmap "
-			    "persist failed (rc=%d); refusing to expose\n",
+		/*
+		 * The load failed (OOM allocating the load context or DMA scratch
+		 * buffers). On-disk state is untouched, so abort the create and let
+		 * the caller retry once memory recovers.
+		 *
+		 * Falling through is unsafe: bitmap_generation == 0 looks the same
+		 * for "no bitmap on disk" and "load could not run," so a non-salvage
+		 * create would persist a fresh all-mapped bitmap over the existing
+		 * on-disk copies and silently drop every previously-recorded UNMAP.
+		 * Matches ec_bdev_create_wib_done.
+		 */
+		SPDK_ERRLOG("EC bdev %s: bitmap load failed (rc=%d); aborting "
+			    "create to preserve on-disk bitmap for a retry\n",
 			    ec->bdev.name, rc);
 		ctx->deferred_rc = rc;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
@@ -1255,14 +1266,38 @@ ec_bdev_create_bitmap_first_persist_done(void *cb_arg, int rc)
 		return;
 	}
 
-	persist_rc = ec_bitmap_persist_async(ec, ec->stripe_unmapped_map,
-				             NULL, NULL,
-				             ec_bdev_create_bitmap_persist_done, ctx);
-	if (persist_rc != 0) {
-		SPDK_ERRLOG("EC bdev %s: fresh-create second-slot bitmap "
-			    "persist submit failed (rc=%d); refusing to "
-			    "expose\n", ec->bdev.name, persist_rc);
-		ctx->deferred_rc = persist_rc;
+	if (ec->bitmap_generation > 0) {
+		ec_bdev_create_finalize(ctx);
+		return;
+	}
+
+	if (ctx->salvage_requested) {
+		SPDK_ERRLOG("EC bdev %s: salvage requested but no valid bitmap "
+			    "copy found on disk; refusing to expose -- "
+			    "reconstructing as all-mapped would resurrect stale "
+			    "non-zero data on read\n", ec->bdev.name);
+		ctx->deferred_rc = -ENODATA;
+		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
+				     ctx);
+		return;
+	}
+
+	/*
+	 * Fresh create: no on-disk bitmap exists yet. Overwrite BOTH copies on
+	 * every disk with a fresh all-mapped blob before exposing the bdev,
+	 * so a stale blob from a reused base bdev cannot out-rank our
+	 * fresh-create copy on a subsequent load. ec_bitmap_persist_both_copies
+	 * does this as two drain-gated persists (gen 1 -> slot 1, gen 2 ->
+	 * slot 0); after both drain, active = 0 and gen = 2.
+	 */
+	SPDK_NOTICELOG("EC bdev %s: no bitmap on disk; persisting fresh "
+		       "all-mapped bitmap to both slots\n", ec->bdev.name);
+
+	rc = ec_bitmap_persist_both_copies(ec, ec_bdev_create_bitmap_persist_done, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: fresh-create bitmap persist submit "
+			    "failed (rc=%d)\n", ec->bdev.name, rc);
+		ctx->deferred_rc = rc;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
 				     ctx);
 	}
@@ -1294,6 +1329,8 @@ ec_bdev_create_wib_done(void *cb_arg, int rc)
 				     ctx);
 		return;
 	}
+
+	ec_bitmap_load_async(ec, ec_bdev_create_bitmap_load_done, ctx);
 }
 
 /*

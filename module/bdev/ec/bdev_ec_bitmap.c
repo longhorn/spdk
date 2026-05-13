@@ -545,6 +545,256 @@ ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 	return 0;
 }
 
+/*
+ * Two chained persists overwrite both bitmap copies (and both commit copies)
+ * on every writable disk with the current map. cb_drained (not cb_durable)
+ * gates the second persist: starting it before the first fully drains would
+ * let the first's straggler writes race the second on the slot it overwrites.
+ *
+ * Persist 1: gen N   -> slot 1 - active.
+ * Persist 2: gen N+1 -> the other slot (active flipped after persist 1's ack).
+ */
+struct ec_bitmap_persist_both_ctx {
+	struct ec_bdev          *ec;
+	ec_bitmap_persist_cb_fn  done_fn;
+	void                    *done_arg;
+};
+
+/* Report the final outcome and free the ctx. Signature matches
+ * ec_bitmap_persist_cb_fn so it also serves as the second persist's cb_drained. */
+static void
+ec_bitmap_persist_both_report(void *arg, int rc)
+{
+	struct ec_bitmap_persist_both_ctx *sctx     = arg;
+	ec_bitmap_persist_cb_fn     done_fn  = sctx->done_fn;
+	void                       *done_arg = sctx->done_arg;
+
+	free(sctx);
+	if (done_fn) {
+		done_fn(done_arg, rc);
+	}
+}
+
+/* First persist drained; chain the second onto the other slot. */
+static void
+ec_bitmap_persist_both_first_done(void *arg, int rc)
+{
+	struct ec_bitmap_persist_both_ctx *sctx = arg;
+	int                         persist_rc;
+
+	if (rc != 0) {
+		ec_bitmap_persist_both_report(sctx, rc);
+		return;
+	}
+
+	persist_rc = ec_bitmap_persist_async(sctx->ec, sctx->ec->stripe_unmapped_map,
+					     NULL, NULL,
+					     ec_bitmap_persist_both_report, sctx);
+	if (persist_rc != 0) {
+		ec_bitmap_persist_both_report(sctx, persist_rc);
+	}
+}
+
+int
+ec_bitmap_persist_both_copies(struct ec_bdev *ec,
+			   ec_bitmap_persist_cb_fn done_fn, void *done_arg)
+{
+	struct ec_bitmap_persist_both_ctx *sctx;
+	int                         rc;
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	sctx = calloc(1, sizeof(*sctx));
+	if (!sctx) {
+		return -ENOMEM;
+	}
+	sctx->ec       = ec;
+	sctx->done_fn  = done_fn;
+	sctx->done_arg = done_arg;
+
+	rc = ec_bitmap_persist_async(ec, ec->stripe_unmapped_map, NULL, NULL,
+				     ec_bitmap_persist_both_first_done, sctx);
+	if (rc != 0) {
+		free(sctx);
+		return rc;
+	}
+	return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Load
+ *
+ * Serial scan: for each {disk, slot} in turn, read into read_buf and
+ * validate. If the new copy beats the running best (higher generation,
+ * or no best yet), swap pointers so best_buf holds the winner. At the
+ * end, apply best_buf if any winner exists.
+ *
+ * Serial keeps memory bounded at 2 * slot_size_bytes regardless of disk
+ * count or volume size; load is one-shot at startup and the latency cost
+ * (2n disk reads serially, sub-millisecond each on NVMe) is acceptable.
+ * ------------------------------------------------------------------------- */
+
+struct ec_bitmap_load_ctx {
+	struct ec_bdev      *ec;
+
+	void                *read_buf;       /* current read target            */
+	void                *best_buf;       /* current best-generation winner */
+	uint64_t             slot_size_bytes;
+
+	uint32_t             cur_disk;       /* base-bdev slot 0..n-1          */
+	uint8_t              cur_copy;       /* 0 or 1                          */
+
+	bool                 has_best;
+	uint32_t             best_gen;
+	uint8_t              best_copy;
+
+	ec_bdev_create_cb_fn done_fn;
+	void                *done_arg;
+};
+
+static void ec_bitmap_load_continue(struct ec_bitmap_load_ctx *ctx);
+
+static void
+ec_bitmap_load_finish(struct ec_bitmap_load_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+	ec_bdev_create_cb_fn done_fn = ctx->done_fn;
+	void *done_arg = ctx->done_arg;
+
+	if (ctx->has_best) {
+		ec_bitmap_apply_buf(ec, ctx->best_buf);
+		ec->bitmap_generation  = ctx->best_gen;
+		ec->bitmap_active_copy = ctx->best_copy;
+		SPDK_NOTICELOG("EC bdev %s: bitmap loaded (gen %u, slot %u)\n",
+			       ec->bdev.name, ctx->best_gen, ctx->best_copy);
+	} else {
+		SPDK_NOTICELOG("EC bdev %s: no valid bitmap copy found -- "
+			       "stripe_unmapped_map left zero\n",
+			       ec->bdev.name);
+	}
+
+	spdk_dma_free(ctx->read_buf);
+	spdk_dma_free(ctx->best_buf);
+	free(ctx);
+
+	done_fn(done_arg, 0);
+}
+
+/* Advance the load cursor: copy 0 -> copy 1 on the same disk, then next disk. */
+static void
+ec_bitmap_load_next_copy(struct ec_bitmap_load_ctx *ctx)
+{
+	if (ctx->cur_copy == 0) {
+		ctx->cur_copy = 1;
+	} else {
+		ctx->cur_copy = 0;
+		ctx->cur_disk++;
+	}
+}
+
+static void
+ec_bitmap_load_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_bitmap_load_ctx *ctx = cb_arg;
+	struct ec_bdev            *ec  = ctx->ec;
+	uint32_t                   generation;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success && ec_bitmap_validate_buf(ec, ctx->read_buf, &generation) == 0) {
+		if (!ctx->has_best || generation > ctx->best_gen) {
+			void *tmp     = ctx->best_buf;
+			ctx->best_buf = ctx->read_buf;
+			ctx->read_buf = tmp;
+			ctx->best_gen  = generation;
+			ctx->best_copy = ctx->cur_copy;
+			ctx->has_best  = true;
+		}
+	}
+
+	ec_bitmap_load_next_copy(ctx);
+
+	ec_bitmap_load_continue(ctx);
+}
+
+static void
+ec_bitmap_load_continue(struct ec_bitmap_load_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+	int             rc;
+
+	while (ctx->cur_disk < ec->n) {
+		uint32_t disk = ctx->cur_disk;
+
+		if (!ec->descs[disk] || !ec->bitmap_chans[disk] ||
+		    !ec_slot_is_readable(ec, disk)) {
+			ctx->cur_disk++;
+			ctx->cur_copy = 0;
+			continue;
+		}
+
+		rc = spdk_bdev_read(ec->descs[disk],
+				    ec->bitmap_chans[disk],
+				    ctx->read_buf,
+				    ec_bitmap_slot_lba_blocks(ec, ctx->cur_copy)
+				    * ec->bdev.blocklen,
+				    ctx->slot_size_bytes,
+				    ec_bitmap_load_read_cb,
+				    ctx);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: bitmap load read submit failed "
+				     "for slot %u copy %u (rc=%d) -- skipping\n",
+				     ec->bdev.name, disk, ctx->cur_copy, rc);
+			/* Skip this copy, try the next. */
+			ec_bitmap_load_next_copy(ctx);
+			continue;
+		}
+
+		return;  /* I/O submitted; callback drives the next step. */
+	}
+
+	ec_bitmap_load_finish(ctx);
+}
+
+void
+ec_bitmap_load_async(struct ec_bdev *ec,
+		     ec_bdev_create_cb_fn done_fn, void *done_arg)
+{
+	struct ec_bitmap_load_ctx *ctx;
+	uint64_t                   slot_size_bytes;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("EC bdev %s: OOM for bitmap load ctx\n",
+			    ec->bdev.name);
+		done_fn(done_arg, -ENOMEM);
+		return;
+	}
+
+	slot_size_bytes = ec_bitmap_slot_io_blocks(ec) * ec->bdev.blocklen;
+
+	ctx->read_buf = spdk_dma_zmalloc(slot_size_bytes, EC_DMA_ALIGN, NULL);
+	ctx->best_buf = spdk_dma_zmalloc(slot_size_bytes, EC_DMA_ALIGN, NULL);
+	if (!ctx->read_buf || !ctx->best_buf) {
+		SPDK_ERRLOG("EC bdev %s: OOM for bitmap load buffers "
+			    "(slot_size=%" PRIu64 " bytes)\n",
+			    ec->bdev.name, slot_size_bytes);
+		spdk_dma_free(ctx->read_buf);
+		spdk_dma_free(ctx->best_buf);
+		free(ctx);
+		done_fn(done_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->ec              = ec;
+	ctx->slot_size_bytes = slot_size_bytes;
+	ctx->done_fn         = done_fn;
+	ctx->done_arg        = done_arg;
+	/* cur_disk = cur_copy = 0; has_best = false; (calloc'd) */
+
+	ec_bitmap_load_continue(ctx);
+}
+
 /* -------------------------------------------------------------------------
  * Status query
  * ------------------------------------------------------------------------- */

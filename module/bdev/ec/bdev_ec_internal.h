@@ -1106,6 +1106,35 @@ int ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 			    ec_bitmap_persist_cb_fn cb_durable, void *cb_durable_arg,
 			    ec_bitmap_persist_cb_fn cb_drained, void *cb_drained_arg);
 
+/*
+ * ec_bitmap_persist_both_copies -- overwrite BOTH bitmap copies (and both commit
+ * copies) on every writable disk with the current map, via two drain-gated
+ * persists. Used at fresh create and after a hot-swap so a stale/foreign blob
+ * on a reused base bdev cannot out-rank ours on a later load. done_fn (may be
+ * NULL) fires with the final rc. Home-thread only.
+ */
+int ec_bitmap_persist_both_copies(struct ec_bdev *ec,
+			       ec_bitmap_persist_cb_fn done_fn, void *done_arg);
+
+/*
+ * ec_bitmap_load_async -- read the bitmap blob from disk at startup
+ * (or after a process restart) and apply the max-generation
+ * CRC-validated copy into stripe_unmapped_map.
+ *
+ * Reads all 2n {disk, slot} copies serially (one in flight at a time),
+ * validates each, and applies the highest-generation valid one.
+ * bitmap_generation and bitmap_active_copy are set from that copy's
+ * header. If no copy
+ * validates -- never-written region, all-disks-down, or a torn first
+ * persist -- stripe_unmapped_map is left zeroed and the create path
+ * decides what that means based on salvage_requested.
+ *
+ * done_fn is always invoked with rc == 0; load failure is non-fatal at
+ * this layer. Consumes ec->bitmap_chans[], which must already be open.
+ */
+void ec_bitmap_load_async(struct ec_bdev *ec,
+			  ec_bdev_create_cb_fn done_fn, void *done_arg);
+
 /* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
 int ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
