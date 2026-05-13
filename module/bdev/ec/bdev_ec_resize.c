@@ -73,6 +73,44 @@ ec_resize_finish(struct ec_resize_ctx *ctx, int rc)
 }
 
 /*
+ * Completion for the post-resize unmapped-bitmap re-stamp (fired from
+ * ec_resize_realloc_stripe_bitmaps below).
+ *
+ * On a failed re-persist we roll the geometry back to the old size. We do
+ * this for clean failure, not for safety: the old on-disk copy still loads
+ * on restart (ec_bitmap_validate_buf accepts a smaller copy,
+ * ec_bitmap_apply_buf zero-fills the new stripes), so no UNMAP is lost
+ * either way. The rollback just keeps a failed resize invisible --
+ * ec_resize_finish publishes the new blockcnt only after this callback --
+ * so the caller sees "nothing changed" and can retry.
+ *
+ * The larger WIB and stripe-map allocations stay; the extra space is
+ * unused until the next resize or teardown, like the OOM-clamp path in
+ * ec_resize_realloc_stripe_bitmaps.
+ */
+static void
+ec_resize_bitmap_persist_done(void *arg, int rc)
+{
+	struct ec_resize_ctx *ctx = arg;
+	struct ec_bdev       *ec  = ctx->ec;
+
+	if (rc != 0) {
+		uint64_t old_num_stripes = ctx->old_blockcnt / ec->stripe_blocks;
+
+		SPDK_ERRLOG("EC bdev %s: resize -- unmapped-bitmap re-persist "
+			    "failed (rc=%d); rolling back to old geometry\n",
+			    ec->bdev.name, rc);
+		ec->num_stripes     = old_num_stripes;
+		ec->wib_num_regions = (uint32_t)
+			((old_num_stripes + EC_WIB_REGION_STRIPES - 1) /
+			 EC_WIB_REGION_STRIPES);
+		ec_resize_finish(ctx, rc);
+		return;
+	}
+	ec_resize_finish(ctx, 0);
+}
+
+/*
  * Reallocate the per-stripe in-memory bitmaps to match the new geometry:
  *
  *   stripe_dirty_map      -- transient RMW interlock; cleared by quiesce,
@@ -153,35 +191,55 @@ ec_resize_realloc_stripe_bitmaps(struct ec_resize_ctx *ctx)
 		 * num_stripes so WIB status and the next persist report the
 		 * correct region count; the larger WIB allocations simply
 		 * keep unused tail capacity until the next resize or teardown.
+		 *
+		 * stripe_dirty_map and stripe_unmapped_map are left as-is:
+		 * the quiesce drained every in-flight RMW / full-stripe write /
+		 * UNMAP / rebuild before this path runs, so stripe_dirty_map is
+		 * already zero across the old range and the unmapped bitmap
+		 * content remains valid at the clamped (old) size.
 		 */
 		ec->wib_num_regions = (uint32_t)
 			((old_num_stripes + EC_WIB_REGION_STRIPES - 1) /
 			 EC_WIB_REGION_STRIPES);
-
-		memset(ec->stripe_dirty_map, 0,
-		       old_map_words * sizeof(uint64_t));
-		/*
-		 * stripe_unmapped_map is left as-is: its content remains
-		 * valid at the clamped (old) size.
-		 */
 	}
 
-	if (ec->num_stripes == old_num_stripes) {
+	if (ec->num_stripes != old_num_stripes) {
+		int rc;
+
 		/*
-		 * Did not grow: ec_bdev_resize rejects no-op requests with
-		 * -EALREADY before quiesce, so reaching here means an OOM
-		 * clamp fired in ec_resize_realloc_wib_arrays or in the
-		 * per-stripe realloc above. Report -ENOMEM so the caller can
-		 * distinguish a clamped no-grow from a real resize.
-		 * ec_resize_finish still unquiesces; the
-		 * spdk_bdev_notify_blockcnt_change call inside it is a no-op
-		 * because committed_blockcnt equals the old value after clamp.
+		 * Re-stamp the unmapped bitmap at the new num_stripes. This is an
+		 * optimization, not a correctness requirement: an old-geometry copy
+		 * still loads after a restart (validate accepts a smaller copy, apply
+		 * zero-extends the tail). The re-stamp just restores both copies to
+		 * the new size now instead of at the next persist.
 		 */
-		ec_resize_finish(ctx, -ENOMEM);
+		rc = ec_bitmap_persist_async(ec, ec->stripe_unmapped_map,
+					     NULL, NULL,
+					     ec_resize_bitmap_persist_done, ctx);
+		if (rc == 0) {
+			return;  /* resize completes from ec_resize_bitmap_persist_done */
+		}
+		SPDK_ERRLOG("EC bdev %s: resize -- could not start unmapped-bitmap "
+			    "re-persist (rc=%d); rolling back to old geometry\n",
+			    ec->bdev.name, rc);
+		ec->num_stripes     = old_num_stripes;
+		ec->wib_num_regions = (uint32_t)
+			((old_num_stripes + EC_WIB_REGION_STRIPES - 1) /
+			 EC_WIB_REGION_STRIPES);
+		ec_resize_finish(ctx, rc);
 		return;
 	}
 
-	ec_resize_finish(ctx, 0);
+	/*
+	 * Did not grow: ec_bdev_resize rejects no-op requests with -EALREADY
+	 * before quiesce, so reaching here means an OOM clamp fired in
+	 * ec_resize_realloc_wib_arrays or in the per-stripe realloc above.
+	 * Report -ENOMEM so the caller can distinguish a clamped no-grow from a
+	 * real resize. ec_resize_finish still unquiesces; the
+	 * spdk_bdev_notify_blockcnt_change call inside it is a no-op because
+	 * committed_blockcnt equals the old value after clamp.
+	 */
+	ec_resize_finish(ctx, -ENOMEM);
 }
 
 /*

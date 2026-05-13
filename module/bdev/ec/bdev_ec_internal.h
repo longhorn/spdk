@@ -995,7 +995,6 @@ ec_wib_region_inflight_dec(struct ec_bdev *ec, uint32_t region)
  * ========================================================================= */
 
 /* Helpers for diagnostics; loop-based, not worth inlining. */
-uint64_t ec_count_dirty_stripes(const struct ec_bdev *ec);
 uint32_t ec_wib_count_dirty(const struct ec_bdev *ec);
 
 /* =========================================================================
@@ -1060,6 +1059,53 @@ void ec_bitmap_apply_buf(struct ec_bdev *ec, const void *buf);
  */
 uint64_t ec_count_unmapped_stripes(const struct ec_bdev *ec);
 
+/*
+ * ec_bitmap_persist_async -- write source_map to disk as a fresh
+ * generation of the bitmap blob. Bumps ec->bitmap_generation, picks
+ * next_copy = 1 - bitmap_active_copy, fills a DMA scratch buffer from
+ * source_map at the new generation, then fans the write out to every
+ * online writable disk's next_copy slot.
+ *
+ * Two completion callbacks, each optional (pass NULL to skip):
+ *
+ *   cb_durable -- fires the moment durability is achieved: at least
+ *     m+1 disks (or all online disks, if fewer than m+1 are online)
+ *     have completed the write. At this point bitmap_active_copy is
+ *     flipped to next_copy. The remaining in-flight writes continue
+ *     to drain in the background; bitmap_persist_in_flight is NOT yet
+ *     cleared. Used by the UNMAP path to release its caller before
+ *     a slow disk has finished writing -- the staged bits are
+ *     applied to the live bitmap from this callback.
+ *
+ *     If the m+1 threshold is never reached, cb_durable is called
+ *     with rc < 0 once all in-flight writes have completed (and
+ *     bitmap_active_copy is not flipped -- the bitmap stays on the
+ *     prior generation).
+ *
+ *   cb_drained -- fires when the last write has completed, after
+ *     bitmap_persist_in_flight has been cleared. The rc argument
+ *     reflects the final outcome (0 if durability was achieved,
+ *     negative errno otherwise). Used by callers that need to
+ *     serialise work behind the persist's full drainout -- the
+ *     fresh-create bootstrap chains a second persist (to the other
+ *     slot) from this callback, since starting it earlier would
+ *     race the first persist's stragglers writing to the same slot.
+ *
+ * source_map is taken explicitly (not read from ec->stripe_unmapped_map)
+ * so the UNMAP path can persist a staged copy of the map without first
+ * applying the staged changes to the live, reader-visible map.
+ *
+ * Returns 0 if the async chain started, or a negative errno on setup
+ * failure (-ENOMEM, -EBUSY if a persist is already in flight, or -EIO
+ * if no writable disk could be issued a write). Neither callback is
+ * invoked on synchronous failure.
+ *
+ * Precondition: ec->bitmap_persist_in_flight must be false on entry.
+ */
+int ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
+			    ec_bitmap_persist_cb_fn cb_durable, void *cb_durable_arg,
+			    ec_bitmap_persist_cb_fn cb_drained, void *cb_drained_arg);
+
 /* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
 int ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
@@ -1115,7 +1161,6 @@ ec_wib_lba(const struct ec_bdev *ec, uint8_t copy)
 
 /* WIB helpers needed by the resize and scrub chains, plus the
  * RMW->WIB bridge ec_wib_persist documented above. */
-void     ec_wib_fill_buf(struct ec_bdev *ec);
 int      ec_wib_persist(struct ec_bdev *ec,
 			void (*cb)(void *cb_arg, int rc), void *cb_arg);
 int      ec_wib_idle_poller_cb(void *arg);

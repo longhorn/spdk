@@ -1192,6 +1192,82 @@ ec_bdev_create_unregister_done(void *cb_arg, int unregister_rc)
 	done_fn(done_arg, rc);
 }
 
+
+/*
+ * Bootstrap-persist completion: fires after the SECOND fresh-create
+ * persist has fully drained, meaning both slots on every online disk
+ * now hold a fresh CRC-valid blob (gen 1 in slot 1 from the first
+ * persist, gen 2 in slot 0 from the second). Any structurally valid
+ * stale blob the base bdevs may have held from a previous lifetime
+ * has been stomped on every slot a load could pick.
+ */
+static void
+ec_bdev_create_bitmap_persist_done(void *cb_arg, int rc)
+{
+	struct ec_bdev_create_async_ctx *ctx = cb_arg;
+	struct ec_bdev                  *ec  = ctx->ec;
+
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: fresh-create second-slot bitmap "
+			    "persist failed (rc=%d); refusing to expose -- "
+			    "slot 0 may still hold stale base-bdev bytes that "
+			    "could out-rank the gen 1 in slot 1 on a future "
+			    "load\n", ec->bdev.name, rc);
+		ctx->deferred_rc = rc;
+		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
+				     ctx);
+		return;
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: fresh bitmap persisted to both slots "
+		       "(gen %u)\n", ec->bdev.name, ec->bitmap_generation);
+
+	ec_bdev_create_finalize(ctx);
+}
+
+/*
+ * First-slot bootstrap-persist completion: fires after the first
+ * fresh-create persist has fully drained (cb_drained, not cb_durable
+ * -- starting the second persist before all writes from the first
+ * have completed would let stragglers from the first overwrite the
+ * second, defeating the whole point of the two-slot bootstrap).
+ *
+ * The first persist wrote gen 1 to next_copy (=1, since active_copy
+ * starts at 0). On success the second persist now writes the OTHER
+ * slot (slot 0) at gen 2; cb_drained chains into
+ * ec_bdev_create_bitmap_persist_done above for the final
+ * finalize/fail decision.
+ */
+static void
+ec_bdev_create_bitmap_first_persist_done(void *cb_arg, int rc)
+{
+	struct ec_bdev_create_async_ctx *ctx = cb_arg;
+	struct ec_bdev                  *ec  = ctx->ec;
+	int                              persist_rc;
+
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: fresh-create first-slot bitmap "
+			    "persist failed (rc=%d); refusing to expose\n",
+			    ec->bdev.name, rc);
+		ctx->deferred_rc = rc;
+		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
+				     ctx);
+		return;
+	}
+
+	persist_rc = ec_bitmap_persist_async(ec, ec->stripe_unmapped_map,
+				             NULL, NULL,
+				             ec_bdev_create_bitmap_persist_done, ctx);
+	if (persist_rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: fresh-create second-slot bitmap "
+			    "persist submit failed (rc=%d); refusing to "
+			    "expose\n", ec->bdev.name, persist_rc);
+		ctx->deferred_rc = persist_rc;
+		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
+				     ctx);
+	}
+}
+
 static void
 ec_bdev_create_wib_done(void *cb_arg, int rc)
 {

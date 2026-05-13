@@ -279,6 +279,273 @@ ec_bitmap_slot_io_blocks(const struct ec_bdev *ec)
 }
 
 /* -------------------------------------------------------------------------
+ * Persist
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Context for one in-flight persist. The DMA buffer holds the
+ * serialised blob (header + span + CRC + trailing slack to the strip
+ * boundary) and is shared by every disk's write -- raw replication
+ * writes identical bytes to every disk.
+ *
+ * Lifecycle: alloc on submit, freed in the write-completion callback
+ * once the last in-flight write completes. Two callbacks are wired:
+ *
+ *   cb_durable fires at the m+1-ack moment (or, on failure, at full
+ *   drainout) -- the caller's "durability achieved" hook. UNMAP uses
+ *   this to apply staged->live and release its caller before slow
+ *   disks finish.
+ *
+ *   cb_drained fires at full drainout, after bitmap_persist_in_flight
+ *   has been cleared -- the caller's "this persist is fully settled"
+ *   hook. Bootstrap uses this to chain the second-slot persist
+ *   without racing the first one's stragglers.
+ *
+ * Either callback may be NULL. bitmap_persist_in_flight stays true
+ * until drainout regardless of when cb_durable fires, so a second
+ * persist arriving in the post-ack-pre-drainout window is blocked
+ * (with -EBUSY); this is the correctness invariant that prevents
+ * straggler writes from a previous persist overwriting fresh writes
+ * from a subsequent persist on the same slot LBA.
+ */
+struct ec_bitmap_persist_ctx {
+	struct ec_bdev          *ec;
+	void                    *dma_buf;
+	uint8_t                  next_copy;
+	uint32_t                 writes_in_flight;
+	uint32_t                 successes;
+	uint32_t                 required;
+	bool                     acked;
+	int                      first_err;
+	ec_bitmap_persist_cb_fn  cb_durable;
+	void                    *cb_durable_arg;
+	ec_bitmap_persist_cb_fn  cb_drained;
+	void                    *cb_drained_arg;
+};
+
+static void
+ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
+			   void *cb_arg)
+{
+	struct ec_bitmap_persist_ctx *ctx = cb_arg;
+	struct ec_bdev               *ec  = ctx->ec;
+	int                           final_rc;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success) {
+		ctx->successes++;
+	} else if (ctx->first_err == 0) {
+		ctx->first_err = -EIO;
+		SPDK_WARNLOG("EC bdev %s: bitmap persist write failed\n",
+			     ec->bdev.name);
+	}
+
+	/*
+	 * Pre-completion durability ack: fire cb_durable as soon as the
+	 * threshold is met so the caller can release its dependents (UNMAP
+	 * applies staged->live and acks its bdev_io). bitmap_active_copy
+	 * is flipped here, but bitmap_persist_in_flight is NOT cleared --
+	 * it stays true until full drainout so a subsequent persist
+	 * cannot start while this persist's slow writes are still in
+	 * flight to the same slot LBA. Clearing pending too early lets
+	 * stragglers from this persist overwrite the next persist's
+	 * fresh writes after that next persist had already been acked,
+	 * silently regressing durability past an acknowledged
+	 * commit.
+	 */
+	if (!ctx->acked && ctx->successes >= ctx->required) {
+		ctx->acked             = true;
+		ec->bitmap_active_copy = ctx->next_copy;
+		if (ctx->cb_durable) {
+			ctx->cb_durable(ctx->cb_durable_arg, 0);
+		}
+	}
+
+	ctx->writes_in_flight--;
+	if (ctx->writes_in_flight != 0) {
+		return;
+	}
+
+	/*
+	 * Last write done. Now safe to clear bitmap_persist_in_flight so the
+	 * next persist may begin -- all on-disk state from this persist is
+	 * either committed (success) or terminally failed.
+	 */
+	ec->bitmap_persist_in_flight = false;
+
+	if (!ctx->acked) {
+		/*
+		 * Threshold was never reached. Report the failure via
+		 * cb_durable now (the caller's "did the persist succeed?"
+		 * hook), leaving the active_copy / generation as they were
+		 * so the bitmap stays on its prior on-disk content.
+		 */
+		SPDK_ERRLOG("EC bdev %s: bitmap persist did not reach durability "
+			    "threshold (succeeded=%u, required=%u)\n",
+			    ec->bdev.name, ctx->successes, ctx->required);
+		final_rc = ctx->first_err ? ctx->first_err : -EIO;
+		if (ctx->cb_durable) {
+			ctx->cb_durable(ctx->cb_durable_arg, final_rc);
+		}
+	} else {
+		final_rc = 0;
+	}
+
+	if (ctx->cb_drained) {
+		ctx->cb_drained(ctx->cb_drained_arg, final_rc);
+	}
+
+	spdk_dma_free(ctx->dma_buf);
+	free(ctx);
+}
+
+/*
+ * Why bitmap persists triggered by I/O paths (UNMAP, write-into-unmapped)
+ * route to the home thread instead of running on each ec_io_channel's
+ * own bitmap_chans[]:
+ *
+ * The same bitmap blob is written to every disk on every persist. The
+ * consistency model needs a single writer to keep three coordination
+ * signals well-defined:
+ *
+ *   - bitmap_active_copy. Each persist writes the slot the active copy
+ *     is NOT in (next_copy = 1 - active_copy). Two writers both reading
+ *     active_copy = 0 would both write slot 1; their bytes interleave
+ *     and the loaded blob fails CRC.
+ *   - bitmap_generation. Monotonic counter, incremented by exactly one
+ *     writer per persist. Two writers both reading N and both writing
+ *     N+1 with different content break the "highest valid generation
+ *     wins" rule that ec_bitmap_load_async relies on to pick the committed copy.
+ *   - cb_drained. Fires when every write for THIS persist has acked,
+ *     which gates the next bit-clear flush. Concurrent persists make
+ *     "all acked" ambiguous (which persist?); the flush ordering
+ *     breaks.
+ *
+ * Distributing writers across per-channel bitmap_chans[] would mean a
+ * new coordination protocol: atomic generation counters, cross-channel
+ * drainout, a cross-thread lock on bitmap_persist_in_flight. That is a
+ * different on-disk consistency story -- a new storage protocol, not
+ * a refactor of this one. Routing each persist trigger to the home
+ * thread via spdk_thread_send_msg keeps the existing single-writer
+ * model. One cross-thread message per persist costs microseconds and
+ * preserves every invariant verbatim.
+ */
+
+int
+ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
+			ec_bitmap_persist_cb_fn cb_durable, void *cb_durable_arg,
+			ec_bitmap_persist_cb_fn cb_drained, void *cb_drained_arg)
+{
+	struct ec_bitmap_persist_ctx *ctx;
+	uint64_t slot_lba_blocks;
+	uint64_t slot_size_blocks;
+	uint64_t slot_size_bytes;
+
+	/*
+	 * Home-thread only: this function uses bitmap_chans[] (thread-affine
+	 * to the creation thread) and mutates bitmap_persist_in_flight,
+	 * bitmap_active_copy, and bitmap_generation. I/O-path callers (UNMAP,
+	 * write-into-unmapped's bit-clear) route here via the helpers above.
+	 */
+	assert(spdk_get_thread() == ec->home_thread);
+	uint32_t n_writable = 0;
+	uint32_t i;
+	int      rc;
+
+	if (ec->bitmap_persist_in_flight) {
+		return -EBUSY;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+
+	slot_size_blocks = ec_bitmap_slot_io_blocks(ec);
+	slot_size_bytes  = slot_size_blocks * ec->bdev.blocklen;
+
+	ctx->dma_buf = spdk_dma_zmalloc(slot_size_bytes, EC_DMA_ALIGN, NULL);
+	if (!ctx->dma_buf) {
+		free(ctx);
+		return -ENOMEM;
+	}
+
+	/* Count writable, attached disks with channels available. */
+	for (i = 0; i < ec->n; i++) {
+		if (ec->descs[i] && ec->bitmap_chans[i] &&
+		    ec_slot_is_writable(ec, i)) {
+			n_writable++;
+		}
+	}
+	if (n_writable == 0) {
+		spdk_dma_free(ctx->dma_buf);
+		free(ctx);
+		return -EIO;
+	}
+
+	ec->bitmap_generation++;
+
+	ctx->ec              = ec;
+	ctx->next_copy       = 1 - ec->bitmap_active_copy;
+	ctx->required        = spdk_min(n_writable, ec->m + 1);
+	ctx->cb_durable      = cb_durable;
+	ctx->cb_durable_arg  = cb_durable_arg;
+	ctx->cb_drained      = cb_drained;
+	ctx->cb_drained_arg  = cb_drained_arg;
+
+	/*
+	 * Serialise once into the shared DMA buffer; raw replication means
+	 * every disk receives the same bytes.
+	 */
+	ec_bitmap_fill_buf(ec, source_map, ec->bitmap_generation, ctx->dma_buf);
+
+	slot_lba_blocks = ec_bitmap_slot_lba_blocks(ec, ctx->next_copy);
+
+	ec->bitmap_persist_in_flight = true;
+
+	for (i = 0; i < ec->n; i++) {
+		if (!ec->descs[i] || !ec->bitmap_chans[i] ||
+		    !ec_slot_is_writable(ec, i)) {
+			continue;
+		}
+
+		ctx->writes_in_flight++;
+		rc = spdk_bdev_write(ec->descs[i],
+				     ec->bitmap_chans[i],
+				     ctx->dma_buf,
+				     slot_lba_blocks * ec->bdev.blocklen,
+				     slot_size_bytes,
+				     ec_bitmap_persist_write_cb,
+				     ctx);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: bitmap persist submit failed "
+				     "for slot %u (rc=%d)\n",
+				     ec->bdev.name, i, rc);
+			ctx->writes_in_flight--;
+			if (ctx->first_err == 0) {
+				ctx->first_err = rc;
+			}
+		}
+	}
+
+	if (ctx->writes_in_flight == 0) {
+		/*
+		 * No write got submitted. Roll the persist back synchronously
+		 * -- the caller treats this exactly like any other -errno
+		 * return, and cb is not invoked.
+		 */
+		ec->bitmap_persist_in_flight = false;
+		rc = ctx->first_err ? ctx->first_err : -EIO;
+		spdk_dma_free(ctx->dma_buf);
+		free(ctx);
+		return rc;
+	}
+
+	return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Status query
  * ------------------------------------------------------------------------- */
 
