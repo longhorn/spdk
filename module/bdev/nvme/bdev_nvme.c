@@ -2388,8 +2388,53 @@ bdev_nvme_reset_destroy_qpair(struct nvme_ctrlr_channel_iter *i,
 static void
 bdev_nvme_reset_create_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int status)
 {
+	struct nvme_ns *nvme_ns;
+	uint64_t num_sectors;
+	int notify_rc;
+
 	if (status == 0) {
 		NVME_CTRLR_INFOLOG(nvme_ctrlr, "qpairs were created after ctrlr reset.\n");
+
+		/*
+		 * Refresh cached blockcnt for active namespaces in case the
+		 * target resized them while the controller was disconnected.
+		 * The canonical refresh is the AER NS_ATTR_CHANGED path via
+		 * nvme_ctrlr_populate_namespaces (see aer_cb), but consumers
+		 * that quiesce the target NVMe-oF subsystem to safely perform
+		 * the resize (required to avoid bdev_lvol_resize hanging on a
+		 * loopback-attached exposed lvol) miss the AER entirely. Without
+		 * this refresh, cached disk.blockcnt would stay stale until the
+		 * next detach+attach.
+		 *
+		 * Runs after qpair recreation, so a RESIZE consumer sees an
+		 * I/O-ready controller -- the same contract as the AER path.
+		 *
+		 * Narrower than nvme_ctrlr_populate_namespaces: it only updates
+		 * the size of namespaces that already have a bdev. Adding or
+		 * removing namespaces stays with the canonical populate path (a
+		 * depopulate here would fire BDEV_EVENT_REMOVE to base-bdev
+		 * consumers like bdev_raid / bdev_ec).
+		 */
+		for (nvme_ns = nvme_ctrlr_get_first_active_ns(nvme_ctrlr);
+		     nvme_ns != NULL;
+		     nvme_ns = nvme_ctrlr_get_next_active_ns(nvme_ctrlr, nvme_ns)) {
+			if (nvme_ns->ns == NULL || nvme_ns->bdev == NULL) {
+				continue;
+			}
+			num_sectors = spdk_nvme_ns_get_num_sectors(nvme_ns->ns);
+			if (nvme_ns->bdev->disk.blockcnt != num_sectors) {
+				NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+						     "NSID %u resized during reconnect: bdev %s, old %" PRIu64 ", new %" PRIu64 "\n",
+						     nvme_ns->id, nvme_ns->bdev->disk.name,
+						     nvme_ns->bdev->disk.blockcnt, num_sectors);
+				notify_rc = spdk_bdev_notify_blockcnt_change(&nvme_ns->bdev->disk, num_sectors);
+				if (notify_rc != 0) {
+					NVME_CTRLR_ERRLOG(nvme_ctrlr,
+							  "Could not change num blocks for nvme bdev: name %s, errno: %d.\n",
+							  nvme_ns->bdev->disk.name, notify_rc);
+				}
+			}
+		}
 
 		bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, true);
 	} else {
