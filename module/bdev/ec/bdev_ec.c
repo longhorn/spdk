@@ -1875,6 +1875,9 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 			    "(emulation not engaged)\n", ec->bdev.name);
 		rc = -EINVAL;
 		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		rc = ec_submit_unmap(ec_io);
+		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);

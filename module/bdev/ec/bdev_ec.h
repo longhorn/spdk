@@ -175,6 +175,32 @@ int ec_bdev_set_rebuild_qos(const char *ec_name,
 int ec_bdev_stop_rebuild(const char *ec_name);
 
 /*
+ * Query in-band unmapped-bitmap status. Returns -ENODEV on error.
+ *
+ *   num_stripes      -- user-stripe count covered by the bitmap.
+ *   unmapped_stripes -- count of set bits in stripe_unmapped_map; how
+ *                       many user stripes are currently flagged zero.
+ *   blob_bytes       -- on-disk CRC-covered length of one slot (header
+ *                       + span); the CRC trailer adds sizeof(uint32_t)
+ *                       to the slot's full on-disk extent.
+ *   generation       -- bitmap_generation; only ever increases
+ *                       across persists.
+ *   active_copy      -- global slot index (0 or 1) the last persist
+ *                       committed to.
+ *   persist_pending  -- true while a bitmap persist is in flight (or
+ *                       its stragglers are still draining; see the
+ *                       "stay true until drainout" invariant in
+ *                       bdev_ec_bitmap.c).
+ */
+int ec_bdev_get_unmap_status(const char *ec_name,
+			     uint64_t   *num_stripes,
+			     uint64_t   *unmapped_stripes,
+			     uint64_t   *blob_bytes,
+			     uint32_t   *generation,
+			     uint8_t    *active_copy,
+			     bool       *persist_pending);
+
+/*
  * Expand the EC bdev in-place after base bdevs have grown.
  * The WIB and unmapped-bitmap reservations sit at fixed front offsets and do
  * not move; resize only grows the user-data region, updating blockcnt, stripe

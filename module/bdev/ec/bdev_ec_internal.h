@@ -915,6 +915,30 @@ ec_stripe_is_dirty(const struct ec_bdev *ec, uint64_t stripe_index)
 }
 
 /*
+ * Stripe unmapped bitmap helpers. One bit per user stripe, 1 = the
+ * stripe is logically zero (unmapped). Same single-thread O(1)
+ * discipline and same user-stripe indexing as the dirty bitmap.
+ */
+static inline void
+ec_stripe_set_unmapped(struct ec_bdev *ec, uint64_t stripe_index)
+{
+	ec->stripe_unmapped_map[stripe_index / 64] |= (UINT64_C(1) << (stripe_index % 64));
+}
+
+static inline void
+ec_stripe_clear_unmapped(struct ec_bdev *ec, uint64_t stripe_index)
+{
+	ec->stripe_unmapped_map[stripe_index / 64] &= ~(UINT64_C(1) << (stripe_index % 64));
+}
+
+static inline bool
+ec_stripe_is_unmapped(const struct ec_bdev *ec, uint64_t stripe_index)
+{
+	return !!(ec->stripe_unmapped_map[stripe_index / 64] &
+		  (UINT64_C(1) << (stripe_index % 64)));
+}
+
+/*
  * Word-level bit ops on a standalone bitmap (a plain uint64_t[] array, not one
  * of the ec->stripe_* maps). The UNMAP staging shadow (uctx->staged_map) and
  * the bit-clear shadow (ec->clear_staged_map) are separate arrays that the
@@ -1329,5 +1353,16 @@ void ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
 		     struct spdk_bdev_io *bdev_io);
 int  ec_submit_read(struct ec_bdev_io *ec_io);
 int  ec_submit_write(struct ec_bdev_io *ec_io);
+
+/*
+ * Native UNMAP entry point. Defined in bdev_ec_unmap.c. UNMAP is
+ * unconditionally advertised by ec_io_type_supported because
+ * correctness is internal to bdev_ec (the in-band unmapped bitmap
+ * synthesizes zeros on read regardless of what the bases do on
+ * discard). Returns 0 on async submit, -EAGAIN for NOMEM requeue
+ * (busy stripe / bitmap persist in flight), -EINVAL for shapes the
+ * path cannot handle, -ENOMEM on alloc failure.
+ */
+int  ec_submit_unmap(struct ec_bdev_io *ec_io);
 
 #endif /* SPDK_BDEV_EC_INTERNAL_H */

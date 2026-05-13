@@ -833,6 +833,31 @@ ec_count_unmapped_stripes(const struct ec_bdev *ec)
 	return total;
 }
 
+int
+ec_bdev_get_unmap_status(const char *ec_name,
+			 uint64_t   *num_stripes,
+			 uint64_t   *unmapped_stripes,
+			 uint64_t   *blob_bytes,
+			 uint32_t   *generation,
+			 uint8_t    *active_copy,
+			 bool       *persist_pending)
+{
+	struct ec_bdev *ec = ec_bdev_find(ec_name);
+
+	if (!ec) {
+		return -ENODEV;
+	}
+
+	*num_stripes      = ec->num_stripes;
+	*unmapped_stripes = ec_count_unmapped_stripes(ec);
+	*blob_bytes       = ec_bitmap_blob_bytes(ec->num_stripes);
+	*generation       = ec->bitmap_generation;
+	*active_copy      = ec->bitmap_active_copy;
+	*persist_pending  = ec->bitmap_persist_in_flight;
+
+	return 0;
+}
+
 /* =========================================================================
  * Bit-clear waiter queue
  *
