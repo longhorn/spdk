@@ -138,6 +138,90 @@ ec_rebuild_finish(struct ec_rebuild_ctx *ctx, int rc)
 		}
 	}
 
+	if (rc == 0) {
+		/*
+		 * Transition all REPLACING slots that we successfully rebuilt.
+		 * We identify them by checking needs_rebuild[] because a slot
+		 * that failed a second time during the rebuild would have had
+		 * its needs_rebuild[] cleared by ec_handle_base_bdev_failure.
+		 *
+		 * This is sound only because new replacements cannot appear
+		 * mid-rebuild: ec_bdev_replace_base_bdev rejects with -EBUSY
+		 * while ec->rebuild_ctx is set. Every REPLACING slot still
+		 * carrying needs_rebuild[] was therefore present at rebuild
+		 * start and walked forward by ec_rebuild_move_to_next_slot.
+		 */
+		for (i = 0; i < ec->n; i++) {
+			if (ec->base_states[i] == EC_BASE_STATE_REPLACING &&
+			    ec->needs_rebuild[i]) {
+				ec->base_states[i]  = EC_BASE_STATE_NORMAL;
+				ec->needs_rebuild[i] = false;
+				ec->failed_count--;
+
+				SPDK_NOTICELOG("EC bdev %s: slot %u rebuild "
+					       "complete -- REPLACING -> NORMAL. "
+					       "failed_count now %u.\n",
+					       ec->bdev.name, i,
+					       ec->failed_count);
+
+				/*
+				 * Reopen WIB I/O channel for rebuilt parity
+				 * slots. The channel was released in
+				 * ec_handle_base_bdev_failure when the old
+				 * parity disk failed; now that the replacement
+				 * disk is NORMAL, WIB persists must resume
+				 * writing to it.
+				 */
+				if (i >= ec->k) {
+					uint32_t parity_idx = i - ec->k;
+					if (!ec->wib_chans[parity_idx] && ec->descs[i]) {
+						ec->wib_chans[parity_idx] = spdk_bdev_get_io_channel(ec->descs[i]);
+						if (!ec->wib_chans[parity_idx]) {
+							SPDK_WARNLOG("EC bdev %s: failed to reopen "
+								     "WIB channel for rebuilt parity "
+								     "slot %u\n",
+								     ec->bdev.name, i);
+						}
+					}
+				}
+			}
+		}
+		if (ec->offline && ec->failed_count <= ec->m) {
+			ec->offline = false;
+			SPDK_NOTICELOG("EC bdev %s: failed_count back to %u "
+				       "(<= m=%u), clearing offline flag\n",
+				       ec->bdev.name, ec->failed_count,
+				       ec->m);
+		}
+		{
+			uint64_t ticks_per_second = spdk_get_ticks_hz();
+			uint64_t elapsed_seconds  = ticks_per_second != 0 ?
+				(spdk_get_ticks() - ctx->start_ticks) / ticks_per_second : 0;
+			uint32_t wib_dirty        = ec_wib_count_dirty(ec);
+
+			SPDK_NOTICELOG("EC bdev %s: rebuild complete: "
+				       "%" PRIu64 " stripes written across %u "
+				       "slot(s) in %" PRIu64 "s; failed_count now %u; "
+				       "WIB dirty regions remaining: %u%s\n",
+				       ec->bdev.name, ctx->stripes_rebuilt,
+				       ctx->slots_to_rebuild, elapsed_seconds,
+				       ec->failed_count, wib_dirty,
+				       wib_dirty > 0 ? " (scrub will sweep them)" : "");
+		}
+
+		/*
+		 * If deferred-scrub guard was holding RMW backpressure (rebuild
+		 * needed to restore a failed data disk first), clear the flag.
+		 * If a scrub starts here it will install its own backpressure
+		 * episode when its active-scrub guard fires.
+		 */
+		ec_rmw_backpressure_end(ec, "rebuild restored failed slot");
+	} else {
+		SPDK_ERRLOG("EC bdev %s: rebuild aborted (rc=%d) after "
+			    "%" PRIu64 " stripes.\n",
+			    ec->bdev.name, rc, ctx->stripes_rebuilt);
+	}
+
 	ec_rebuild_free_resources(ctx);
 
 	ec->rebuild_ctx = NULL;
