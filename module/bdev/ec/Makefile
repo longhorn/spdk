@@ -8,8 +8,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 SO_VER := 1
 SO_MINOR := 0
 
-C_SRCS = bdev_ec.c bdev_ec_bitmap.c bdev_ec_rpc.c bdev_ec_io.c bdev_ec_rebuild.c \
-	 bdev_ec_resize.c bdev_ec_rmw.c bdev_ec_wib.c bdev_ec_unmap.c
+C_SRCS = bdev_ec.c
 
 LIBNAME = bdev_ec
 

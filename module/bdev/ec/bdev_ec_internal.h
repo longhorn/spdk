@@ -94,6 +94,12 @@
 /* Maximum number of base bdevs (data + parity) */
 #define EC_MAX_BASE_BDEVS 32
 
+/*
+ * Max chunk count (n = k + m, and each of k and m) the GF(2^8) Reed-Solomon
+ * field allows.
+ */
+#define EC_GF8_MAX_CHUNKS 255u
+
 /* Maximum length (including NUL) of an EC bdev or base-bdev name. */
 #define EC_BDEV_NAME_MAX 256
 
@@ -148,7 +154,23 @@ struct ec_bdev {
 	/* Generic SPDK bdev structure (must be first) */
 	struct spdk_bdev bdev;
 
-	/* EC Configuration */
+	/*
+	 * Thread that created the EC bdev and owns its persist state:
+	 * bitmap_chans[], pending_bit_clears, bitmap_persist_in_flight,
+	 * bitmap_active_copy, and bitmap_generation. SPDK bdev channels are
+	 * thread-affine and the persist serializes through this single writer,
+	 * so I/O-path callers on other reactors must route bitmap-persist
+	 * work here via spdk_thread_send_msg.
+	 */
+	struct spdk_thread *home_thread;
+
+	/*
+	 * EC configuration.
+	 *
+	 * strip_size_kb: user-configured per-chunk strip size in KiB.
+	 * strip_size:    per-chunk strip size in blocks (strip_size_kb * 1024 / blocklen).
+	 * stripe_blocks: full stripe in blocks (k * strip_size).
+	 */
 	uint32_t k;
 	uint32_t m;
 	uint32_t n;

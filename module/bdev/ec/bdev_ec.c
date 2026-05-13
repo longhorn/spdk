@@ -1,0 +1,1087 @@
+/*   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright (C) 2026 Longhorn Authors.
+ *   All rights reserved.
+ */
+
+/*
+ * bdev_ec.c -- module lifecycle, fn_table glue, failure detection,
+ * channel management, and hot-swap replace. Other subsystems live in
+ * the sibling bdev_ec_*.c files (each carries its own header).
+ *
+ * Threading: all state changes run on the EC bdev's home thread (the
+ * single SPDK reactor that created it). Cross-thread fanout uses
+ * spdk_for_each_channel walks. The full channel inventory is at the
+ * top of bdev_ec_internal.h under "CHANNEL INVENTORY".
+ */
+
+#include "bdev_ec_internal.h"
+#include "spdk/stdinc.h"
+#include "spdk/bdev.h"
+#include "spdk/bdev_module.h"
+#include "spdk/env.h"
+#include "spdk/log.h"
+#include "spdk/string.h"
+#include "spdk/util.h"
+#include "spdk/thread.h"
+
+/* ISA-L library header for Reed-Solomon erasure coding */
+#include <isa-l/erasure_code.h>
+
+struct ec_all_tailq g_ec_bdev_list = TAILQ_HEAD_INITIALIZER(g_ec_bdev_list);
+
+/* Forward declaration; defined near the bottom of this file. Used by
+ * _ec_bdev_create to wire the bdev fn_table at registration. */
+static const struct spdk_bdev_fn_table g_ec_fn_table;
+
+/* =========================================================================
+ * Module init / ctx size
+ * ========================================================================= */
+
+static int
+ec_bdev_init(void)
+{
+	return 0;
+}
+
+static int
+ec_bdev_get_ctx_size(void)
+{
+	return sizeof(struct ec_bdev_io);
+}
+
+struct spdk_bdev_module ec_if = {
+	.name         = "ec",
+	.module_init  = ec_bdev_init,
+	.get_ctx_size = ec_bdev_get_ctx_size,
+	.async_init   = false,
+	.async_fini   = false,
+};
+
+SPDK_BDEV_MODULE_REGISTER(ec, &ec_if)
+
+/* =========================================================================
+ * Helpers
+ * ========================================================================= */
+
+/*
+ * ec_free_runtime_arrays -- safe-to-repeat release of the per-bdev state
+ * arrays. Used both by ec_alloc_runtime_arrays on OOM unwind and by
+ * ec_bdev_free on destruct. Every pointer is NULLed so the helper can
+ * be called repeatedly without harm.
+ */
+static void
+ec_free_runtime_arrays(struct ec_bdev *ec)
+{
+	free(ec->stripe_dirty_map);
+	ec->stripe_dirty_map = NULL;
+
+	free(ec->stripe_unmapped_map);
+	ec->stripe_unmapped_map = NULL;
+
+	if (ec->wib_buf) {
+		spdk_dma_free(ec->wib_buf);
+		ec->wib_buf = NULL;
+	}
+	free(ec->wib_region_map);
+	ec->wib_region_map = NULL;
+
+	free(ec->wib_region_inflight);
+	ec->wib_region_inflight = NULL;
+
+	free(ec->wib_region_dirty_ticks);
+	ec->wib_region_dirty_ticks = NULL;
+
+	/*
+	 * Bit-clear waiter queues. By the time the bdev is being torn down
+	 * the I/O path is quiesced, so any still-queued waiters had their
+	 * bdev_io aborted upstream; drain them with -ECANCELED so the
+	 * callbacks (if any are still wired) don't leak state. The shadow
+	 * map is freed regardless.
+	 */
+	{
+		struct ec_pending_bit_clear *w, *tmp;
+
+		TAILQ_FOREACH_SAFE(w, &ec->pending_bit_clears, link, tmp) {
+			TAILQ_REMOVE(&ec->pending_bit_clears, w, link);
+			if (w->cb_fn) {
+				w->cb_fn(w->cb_arg, -ECANCELED);
+			}
+			free(w);
+		}
+		TAILQ_FOREACH_SAFE(w, &ec->in_flight_bit_clears, link, tmp) {
+			TAILQ_REMOVE(&ec->in_flight_bit_clears, w, link);
+			if (w->cb_fn) {
+				w->cb_fn(w->cb_arg, -ECANCELED);
+			}
+			free(w);
+		}
+	}
+	free(ec->clear_staged_map);
+	ec->clear_staged_map = NULL;
+}
+
+static void
+ec_bdev_free(struct ec_bdev *ec)
+{
+	if (!ec) {
+		return;
+	}
+	free(ec->bdev.name);
+	free(ec->encode_matrix);
+	free(ec->g_tbls);
+	ec_free_runtime_arrays(ec);
+	free(ec);
+}
+
+struct ec_bdev *
+ec_bdev_find(const char *name)
+{
+	struct ec_bdev *ec;
+
+	TAILQ_FOREACH(ec, &g_ec_bdev_list, link) {
+		if (strcmp(ec->bdev.name, name) == 0) {
+			return ec;
+		}
+	}
+	return NULL;
+}
+
+static void
+ec_close_base_bdevs(struct ec_bdev *ec)
+{
+	uint32_t i;
+
+	for (i = 0; i < ec->n; i++) {
+		if (ec->descs[i]) {
+			spdk_bdev_close(ec->descs[i]);
+			ec->descs[i] = NULL;
+		}
+	}
+}
+
+static int
+ec_open_base_bdevs(struct ec_bdev *ec, const char **base_bdev_names)
+{
+	struct spdk_bdev *base_bdev;
+	uint32_t          i;
+	int               rc;
+	bool              blocklen_set = false;
+
+	for (i = 0; i < ec->n; i++) {
+		/* Empty string means the slot is intentionally missing
+		 * (e.g., crash recovery with a failed disk). Mark it
+		 * FAILED and skip opening.
+		 */
+		if (base_bdev_names[i] == NULL ||
+		    base_bdev_names[i][0] == '\0') {
+			SPDK_NOTICELOG("EC bdev %s: slot %u marked FAILED "
+				       "(missing base bdev)\n",
+				       ec->bdev.name, i);
+			ec->descs[i]       = NULL;
+			ec->base_states[i] = EC_BASE_STATE_FAILED;
+			ec->failed_count++;
+			continue;
+		}
+
+		SPDK_NOTICELOG("Opening base bdev %s for EC bdev %s\n",
+			       base_bdev_names[i], ec->bdev.name);
+
+		rc = spdk_bdev_open_ext(base_bdev_names[i], true,
+					ec_base_bdev_event_cb, ec,
+					&ec->descs[i]);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to open base bdev %s: %s\n",
+				    base_bdev_names[i], spdk_strerror(-rc));
+			return rc;
+		}
+
+		base_bdev = spdk_bdev_desc_get_bdev(ec->descs[i]);
+
+		if (!blocklen_set) {
+			ec->bdev.blocklen = base_bdev->blocklen;
+			blocklen_set = true;
+		} else if (ec->bdev.blocklen != base_bdev->blocklen) {
+			SPDK_ERRLOG("Block length mismatch for %s\n",
+				    base_bdev_names[i]);
+			return -EINVAL;
+		}
+	}
+
+	if (!blocklen_set) {
+		SPDK_ERRLOG("EC bdev %s: all base bdevs are missing\n",
+			    ec->bdev.name);
+		return -EINVAL;
+	}
+
+	if (ec->failed_count > ec->m) {
+		SPDK_ERRLOG("EC bdev %s: too many missing slots (%u) "
+			    "exceeds fault tolerance m=%u\n",
+			    ec->bdev.name, ec->failed_count, ec->m);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * ec_compute_geometry -- pure derivation of EC bdev geometry from k, m,
+ * strip_size_kb, and the first open base bdev's blockcnt. No allocation,
+ * no side effects beyond filling in fields on ec. Returns -EINVAL on
+ * inputs that produce an unworkable layout; the caller has nothing to
+ * clean up on failure.
+ */
+static int
+ec_compute_geometry(struct ec_bdev *ec)
+{
+	uint64_t          min_blockcnt = UINT64_MAX;
+	uint64_t          max_blockcnt = 0;
+	uint32_t          gi;
+	uint64_t          total_physical_stripes;
+	uint64_t          map_bytes_needed;
+	uint64_t          wib_total_needed;
+	uint64_t          buf_available;
+
+	/*
+	 * Size the EC bdev to the smallest open base disk's blockcnt so no
+	 * user stripe can map past any one disk's EOF. The resize path uses
+	 * the same min(blockcnt) rule (bdev_ec_resize.c). Track max so a
+	 * mismatch surfaces in the log -- a heterogeneous create still
+	 * succeeds, but the wasted blocks on oversized slots are worth a
+	 * NOTICE so an operator can spot a provisioning typo.
+	 */
+	for (gi = 0; gi < ec->n; gi++) {
+		struct spdk_bdev *base;
+
+		if (!ec->descs[gi]) {
+			continue;
+		}
+		base = spdk_bdev_desc_get_bdev(ec->descs[gi]);
+		if (base->blockcnt < min_blockcnt) {
+			min_blockcnt = base->blockcnt;
+		}
+		if (base->blockcnt > max_blockcnt) {
+			max_blockcnt = base->blockcnt;
+		}
+	}
+	if (min_blockcnt == UINT64_MAX) {
+		SPDK_ERRLOG("EC bdev %s: no open base bdevs for geometry\n",
+			    ec->bdev.name);
+		return -EINVAL;
+	}
+	if (min_blockcnt != max_blockcnt) {
+		SPDK_NOTICELOG("EC bdev %s: base bdev capacities differ "
+			       "(min=%" PRIu64 ", max=%" PRIu64 " blocks); "
+			       "sizing to min, %" PRIu64 " blocks unused per oversized slot\n",
+			       ec->bdev.name, min_blockcnt, max_blockcnt,
+			       max_blockcnt - min_blockcnt);
+	}
+
+	ec->strip_size = ((uint64_t)ec->strip_size_kb * 1024) / ec->bdev.blocklen;
+	if (ec->strip_size == 0 ||
+	    ((uint64_t)ec->strip_size_kb * 1024) % ec->bdev.blocklen != 0) {
+		SPDK_ERRLOG("Invalid strip size: strip_size_kb=%u not a multiple "
+			    "of blocklen=%u\n", ec->strip_size_kb, ec->bdev.blocklen);
+		return -EINVAL;
+	}
+
+	/*
+	 * ec_encode_data() takes the chunk byte length as an int. Reject strips
+	 * larger than INT_MAX bytes, or the cast at the encode call sites
+	 * truncates the length and corrupts parity.
+	 */
+	if (ec->strip_size * ec->bdev.blocklen > (uint64_t)INT_MAX) {
+		SPDK_ERRLOG("EC bdev %s: strip size too large: strip_size_kb=%u "
+			    "(%" PRIu64 " bytes) exceeds the ISA-L per-chunk limit "
+			    "of %d bytes\n",
+			    ec->bdev.name, ec->strip_size_kb,
+			    (uint64_t)ec->strip_size * ec->bdev.blocklen, INT_MAX);
+		return -EINVAL;
+	}
+
+	ec->stripe_blocks = ec->k * ec->strip_size;
+
+	/*
+	 * Front-placed metadata:
+	 *   [ bitmap_reservation_strips ][ 2 WIB strips ][ user data ]
+	 *
+	 * Both regions are fixed-max and never move on resize. Only the
+	 * trailing user-data region grows. data_offset_stripes is the
+	 * combined reservation -- the LBA at which user stripe 0 lives on
+	 * every base disk. The same on all k+m disks; data disks reserve
+	 * the WIB strips even though they never write them, so the layout
+	 * computation uses one rule for every disk.
+	 *
+	 * A disk that cannot even hold the combined reservation is rejected
+	 * here; the WIB-fits-in-one-strip check still runs at the bottom of
+	 * this function as an independent invariant.
+	 */
+	total_physical_stripes  = min_blockcnt / ec->strip_size;
+
+	if (total_physical_stripes <= ec->data_offset_stripes) {
+		SPDK_ERRLOG("EC bdev %s: disk too small to reserve front "
+			    "metadata (physical stripes=%" PRIu64 ", "
+			    "data_offset_stripes=%" PRIu64 " = bitmap + 2 WIB strips)\n",
+			    ec->bdev.name, total_physical_stripes,
+			    ec->data_offset_stripes);
+		return -EINVAL;
+	}
+
+	ec->num_stripes   = total_physical_stripes - ec->data_offset_stripes;
+	ec->bdev.blockcnt = ec->num_stripes * ec->stripe_blocks;
+	ec->wib_num_regions = (uint32_t)((ec->num_stripes + EC_WIB_REGION_STRIPES - 1) /
+				EC_WIB_REGION_STRIPES);
+
+	/*
+	 * write_unit_size=1: allows sub-stripe writes (RMW path).
+	 * optimal_io_boundary=strip_size: SPDK splits cross-strip writes.
+	 * max_write_zeroes=0: WRITE_ZEROES is left unset so the bdev layer
+	 * auto-emulates it as a buffer-backed WRITE that respects
+	 * optimal_io_boundary. See ec_io_type_supported for the full rationale.
+	 */
+	ec->bdev.write_unit_size              = 1;
+	ec->bdev.optimal_io_boundary          = ec->strip_size;
+	ec->bdev.split_on_write_unit          = false;
+	ec->bdev.split_on_optimal_io_boundary = true;
+
+	/*
+	 * Publish max_unmap and max_unmap_segments derived from base bdevs.
+	 * SPDK splits an UNMAP request whose num_blocks exceeds max_unmap or
+	 * whose segment count exceeds max_unmap_segments. An EC-level UNMAP
+	 * fans out as one UNMAP per base bdev at num_blocks / k per slot, so
+	 * the EC-level limit is k * min(base->max_unmap). Segments pass
+	 * through 1:1. Zero on any base means "no limit" and is excluded from
+	 * the min; if every base reports zero, EC reports zero too (no
+	 * splitting). This sets the layer-above splitting boundary so a large
+	 * fstrim does not arrive at ec_submit_unmap larger than the smallest
+	 * base bdev can absorb in one operation.
+	 */
+	{
+		uint32_t min_max_unmap          = UINT32_MAX;
+		uint32_t min_max_unmap_segments = UINT32_MAX;
+		uint32_t i;
+		uint64_t max_unmap_blocks;
+
+		for (i = 0; i < ec->n; i++) {
+			struct spdk_bdev *base;
+
+			if (!ec->descs[i]) {
+				continue;
+			}
+			base = spdk_bdev_desc_get_bdev(ec->descs[i]);
+			if (base->max_unmap > 0) {
+				min_max_unmap = spdk_min(min_max_unmap,
+							 base->max_unmap);
+			}
+			if (base->max_unmap_segments > 0) {
+				min_max_unmap_segments =
+					spdk_min(min_max_unmap_segments,
+						 base->max_unmap_segments);
+			}
+		}
+		max_unmap_blocks = (uint64_t)min_max_unmap * ec->k;
+		ec->bdev.max_unmap = (min_max_unmap == UINT32_MAX) ? 0 :
+				     (uint32_t)spdk_min(max_unmap_blocks, (uint64_t)UINT32_MAX);
+		ec->bdev.max_unmap_segments =
+			(min_max_unmap_segments == UINT32_MAX) ?
+			0 : min_max_unmap_segments;
+
+		/*
+		 * Soft-cap max_unmap to one WIB region's worth of EC-level
+		 * blocks (EC_WIB_REGION_STRIPES * stripe_blocks). This is a
+		 * work bound, not a correctness requirement: ec_submit_unmap
+		 * handles UNMAPs that span multiple WIB regions (the whole-blob
+		 * bitmap persist has no region concept; the scrubber defers
+		 * region by region), so a larger request is served correctly.
+		 * Bounding it here just keeps one UNMAP from spanning many
+		 * regions and deferring behind the startup scrub. In typical
+		 * hardware (4 MiB base max_unmap, k=4, 64 KiB strip -> 16 MiB
+		 * EC max_unmap, 256 MiB WIB region) the cap never fires. The
+		 * value is EC-level blocks; each base bdev sees num_blocks / k
+		 * after fan-out.
+		 */
+		{
+			uint64_t wib_region_blocks =
+				EC_WIB_REGION_STRIPES * ec->stripe_blocks;
+			if (ec->bdev.max_unmap == 0 ||
+			    ec->bdev.max_unmap > wib_region_blocks) {
+				ec->bdev.max_unmap =
+					(wib_region_blocks > UINT32_MAX) ?
+					UINT32_MAX : (uint32_t)wib_region_blocks;
+			}
+		}
+	}
+
+	/*
+	 * Validate that one strip is large enough to hold the WIB on-disk
+	 * layout: sizeof(ec_wib_header) + ceil(wib_num_regions/64)*8 + 4 (CRC).
+	 * This is guaranteed for any realistic strip size / disk size combination,
+	 * but we check explicitly to catch edge cases (very small strips on very
+	 * large disks) before silently producing a too-small buffer.
+	 */
+	map_bytes_needed = ((uint64_t)EC_BITMAP_WORDS(ec->wib_num_regions))
+			    * sizeof(uint64_t);
+	wib_total_needed = sizeof(struct ec_wib_header) + map_bytes_needed
+			    + sizeof(uint32_t);  /* CRC */
+	buf_available    = (uint64_t)ec->strip_size * ec->bdev.blocklen;
+	if (wib_total_needed > buf_available) {
+		SPDK_ERRLOG("EC bdev %s: WIB on-disk layout (%" PRIu64 " bytes) "
+			    "exceeds one strip (%" PRIu64 " bytes). "
+			    "Increase strip_size_kb or reduce disk size.\n",
+			    ec->bdev.name, wib_total_needed, buf_available);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * ec_alloc_runtime_arrays -- allocate the per-bdev state arrays, sized from
+ * the geometry in ec. Called once at create on a fresh ec, never on a live
+ * bdev. On OOM, frees the partial allocations so the caller can free ec.
+ */
+static int
+ec_alloc_runtime_arrays(struct ec_bdev *ec)
+{
+	uint64_t map_words        = EC_BITMAP_WORDS(ec->num_stripes);
+	uint64_t wib_region_words = EC_BITMAP_WORDS(ec->wib_num_regions);
+
+	assert(ec->wib_region_map == NULL);
+
+	ec->stripe_dirty_map = calloc(map_words, sizeof(uint64_t));
+	if (!ec->stripe_dirty_map) {
+		SPDK_ERRLOG("EC bdev %s: OOM for stripe_dirty_map "
+			    "(%" PRIu64 " stripes, %" PRIu64 " words)\n",
+			    ec->bdev.name, ec->num_stripes, map_words);
+		goto err;
+	}
+
+	ec->stripe_unmapped_map = calloc(map_words, sizeof(uint64_t));
+	if (!ec->stripe_unmapped_map) {
+		SPDK_ERRLOG("EC bdev %s: OOM for stripe_unmapped_map "
+			    "(%" PRIu64 " stripes, %" PRIu64 " words)\n",
+			    ec->bdev.name, ec->num_stripes, map_words);
+		goto err;
+	}
+
+	ec->wib_region_map = calloc(wib_region_words, sizeof(uint64_t));
+	if (!ec->wib_region_map) {
+		SPDK_ERRLOG("EC bdev %s: OOM for wib_region_map "
+			    "(%u regions, %" PRIu64 " words)\n",
+			    ec->bdev.name, ec->wib_num_regions, wib_region_words);
+		goto err;
+	}
+
+	ec->wib_region_inflight = calloc(ec->wib_num_regions, sizeof(uint32_t));
+	if (!ec->wib_region_inflight) {
+		SPDK_ERRLOG("EC bdev %s: OOM for wib_region_inflight "
+			    "(%u regions, %" PRIu64 " bytes)\n",
+			    ec->bdev.name, ec->wib_num_regions,
+			    (uint64_t)ec->wib_num_regions * sizeof(uint32_t));
+		goto err;
+	}
+
+	ec->wib_region_dirty_ticks = calloc(ec->wib_num_regions, sizeof(uint64_t));
+	if (!ec->wib_region_dirty_ticks) {
+		SPDK_ERRLOG("EC bdev %s: OOM for wib_region_dirty_ticks "
+			    "(%u regions, %" PRIu64 " bytes)\n",
+			    ec->bdev.name, ec->wib_num_regions,
+			    (uint64_t)ec->wib_num_regions * sizeof(uint64_t));
+		goto err;
+	}
+
+	{
+		uint64_t wib_buf_bytes = ec->strip_size * ec->bdev.blocklen;
+
+		ec->wib_buf = spdk_dma_zmalloc(wib_buf_bytes, EC_DMA_ALIGN, NULL);
+		if (!ec->wib_buf) {
+			SPDK_ERRLOG("EC bdev %s: OOM for wib_buf "
+				    "(%" PRIu64 " bytes)\n",
+				    ec->bdev.name, wib_buf_bytes);
+			goto err;
+		}
+	}
+
+	/* Scalar / pointer / array fields are already zeroed by the calloc
+	 * in _ec_bdev_create; only the list heads need explicit init. */
+	TAILQ_INIT(&ec->wib_deferred_writes);
+	TAILQ_INIT(&ec->pending_bit_clears);
+	TAILQ_INIT(&ec->in_flight_bit_clears);
+
+	SPDK_DEBUGLOG(bdev_ec,
+		"EC bdev %s: runtime arrays allocated -- %" PRIu64 " stripes, "
+		"dirty map %" PRIu64 " bytes, WIB %u regions\n",
+		ec->bdev.name, ec->num_stripes, map_words * sizeof(uint64_t),
+		ec->wib_num_regions);
+
+	return 0;
+
+err:
+	ec_free_runtime_arrays(ec);
+	return -ENOMEM;
+}
+
+static int
+ec_init_isa_l_tables(struct ec_bdev *ec)
+{
+	/*
+	 * gf_gen_rs_matrix(a, n, k) writes n*k bytes:
+	 *   rows 0..k-1  = kxk identity matrix (data rows)
+	 *   rows k..n-1  = mxk parity generator rows
+	 *
+	 * ec_init_tables(k, m, &a[k*k], g_tbls) uses only the m parity rows
+	 * (starting at byte offset k*k) and writes 32*k*m bytes to g_tbls.
+	 *
+	 * We must allocate n*k bytes for encode_matrix so gf_gen_rs_matrix can
+	 * write all n rows. Allocating only m*k underallocates by k*k bytes and
+	 * causes a buffer overrun for m < k.
+	 */
+	ec->encode_matrix = malloc(ec->n * ec->k);
+	if (!ec->encode_matrix) {
+		SPDK_ERRLOG("EC bdev %s: OOM for encode_matrix "
+			    "(%u bytes, n=%u k=%u)\n",
+			    ec->bdev.name, ec->n * ec->k, ec->n, ec->k);
+		return -ENOMEM;
+	}
+
+	ec->g_tbls = malloc(32 * ec->k * ec->m);
+	if (!ec->g_tbls) {
+		SPDK_ERRLOG("EC bdev %s: OOM for g_tbls (%u bytes, k=%u m=%u)\n",
+			    ec->bdev.name, 32 * ec->k * ec->m, ec->k, ec->m);
+		free(ec->encode_matrix);
+		ec->encode_matrix = NULL;
+		return -ENOMEM;
+	}
+
+	gf_gen_rs_matrix(ec->encode_matrix, ec->n, ec->k);
+	ec_init_tables(ec->k, ec->m, &ec->encode_matrix[ec->k * ec->k], ec->g_tbls);
+
+	return 0;
+}
+
+static int
+_ec_bdev_create(const char *name, uint32_t strip_size_kb, uint32_t k, uint32_t m,
+		const struct spdk_uuid *uuid, struct ec_bdev **ec_bdev_out)
+{
+	struct ec_bdev   *ec;
+	struct spdk_bdev *ec_bdev_gen;
+	uint32_t          num_base_bdevs = k + m;
+	int               rc;
+
+	if (strnlen(name, EC_BDEV_NAME_MAX) == EC_BDEV_NAME_MAX) {
+		SPDK_ERRLOG("EC bdev name '%s' exceeds %d characters\n",
+			    name, EC_BDEV_NAME_MAX - 1);
+		return -EINVAL;
+	}
+
+	if (spdk_bdev_get_by_name(name) != NULL) {
+		SPDK_ERRLOG("Duplicate EC bdev name: %s\n", name);
+		return -EEXIST;
+	}
+
+	/*
+	 * Bound k and m individually before relying on their sum: the addition
+	 * is done in uint32_t and a JSON-RPC caller can pass huge values that
+	 * wrap k+m to a small number, bypassing the n>255 / EC_MAX_BASE_BDEVS
+	 * checks below while leaving the huge values stored in ec->k / ec->m
+	 * where gf_gen_rs_matrix() and ec_init_isa_l_tables() use them for
+	 * memory sizing. Capping each at 255 (the GF(2^8) limit, and the natural
+	 * ceiling for n=k+m) keeps the sum and every downstream allocation
+	 * bounded.
+	 */
+	if (k == 0 || k > EC_GF8_MAX_CHUNKS || m == 0 || m > EC_GF8_MAX_CHUNKS) {
+		SPDK_ERRLOG("Invalid EC geometry: k=%u m=%u (must be in 1..255)\n",
+			    k, m);
+		return -EINVAL;
+	}
+
+	/*
+	 * ISA-L GF(2^8) constraint: n = k+m must not exceed 255.
+	 *
+	 * gf_gen_rs_matrix() (isa-l/erasure_code/ec_base.c) builds each
+	 * parity row from a different power of 2: 2^0, 2^1, 2^2, and so
+	 * on. In GF(2^8) only 255 of these are distinct -- at 2^255 the
+	 * sequence wraps back to 1 -- so more than 255 rows reuse an
+	 * earlier power. Two rows built from the same power come out
+	 * identical, and identical rows break recovery: the parity can
+	 * no longer rebuild data from every set of k surviving disks.
+	 */
+	if (num_base_bdevs > EC_GF8_MAX_CHUNKS) {
+		SPDK_ERRLOG("Invalid EC geometry: n = k+m = %u exceeds GF(2^8) "
+			    "limit of 255\n", num_base_bdevs);
+		return -EINVAL;
+	}
+
+	if (num_base_bdevs > EC_MAX_BASE_BDEVS) {
+		SPDK_ERRLOG("Too many base bdevs %u (max %d)\n",
+			    num_base_bdevs, EC_MAX_BASE_BDEVS);
+		return -EINVAL;
+	}
+
+	if (strip_size_kb == 0 || spdk_u32_is_pow2(strip_size_kb) == false) {
+		SPDK_ERRLOG("Invalid strip size %" PRIu32 "\n", strip_size_kb);
+		return -EINVAL;
+	}
+
+	ec = calloc(1, sizeof(*ec));
+	if (!ec) {
+		SPDK_ERRLOG("OOM for ec_bdev struct (%" PRIu64 " bytes)\n",
+			    (uint64_t)sizeof(*ec));
+		return -ENOMEM;
+	}
+
+	ec->k             = k;
+	ec->m             = m;
+	ec->n             = num_base_bdevs;
+	ec->strip_size_kb = strip_size_kb;
+
+	rc = ec_init_isa_l_tables(ec);
+	if (rc != 0) {
+		ec_bdev_free(ec);
+		return rc;
+	}
+
+	ec_bdev_gen = &ec->bdev;
+	ec_bdev_gen->name = strdup(name);
+	if (!ec_bdev_gen->name) {
+		ec_bdev_free(ec);
+		return -ENOMEM;
+	}
+
+	ec_bdev_gen->product_name = "ErasureCode Volume";
+	ec_bdev_gen->ctxt         = ec;
+	ec_bdev_gen->fn_table     = &g_ec_fn_table;
+	ec_bdev_gen->module       = &ec_if;
+	ec_bdev_gen->write_cache  = 0;
+
+	if (uuid) {
+		spdk_uuid_copy(&ec_bdev_gen->uuid, uuid);
+	}
+
+	TAILQ_INSERT_TAIL(&g_ec_bdev_list, ec, link);
+
+	*ec_bdev_out = ec;
+	return 0;
+}
+
+/* =========================================================================
+ * I/O channel management
+ * ========================================================================= */
+
+static int
+ec_create_ch(void *io_device, void *ctx_buf)
+{
+	struct ec_bdev       *ec    = io_device;
+	struct ec_io_channel *ec_ch = ctx_buf;
+	uint32_t              i;
+
+	for (i = 0; i < ec->n; i++) {
+		/* FAILED: no descriptor. REPLACING: descriptor is live. */
+		if (ec->base_states[i] == EC_BASE_STATE_FAILED || !ec->descs[i]) {
+			ec_ch->base_chans[i] = NULL;
+			continue;
+		}
+
+		ec_ch->base_chans[i] = spdk_bdev_get_io_channel(ec->descs[i]);
+		if (!ec_ch->base_chans[i]) {
+			SPDK_ERRLOG("Failed to get I/O channel for base bdev "
+				    "index %u\n", i);
+			goto err_cleanup;
+		}
+	}
+
+	return 0;
+
+err_cleanup:
+	while (i > 0) {
+		i--;
+		if (ec_ch->base_chans[i]) {
+			spdk_put_io_channel(ec_ch->base_chans[i]);
+			ec_ch->base_chans[i] = NULL;
+		}
+	}
+	return -ENOMEM;
+}
+
+static void
+ec_destroy_ch(void *io_device, void *ctx_buf)
+{
+	struct ec_io_channel *ec_ch = ctx_buf;
+	struct ec_bdev       *ec    = io_device;
+	uint32_t              i;
+
+	for (i = 0; i < ec->n; i++) {
+		if (ec_ch->base_chans[i]) {
+			spdk_put_io_channel(ec_ch->base_chans[i]);
+			ec_ch->base_chans[i] = NULL;
+		}
+	}
+}
+
+/* =========================================================================
+ * Public creation / deletion
+ * ========================================================================= */
+
+static void ec_device_unregister_done(void *io_device);
+static void ec_release_dedicated_channels(struct ec_bdev *ec);
+/* ec_scrub_free_resources declared in bdev_ec_internal.h. */
+
+/*
+ * Context threaded through the async ec_bdev_create_async chain:
+ * WIB load (ec_wib_load_async) -> bitmap load (ec_bitmap_load_async) ->
+ * finalize (ec_bdev_create_finalize), which starts the scrub and gates the
+ * caller's done_fn on bdev_examine completion.
+ */
+struct ec_bdev_create_async_ctx {
+	struct ec_bdev       *ec;
+	ec_bdev_create_cb_fn done_fn;
+	void                 *done_arg;
+	int                   deferred_rc;  /* rc preserved across async unregister teardown
+					      * (set on any create-failure path) */
+	bool                  salvage_requested;
+};
+
+/*
+ * ec_bdev_create_examine_done -- fires after bdev_examine on the newly
+ * registered EC bdev has completed. Releases the create context and
+ * signals success to the caller.
+ *
+ * Gating the JSON-RPC reply here closes a race where callers doing
+ * examine-dependent discovery (e.g., bdev_lvol_get_lvstores for a
+ * pre-existing lvstore on the encoded blocks during a salvage flow)
+ * would otherwise see the lvstore as missing because the lvol module's
+ * async examine_disk chain had not yet completed.
+ */
+static void
+ec_bdev_create_examine_done(void *cb_arg)
+{
+	struct ec_bdev_create_async_ctx *ctx = cb_arg;
+	ec_bdev_create_cb_fn done_fn = ctx->done_fn;
+	void *done_arg = ctx->done_arg;
+
+	free(ctx);
+	done_fn(done_arg, 0);
+}
+
+/*
+ * Post-WIB-load finalization. Starts the background scrub if dirty regions
+ * were found, then gates the caller's done_fn on bdev_examine completion.
+ * Extracted so the self-test path can dispatch into the same flow on success.
+ */
+static void
+ec_bdev_create_finalize(struct ec_bdev_create_async_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+	int             rc;
+	if (rc != 0) {
+		SPDK_WARNLOG("EC bdev %s: failed to start startup scrub "
+			     "(rc=%d); parity may be stale in dirty regions\n",
+			     ec->bdev.name, rc);
+		/* Non-fatal */
+	}
+
+	SPDK_NOTICELOG("Created EC bdev %s (k=%u m=%u, WIB %u regions%s)\n",
+		       ec->bdev.name, ec->k, ec->m, ec->wib_num_regions,
+		       ec->scrub_ctx ? ", scrub in progress" : "");
+
+	/*
+	 * Gate the create-completion callback on bdev_examine.
+	 * spdk_bdev_register dispatched examine_disk callbacks asynchronously;
+	 * modules like vbdev_lvol do I/O through this EC bdev to import an
+	 * existing lvstore, and that I/O typically outlives the WIB load.
+	 * Without this wait, ec_bdev_create_async's caller could observe
+	 * the create as complete before lvol examine has registered the
+	 * lvstore, causing salvage-mode discovery to fail.
+	 *
+	 * spdk_bdev_wait_for_examine waits on every bdev module's
+	 * action_in_progress counter globally, not just on this bdev's
+	 * examines. In our typical workload, bdev create RPCs are
+	 * serialized enough that this coupling is invisible.
+	 */
+	rc = spdk_bdev_wait_for_examine(ec_bdev_create_examine_done, ctx);
+	if (rc != 0) {
+		ec_bdev_create_cb_fn done_fn = ctx->done_fn;
+		void *done_arg = ctx->done_arg;
+
+		SPDK_WARNLOG("EC bdev %s: spdk_bdev_wait_for_examine failed: %s; "
+			     "completing create without examine gate (caller may race)\n",
+			     ec->bdev.name, spdk_strerror(-rc));
+		free(ctx);
+		done_fn(done_arg, 0);
+	}
+}
+
+
+/*
+ * Async-unregister callback after a create-time failure. By the time
+ * this fires the ec_bdev is gone; the rc to report was preserved on
+ * the create ctx as deferred_rc by whichever upstream branch issued
+ * the unregister.
+ */
+static void
+ec_bdev_create_unregister_done(void *cb_arg, int unregister_rc)
+{
+	struct ec_bdev_create_async_ctx *ctx = cb_arg;
+	ec_bdev_create_cb_fn done_fn = ctx->done_fn;
+	void *done_arg = ctx->done_arg;
+	int rc = ctx->deferred_rc;
+
+	(void)unregister_rc;  /* deferred_rc is the user-meaningful failure */
+	free(ctx);
+	done_fn(done_arg, rc);
+}
+static int
+ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, uint32_t m,
+		     const char **base_bdev_names, const struct spdk_uuid *uuid,
+		     ec_bdev_create_cb_fn done_fn, void *done_arg)
+{
+	struct ec_bdev                  *ec;
+	struct ec_bdev_create_async_ctx *ctx;
+	int      rc;
+	bool     io_device_registered = false;
+
+	rc = _ec_bdev_create(name, strip_size_kb, k, m, uuid, &ec);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/*
+	 * Capture this thread as the home thread. The subsequent
+	 * spdk_bdev_get_io_channel calls all run here, so the cached
+	 * bitmap_chans[] / wib_chans[] are bound to this thread. Only this
+	 * thread writes the persist coordination state
+	 * (bitmap_persist_in_flight, bitmap_active_copy, bitmap_generation,
+	 * pending_bit_clears); off-thread callers route their work here via
+	 * spdk_thread_send_msg.
+	 */
+	ec->home_thread = spdk_get_thread();
+
+	if (spdk_uuid_is_null(&ec->bdev.uuid)) {
+		spdk_uuid_generate(&ec->bdev.uuid);
+	}
+
+	rc = ec_open_base_bdevs(ec, base_bdev_names);
+	if (rc != 0) {
+		goto error_cleanup;
+	}
+
+	rc = ec_compute_geometry(ec);
+	if (rc != 0) {
+		goto error_cleanup;
+	}
+
+	rc = ec_alloc_runtime_arrays(ec);
+	if (rc != 0) {
+		goto error_cleanup;
+	}
+
+	spdk_io_device_register(ec, ec_create_ch, ec_destroy_ch,
+				sizeof(struct ec_io_channel), name);
+	io_device_registered = true;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("EC bdev %s: OOM for create ctx\n", name);
+		rc = -ENOMEM;
+		goto error_cleanup;
+	}
+
+	rc = spdk_bdev_register(&ec->bdev);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to register EC bdev %s: %s\n",
+			    name, spdk_strerror(-rc));
+		/*
+		 * ctx belongs to this function only until ec_wib_load_async takes
+		 * it below; register failure is the one error path inside that
+		 * window, so free it here.
+		 */
+		free(ctx);
+		goto error_cleanup;
+	}
+	ec->bdev_registered = true;
+
+	ctx->ec       = ec;
+	ctx->done_fn  = done_fn;
+	ctx->done_arg = done_arg;
+
+	ec_bdev_create_finalize(ctx);
+	return 0;
+
+error_cleanup:
+	ec_release_dedicated_channels(ec);
+	TAILQ_REMOVE(&g_ec_bdev_list, ec, link);
+	if (io_device_registered) {
+		spdk_io_device_unregister(ec, ec_device_unregister_done);
+	} else {
+		ec_close_base_bdevs(ec);
+		ec_bdev_free(ec);
+	}
+	return rc;
+}
+
+/*
+ * Release the dedicated WIB and bitmap I/O channels and stop the WIB idle
+ * poller. Each channel is NULL-checked and NULLed, so this is safe on both
+ * the create-error and device-unregister paths.
+ */
+static void
+ec_release_dedicated_channels(struct ec_bdev *ec)
+{
+	uint32_t i;
+
+	if (ec->wib_poller) {
+		spdk_poller_unregister(&ec->wib_poller);
+	}
+	for (i = 0; i < ec->m; i++) {
+		if (ec->wib_chans[i]) {
+			spdk_put_io_channel(ec->wib_chans[i]);
+			ec->wib_chans[i] = NULL;
+		}
+	}
+	for (i = 0; i < ec->n; i++) {
+		if (ec->bitmap_chans[i]) {
+			spdk_put_io_channel(ec->bitmap_chans[i]);
+			ec->bitmap_chans[i] = NULL;
+		}
+	}
+}
+
+static void
+ec_device_unregister_done(void *io_device)
+{
+	struct ec_bdev *ec = io_device;
+
+	ec_release_dedicated_channels(ec);
+
+	/* All per-thread channels destroyed; safe to close descriptors. */
+	ec_close_base_bdevs(ec);
+
+	/*
+	 * Only complete the destruct protocol for a bdev that was actually
+	 * registered. The create-failure teardown path reaches this same
+	 * io_device-unregister callback (to release the io_device) before
+	 * spdk_bdev_register has succeeded; calling spdk_bdev_destruct_done on
+	 * a never-registered bdev is a bdev-layer protocol violation.
+	 */
+	if (ec->bdev_registered) {
+		spdk_bdev_destruct_done(&ec->bdev, 0);
+	}
+	ec_bdev_free(ec);
+}
+
+static int
+ec_destruct(void *ctx)
+{
+	struct ec_bdev *ec = ctx;
+
+	TAILQ_REMOVE(&g_ec_bdev_list, ec, link);
+
+	/*
+	 * Async: ec_destroy_ch runs on every thread to put base_chans[] refs.
+	 * ec_device_unregister_done fires when all channels are torn down.
+	 */
+	spdk_io_device_unregister(ec, ec_device_unregister_done);
+	return 1;  /* async destruct */
+}
+
+/* =========================================================================
+ * bdev fn_table callbacks
+ * ========================================================================= */
+
+static bool
+ec_io_type_supported(void *ctx, enum spdk_bdev_io_type type)
+{
+	(void)ctx;
+
+	switch (type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		return true;
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		/*
+		 * Native WRITE_ZEROES is intentionally NOT advertised.
+		 *
+		 * The SPDK bdev layer splits WRITE_ZEROES purely by size
+		 * (max_write_zeroes) and does not honor optimal_io_boundary,
+		 * so a sub-stripe-aligned WRITE_ZEROES can straddle a stripe
+		 * boundary and arrive at the RMW path with
+		 * (stripe_off_blocks + num_blocks) > stripe_blocks. That
+		 * overruns the per-stripe scratch buffer and corrupts the
+		 * heap.
+		 *
+		 * Returning false here lets the bdev layer auto-emulate
+		 * WRITE_ZEROES as a regular zero-buffer WRITE, which then
+		 * goes through optimal_io_boundary splitting like any other
+		 * write and lands on the RMW / full-stripe paths correctly
+		 * bounded. UNMAP retains the is_zero_fill RMW shortcut
+		 * because it sets the flag itself (bdev_ec_unmap.c).
+		 */
+		return false;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		/*
+		 * Native UNMAP is always supported under the in-band
+		 * unmapped-bitmap design: correctness comes from the EC
+		 * layer's own per-stripe bitmap (every read consults it
+		 * before issuing base I/O), independent of whether any
+		 * particular base bdev deallocates-to-zero on discard. The
+		 * physical UNMAP fan-out is best-effort space reclamation;
+		 * a slot that fails to reclaim just wastes space, it cannot
+		 * resurrect non-zero data because no reader trusts a
+		 * discarded range. See bdev_ec_unmap.c.
+		 */
+		return true;
+	default:
+		return false;
+	}
+}
+
+static struct spdk_io_channel *
+ec_get_io_channel(void *ctx)
+{
+	struct ec_bdev *ec = ctx;
+	return spdk_get_io_channel(ec);
+}
+
+static void
+ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(bdev_io);
+
+	if (ec->offline) {
+		SPDK_DEBUGLOG(bdev_ec, "EC bdev %s OFFLINE -- rejecting I/O\n", ec->bdev.name);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_RESET:
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		return;
+	default:
+		SPDK_ERRLOG("Invalid IO type %d\n", bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+}
+
+static const struct spdk_bdev_fn_table g_ec_fn_table = {
+	.destruct          = ec_destruct,
+	.submit_request    = ec_submit_request,
+	.io_type_supported = ec_io_type_supported,
+	.get_io_channel    = ec_get_io_channel,
+	.dump_info_json    = ec_dump_info_json,
+	.write_config_json = ec_write_config_json,
+};
+
+void
+ec_bdev_delete(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
+{
+	int rc;
+
+	rc = spdk_bdev_unregister_by_name(name, &ec_if, cb_fn, cb_arg);
+	if (rc != 0) {
+		cb_fn(cb_arg, rc);
+	}
+}
+
+SPDK_LOG_REGISTER_COMPONENT(bdev_ec)
