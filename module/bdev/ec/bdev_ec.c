@@ -675,6 +675,7 @@ ec_compute_geometry(struct ec_bdev *ec)
 	 * this function as an independent invariant.
 	 */
 	total_physical_stripes  = min_blockcnt / ec->strip_size;
+	ec->data_offset_stripes = ec_bitmap_reservation_stripes(ec) + 2;
 
 	if (total_physical_stripes <= ec->data_offset_stripes) {
 		SPDK_ERRLOG("EC bdev %s: disk too small to reserve front "
@@ -1640,6 +1641,8 @@ ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 				     ec->writes_into_unmapped);
 	spdk_json_write_named_uint64(w, "writes_into_unmapped_failed",
 				     ec->writes_into_unmapped_failed);
+	spdk_json_write_named_uint64(w, "unmapped_stripes",
+				     ec_count_unmapped_stripes(ec));
 	spdk_json_write_named_uint64(w, "degraded_reads_reconstructed",
 				     ec->degraded_reads_reconstructed);
 }

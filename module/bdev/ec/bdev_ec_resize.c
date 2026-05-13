@@ -73,6 +73,118 @@ ec_resize_finish(struct ec_resize_ctx *ctx, int rc)
 }
 
 /*
+ * Reallocate the per-stripe in-memory bitmaps to match the new geometry:
+ *
+ *   stripe_dirty_map      -- transient RMW interlock; cleared by quiesce,
+ *                            so the old content is discarded.
+ *   stripe_unmapped_map   -- persistent allocation state; old content is
+ *                            preserved via memcpy. Newly added stripes
+ *                            initialise to mapped (bit=0) since the
+ *                            underlying lvol/blob extension reads back as
+ *                            zero, so a read of a new stripe returns
+ *                            zeros via the normal data path. Marking new
+ *                            stripes UNMAPPED as a read-side optimisation
+ *                            is a future improvement; for crash-safety
+ *                            either initialisation is correct.
+ *
+ * Both reallocations are treated atomically: either both succeed and
+ * geometry expands, or neither does and num_stripes clamps back to the
+ * old geometry. A partial expansion would leave one map sized for new and
+ * the other for old, with OOB heap access on the very next I/O.
+ *
+ * Without the unmapped-map realloc here, ec_stripe_{set,clear,is}_unmapped
+ * indexes past the end of the old allocation as soon as
+ * spdk_bdev_unquiesce_range below resumes I/O on the expanded address
+ * space, corrupting the heap. libc detects the corruption on the next
+ * free() ("double free or corruption (out)") and aborts the process.
+ *
+ * Called from ec_resize_quiesce_cb after the WIB region arrays have been
+ * reallocated. Finishes the resize on success or after an OOM clamp.
+ */
+static void
+ec_resize_realloc_stripe_bitmaps(struct ec_resize_ctx *ctx)
+{
+	struct ec_bdev *ec               = ctx->ec;
+	uint64_t        new_num_stripes  = ec->num_stripes;
+	uint64_t        old_num_stripes  = ctx->old_blockcnt / ec->stripe_blocks;
+	uint64_t        new_map_words    = EC_BITMAP_WORDS(new_num_stripes);
+	uint64_t        old_map_words    = EC_BITMAP_WORDS(old_num_stripes);
+	uint64_t       *new_dirty_map;
+	uint64_t       *new_unmapped_map;
+
+	new_dirty_map    = calloc(new_map_words, sizeof(uint64_t));
+	new_unmapped_map = calloc(new_map_words, sizeof(uint64_t));
+
+	if (new_dirty_map && new_unmapped_map) {
+		/*
+		 * Preserve persistent unmapped bits across the resize. New
+		 * stripes [old_num_stripes, new_num_stripes) are zeroed by
+		 * calloc (mapped). dirty_map starts fresh -- quiesce
+		 * guarantees no RMW is in flight, so old content is
+		 * discardable.
+		 */
+		memcpy(new_unmapped_map, ec->stripe_unmapped_map,
+		       old_map_words * sizeof(uint64_t));
+
+		free(ec->stripe_dirty_map);
+		ec->stripe_dirty_map = new_dirty_map;
+
+		free(ec->stripe_unmapped_map);
+		ec->stripe_unmapped_map = new_unmapped_map;
+	} else {
+		/*
+		 * OOM on either map -- clamp geometry back to what the
+		 * old allocations cover. Partial expansion would set us
+		 * up for heap OOB on the next I/O to a stripe past
+		 * old_num_stripes.
+		 */
+		free(new_dirty_map);
+		free(new_unmapped_map);
+
+		SPDK_WARNLOG("EC bdev %s: resize -- OOM for per-stripe "
+			     "bitmaps; clamping to old geometry\n",
+			     ec->bdev.name);
+
+		ec->num_stripes = old_num_stripes;
+
+		/*
+		 * Step 2 already grew the WIB arrays to the new geometry.
+		 * Clamp wib_num_regions back to match the rolled-back
+		 * num_stripes so WIB status and the next persist report the
+		 * correct region count; the larger WIB allocations simply
+		 * keep unused tail capacity until the next resize or teardown.
+		 */
+		ec->wib_num_regions = (uint32_t)
+			((old_num_stripes + EC_WIB_REGION_STRIPES - 1) /
+			 EC_WIB_REGION_STRIPES);
+
+		memset(ec->stripe_dirty_map, 0,
+		       old_map_words * sizeof(uint64_t));
+		/*
+		 * stripe_unmapped_map is left as-is: its content remains
+		 * valid at the clamped (old) size.
+		 */
+	}
+
+	if (ec->num_stripes == old_num_stripes) {
+		/*
+		 * Did not grow: ec_bdev_resize rejects no-op requests with
+		 * -EALREADY before quiesce, so reaching here means an OOM
+		 * clamp fired in ec_resize_realloc_wib_arrays or in the
+		 * per-stripe realloc above. Report -ENOMEM so the caller can
+		 * distinguish a clamped no-grow from a real resize.
+		 * ec_resize_finish still unquiesces; the
+		 * spdk_bdev_notify_blockcnt_change call inside it is a no-op
+		 * because committed_blockcnt equals the old value after clamp.
+		 */
+		ec_resize_finish(ctx, -ENOMEM);
+		return;
+	}
+
+	ec_resize_finish(ctx, 0);
+}
+
+/*
  * Reallocate the WIB region arrays for the new (larger) geometry. On OOM the
  * new arrays are discarded and num_stripes is clamped to what the existing WIB
  * coverage supports. wib_buf itself is not reallocated (it is one strip,
@@ -203,6 +315,12 @@ ec_resize_quiesce_cb(void *cb_arg, int status)
 	 * idle poller (see the concurrency note atop ec_bdev_resize).
 	 */
 	ec_resize_realloc_wib_arrays(ctx);
+
+	/*
+	 * Step 3: Reallocate per-stripe bitmaps. Terminates the resize
+	 * (calls ec_resize_finish).
+	 */
+	ec_resize_realloc_stripe_bitmaps(ctx);
 }
 
 /*

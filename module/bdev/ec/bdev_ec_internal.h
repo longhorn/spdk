@@ -13,24 +13,18 @@
 /* =========================================================================
  * THREADING MODEL
  *
- * Each ec_bdev has a single home thread (ec->home_thread, captured at
- * create time) that owns all shared ec_bdev state: control-plane
- * mutations, WIB persist/load, scrub/rebuild orchestration, bitmap
- * coordination, and the rebuild/resize/scrub busy gates. Anything that
- * touches ec_bdev fields must run on the home thread or hand off via
- * spdk_thread_send_msg.
+ * The EC module runs single-threaded on the SPDK app thread. All RPC
+ * handlers, I/O submission, completion callbacks, pollers, and shared
+ * ec_bdev state mutations occur on that thread. No locks are used.
  *
- * I/O submission is per-channel. Each ec_io_channel owns base_chans[]
- * for its reactor. The submitter thread (the thread that received
- * bdev_io from the stack) is captured into ec_io->submitter_thread and
- * every base-bdev dispatch site re-asserts it. Completion callbacks
- * from base bdevs may fire on any thread; they are routed back to the
- * submitter thread via the routing helper, which is a no-op fast path
- * when the caller is already on the target thread.
+ * spdk_for_each_channel walks per-thread ec_io_channel instances on
+ * each reactor; those callbacks touch only per-channel state
+ * (ec_io_channel.base_chans[]), not the shared ec_bdev.
  *
- * No locks. Cross-thread fields use C11 atomics; everything else relies
- * on the "all writers on home_thread, or all writers on submitter_thread"
- * invariant being honoured at every site.
+ * Any change that introduces concurrent access to ec_bdev fields
+ * (worker thread, multi-reactor dispatch, etc.) MUST re-audit every
+ * check-then-act pattern in this module -- especially the busy gates
+ * around rebuild/resize/scrub and the WIB persist machinery.
  *
  * =========================================================================
  * CHANNEL INVENTORY
@@ -105,13 +99,6 @@
 
 /* ISA-L gf_gen_decode_matrix() requires (k * m * 32) bytes for the
  * encode / decode tables. */
-#define EC_ISAL_GF_TABLE_BYTES 32u
-
-/*
- * ISA-L ec_init_tables requires 32 bytes per (k * f) entry to build
- * the GF lookup tables. Used to size the on-stack decode_tbls[] scratch
- * for both single- and multi-failure reconstruction paths.
- */
 #define EC_ISAL_GF_TABLE_BYTES 32u
 
 /*
@@ -274,9 +261,8 @@ struct ec_rebuild_ctx {
  *
  * Protects against the RMW write-hole. One dirty bit per region of
  * EC_WIB_REGION_STRIPES stripes, stored on-disk as two alternating
- * front-placed copies on every parity disk, immediately after the
- * unmapped-bitmap reservation. See bdev_ec_wib.c for the on-disk layout
- * and persist protocol.
+ * copies in the two front-placed reservation strips on every parity disk. See
+ * bdev_ec_wib.c for the on-disk layout and persist protocol.
  * ========================================================================= */
 
 /* Stripes per WIB region -- one dirty bit covers this many stripes. */
@@ -306,6 +292,53 @@ struct ec_wib_header {
 	uint32_t num_regions;
 	uint32_t _pad;
 	/* uint64_t region_bits[] follows in the DMA buffer */
+};
+
+/* =========================================================================
+ * In-band unmapped bitmap
+ *
+ * The persistent per-stripe unmapped bitmap is stored in-band and
+ * raw-replicated: every base disk reserves two slots (copy A / copy B)
+ * at the front of its address space, each holding an identical copy of
+ * the whole bitmap blob. Crash-safety is double-buffer + CRC, not EC
+ * redundancy; the blob survives n-1 disk loss. A persist writes the
+ * inactive slot on every online disk and flips the global active-copy
+ * index; load scans all 2n {disk, slot} copies and picks the
+ * max-generation CRC-valid copy. See bdev_ec_bitmap.c.
+ * ========================================================================= */
+
+/* Magic in each on-disk bitmap slot header. */
+#define EC_BITMAP_MAGIC   UINT64_C(0x4543554d41500000)   /* "ECUMAP\0\0" */
+
+/*
+ * On-disk bitmap slot header version. ec_bitmap_validate_buf rejects any
+ * non-matching version.
+ */
+#define EC_BITMAP_VERSION 1u
+
+/*
+ * On-disk header at the front of every bitmap slot. The bitmap payload
+ * (uint64_t words) follows immediately; a uint32_t crc32c sits at the
+ * end of the blob and covers [header_start, header_start + blob_bytes).
+ *
+ * blob_bytes is the explicit length of the CRC-covered region (header +
+ * span). The CRC trailer lives at offset blob_bytes; total on-disk
+ * extent of one slot is blob_bytes + sizeof(uint32_t). Carrying
+ * blob_bytes explicitly -- rather than deriving it from num_stripes --
+ * is forward-compat: a later format revision can append fields at the
+ * tail and an older reader can still CRC-validate the prefix it
+ * understands.
+ *
+ * num_stripes records the user-stripe count the span covers at persist
+ * time. Load rejects a slot whose num_stripes disagrees with the
+ * volume's current geometry.
+ */
+struct ec_bitmap_header {
+	uint64_t magic;
+	uint32_t version;
+	uint32_t generation;    /* only ever increases across persists           */
+	uint64_t blob_bytes;    /* explicit length of header + span (CRC follows)*/
+	uint64_t num_stripes;   /* user-stripe count the span covers             */
 };
 
 /* =========================================================================
@@ -627,16 +660,9 @@ struct ec_bdev_io {
 	 * writes need.
 	 */
 	void *bounce_buf;
-	/*
-	 * Inline scratch for full-stripe writes. Bounded by k+m
-	 * <= EC_MAX_BASE_BDEVS, so each ec_bdev_io carries its own slots
-	 * without three per-submission callocs (parity bdev pointers come
-	 * from ec_alloc_full_stripe, the iovs are filled from the bounce
-	 * buffer). Read and RMW paths leave these unused.
-	 */
-	struct iovec data_iovs[EC_MAX_BASE_BDEVS];
-	struct iovec parity_iovs[EC_MAX_BASE_BDEVS];
-	void        *parity_bufs[EC_MAX_BASE_BDEVS];
+	struct iovec *data_iovs;
+	struct iovec *parity_iovs;
+	void **parity_bufs;
 
 	/*
 	 * Stripe-dirty claim release info. Set by ec_submit_full_write when
@@ -777,6 +803,9 @@ struct ec_rmw_ctx {
 TAILQ_HEAD(ec_all_tailq, ec_bdev);
 extern struct ec_all_tailq g_ec_bdev_list;
 
+/* Function table for EC bdev operations */
+extern const struct spdk_bdev_fn_table g_ec_fn_table;
+
 /* SPDK bdev module identity, referenced by quiesce/unquiesce and other helpers. */
 extern struct spdk_bdev_module ec_if;
 
@@ -885,6 +914,26 @@ ec_stripe_is_dirty(const struct ec_bdev *ec, uint64_t stripe_index)
 		  (UINT64_C(1) << (stripe_index % 64)));
 }
 
+/*
+ * Word-level bit ops on a standalone bitmap (a plain uint64_t[] array, not one
+ * of the ec->stripe_* maps). The UNMAP staging shadow (uctx->staged_map) and
+ * the bit-clear shadow (ec->clear_staged_map) are separate arrays that the
+ * ec_stripe_*_unmapped helpers cannot target, so they use these rather than
+ * re-deriving the word/bit split inline. Keeps the 64-bit arithmetic in one
+ * place alongside EC_BITMAP_WORDS.
+ */
+static inline void
+ec_bitmap_word_set(uint64_t *map, uint64_t idx)
+{
+	map[idx / 64] |= (UINT64_C(1) << (idx % 64));
+}
+
+static inline void
+ec_bitmap_word_clear(uint64_t *map, uint64_t idx)
+{
+	map[idx / 64] &= ~(UINT64_C(1) << (idx % 64));
+}
+
 /* WIB region dirty-bit helpers. Same single-thread O(1) discipline. */
 static inline uint32_t
 ec_wib_stripe_to_region(uint64_t stripe_index)
@@ -946,7 +995,70 @@ ec_wib_region_inflight_dec(struct ec_bdev *ec, uint32_t region)
  * ========================================================================= */
 
 /* Helpers for diagnostics; loop-based, not worth inlining. */
+uint64_t ec_count_dirty_stripes(const struct ec_bdev *ec);
 uint32_t ec_wib_count_dirty(const struct ec_bdev *ec);
+
+/* =========================================================================
+ * In-band unmapped bitmap (bdev_ec_bitmap.c)
+ *
+ * Geometry math and whole-blob serialize / validate / apply for the
+ * persistent per-stripe unmapped bitmap. The blob is raw-replicated to
+ * every disk and double-buffered; the async persist and load chains
+ * build on these helpers. See bdev_ec_bitmap.c for the on-disk layout.
+ * ========================================================================= */
+
+/*
+ * ec_bitmap_blob_bytes -- length of the CRC-covered region (header +
+ * span) for a bitmap blob covering num_stripes user stripes. The CRC32C
+ * trailer lives at offset blob_bytes; total on-disk slot extent is
+ * blob_bytes + sizeof(uint32_t).
+ */
+uint64_t ec_bitmap_blob_bytes(uint64_t num_stripes);
+
+uint64_t ec_bitmap_reservation_stripes(const struct ec_bdev *ec);
+
+/*
+ * ec_bitmap_fill_buf -- serialize source_map into buf as a complete
+ * on-disk blob (header + span + CRC32C). source_map must hold at least
+ * EC_BITMAP_WORDS(ec->num_stripes) uint64_t words; buf must hold at
+ * least ec_bitmap_blob_bytes(ec->num_stripes) + sizeof(uint32_t) bytes
+ * and must be zero-initialised on entry (the trailing slack past the
+ * CRC, if any, is left untouched).
+ *
+ * source_map is explicit (not always ec->stripe_unmapped_map) so a
+ * later caller can persist a staged copy of the map -- the foundation
+ * for pessimistic visibility in the UNMAP path. The create-time
+ * bootstrap persist simply passes ec->stripe_unmapped_map.
+ */
+void ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
+			uint32_t generation, void *buf);
+
+/*
+ * ec_bitmap_validate_buf -- check a slot read back from disk: magic,
+ * version, num_stripes match the current volume geometry, blob_bytes
+ * is exactly the expected length for that geometry, and the CRC32C
+ * over [start, start + blob_bytes) matches the trailer at offset
+ * blob_bytes. Returns 0 and fills *gen_out on success, -EINVAL on any
+ * mismatch -- which is also what a never-written or torn slot looks
+ * like.
+ */
+int  ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
+			    uint32_t *gen_out);
+
+/*
+ * ec_bitmap_apply_buf -- copy the span out of a validated blob into
+ * ec->stripe_unmapped_map. Call only after ec_bitmap_validate_buf has
+ * returned 0 for this buffer.
+ */
+void ec_bitmap_apply_buf(struct ec_bdev *ec, const void *buf);
+
+/*
+ * Count of set bits in ec->stripe_unmapped_map. Linear popcount over
+ * the live map; cheap enough to call from the JSON-dump paths
+ * (bdev_get_bdevs, bdev_ec_get_bdevs, bdev_ec_get_unmap_status).
+ * Returns 0 if the map has not yet been allocated.
+ */
+uint64_t ec_count_unmapped_stripes(const struct ec_bdev *ec);
 
 /* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
 int ec_reconstruct_data_chunk(const struct ec_bdev *ec,
@@ -997,19 +1109,13 @@ int ec_reconstruct_multi_data(const struct ec_bdev *ec,
 static inline uint64_t
 ec_wib_lba(const struct ec_bdev *ec, uint8_t copy)
 {
-	/*
-	 * Two alternating front-placed copies. At this commit there is no
-	 * other front-placed reservation, so copy 0 starts at LBA 0 and
-	 * copy 1 starts one strip later. Once the in-band unmapped bitmap
-	 * lands (c19), this offset shifts behind it via
-	 * ec_bitmap_reservation_stripes(), but the two-copies-back-to-back
-	 * layout is preserved.
-	 */
-	return ((uint64_t)copy) * ec->strip_size;
+	return (ec_bitmap_reservation_stripes(ec) + copy) *
+	       (uint64_t)ec->strip_size;
 }
 
 /* WIB helpers needed by the resize and scrub chains, plus the
  * RMW->WIB bridge ec_wib_persist documented above. */
+void     ec_wib_fill_buf(struct ec_bdev *ec);
 int      ec_wib_persist(struct ec_bdev *ec,
 			void (*cb)(void *cb_arg, int rc), void *cb_arg);
 int      ec_wib_idle_poller_cb(void *arg);
