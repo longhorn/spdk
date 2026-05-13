@@ -1002,4 +1002,6 @@ ec_submit_write(struct ec_bdev_io *ec_io)
 	    ec_io->offset_blocks % ec->stripe_blocks == 0) {
 		return ec_submit_full_write(ec_io);
 	}
+
+	return ec_submit_rmw_write(ec_io);
 }

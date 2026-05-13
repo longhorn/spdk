@@ -214,6 +214,16 @@ struct ec_wib_header {
 	uint32_t _pad;
 	/* uint64_t region_bits[] follows in the DMA buffer */
 };
+
+/* =========================================================================
+ * ec_bdev -- main EC bdev instance
+ * ========================================================================= */
+
+/*
+ * Represents an Erasure Coded virtual block device.
+ * Maps logical addresses across k data disks and m parity disks.
+ */
+struct ec_rmw_ctx;  /* defined later in this header */
 struct ec_bdev {
 	/* Generic SPDK bdev structure (must be first) */
 	struct spdk_bdev bdev;
@@ -504,6 +514,105 @@ struct ec_bdev_io {
 	bool     is_write_into_unmapped;
 };
 
+/* =========================================================================
+ * Read-Modify-Write context
+ *
+ * Used for sub-stripe writes. Sequence:
+ *   1. Set dirty bit for this stripe.
+ *   2. Read k chunks from readable disks.
+ *   3. If degraded, reconstruct unreadable data via ISA-L.
+ *      Apply write payload, re-encode all m parity chunks.
+ *   4. Write modified data + parity back to disk.
+ *   5. Clear dirty bit, complete parent bdev_io.
+ *
+ * The struct is in this header because ec_wib_deferred_drain (in
+ * bdev_ec_wib.c) walks ec->wib_deferred_writes via TAILQ_FOREACH_SAFE,
+ * which needs the wib_defer_link field offset. All other access to
+ * the context lives in bdev_ec_rmw.c.
+ * ========================================================================= */
+
+struct ec_rmw_ctx {
+	struct ec_bdev_io       *ec_io;
+
+	/*
+	 * Effective payload geometry for this RMW. Populated at context
+	 * setup from either ec_io->{offset_blocks,num_blocks,is_zero_fill}
+	 * (the standard write path) or caller-supplied overrides
+	 * (ec_submit_rmw_zero_fill_range, used by the multi-segment UNMAP
+	 * dispatcher to zero-fill the partial-stripe head/tail fragments
+	 * of an unaligned multi-stripe UNMAP). The async chain that follows
+	 * reads num_blocks / is_zero_fill and the derived stripe fields
+	 * below, never ec_io's copies, so the two callers route through the
+	 * same RMW machinery. The source offset is consumed only at setup,
+	 * to derive stripe_index / stripe_off_blocks.
+	 */
+	uint64_t                 num_blocks;
+	bool                     is_zero_fill;
+
+	/* Stripe index for this RMW (offset_blocks / stripe_blocks) */
+	uint64_t                 stripe_index;
+
+	/* Per-disk LBA for this stripe = ec_stripe_base_lba(ec, stripe_index) */
+	uint64_t                 disk_lba;
+
+	/*
+	 * Offset within the stripe where the write payload begins, in blocks.
+	 * stripe_off_blocks = offset_blocks % stripe_blocks
+	 */
+	uint64_t                 stripe_off_blocks;
+
+	/*
+	 * DMA-safe I/O buffers: [0..k-1] data, [k..n-1] parity.
+	 * Allocated in ec_rmw_submit_core(); freed via ec_rmw_free_ctx()
+	 * (from ec_rmw_complete or an ec_rmw_submit_core error path).
+	 */
+	uint8_t                 *chunk_bufs[EC_MAX_BASE_BDEVS];
+	struct iovec             chunk_iovs[EC_MAX_BASE_BDEVS];
+
+	/* Number of read completions still pending */
+	uint32_t                 reads_remaining;
+
+	/* Number of write completions still pending */
+	uint32_t                 writes_remaining;
+
+	/* Accumulated I/O status (FAILED if any child fails) */
+	enum spdk_bdev_io_status status;
+
+	/*
+	 * Inclusive range of data chunks modified by this RMW (0..k-1).
+	 * Derived at context creation from stripe_off_blocks and num_blocks.
+	 *
+	 * For ordinary WRITE this range is always one chunk -- SPDK's WRITE
+	 * splitter is boundary-aware (split_on_optimal_io_boundary) and
+	 * never lets a sub-stripe WRITE cross a strip boundary. The
+	 * defensive check in ec_submit_rmw_write enforces that.
+	 *
+	 * For WRITE_ZEROES the range can span multiple chunks within one
+	 * stripe, because SPDK's WRITE_ZEROES splitter (bdev_write_zeroes_split
+	 * in lib/bdev/bdev.c) only caps size at max_write_zeroes and does
+	 * not align to optimal_io_boundary. Handled in ec_rmw_submit_writes
+	 * by writing back every chunk in [modified_chunk_first,
+	 * modified_chunk_last] alongside the parity chunks.
+	 */
+	uint32_t                 modified_chunk_first;
+	uint32_t                 modified_chunk_last;
+
+	/* Linkage for deferred-write queue (wib_deferred_writes) */
+	TAILQ_ENTRY(ec_rmw_ctx)  wib_defer_link;
+
+	/*
+	 * Optional completion override. When non-NULL, ec_rmw_complete
+	 * invokes cb_fn(cb_arg, status) instead of completing the parent
+	 * bdev_io directly. The standard write path leaves both NULL,
+	 * preserving today's spdk_bdev_io_complete semantics; the
+	 * multi-segment UNMAP dispatcher passes a coordinator callback so the
+	 * parent bdev_io only completes once every segment has reported back.
+	 */
+	void                   (*cb_fn)(void *cb_arg,
+					enum spdk_bdev_io_status status);
+	void                    *cb_arg;
+};
+
 /* Global list type */
 TAILQ_HEAD(ec_all_tailq, ec_bdev);
 extern struct ec_all_tailq g_ec_bdev_list;
@@ -723,6 +832,26 @@ int      ec_wib_persist(struct ec_bdev *ec,
 int      ec_wib_idle_poller_cb(void *arg);
 void     ec_wib_load_async(struct ec_bdev *ec,
 			   ec_bdev_create_cb_fn done_fn, void *done_arg);
+
+/* WIB->RMW bridge: drained by ec_wib_deferred_drain. See the
+ * WIB <-> RMW protocol section above. */
+void     ec_rmw_submit_writes(struct ec_rmw_ctx *mctx);
+
+/*
+ * Complete a deferred RMW with mctx->status (set by the caller) and tear
+ * down its resources (stripe-busy claim, WIB region in-flight counter,
+ * DMA buffers, ctx). Called from ec_wib_deferred_drain when a follow-up
+ * WIB persist fails, so the deferred RMWs are returned to SPDK via
+ * SPDK_BDEV_IO_STATUS_NOMEM rather than having their data writes go out
+ * with no durable write-intent (write-hole).
+ */
+void     ec_rmw_complete(struct ec_rmw_ctx *mctx);
+
+/*
+ * Submit a sub-stripe RMW write. Called by ec_submit_write to handle
+ * any write that doesn't cover one or more full stripes aligned.
+ */
+int ec_submit_rmw_write(struct ec_bdev_io *ec_io);
 
 /*
  * I/O entry points defined in bdev_ec_io.c and dispatched from

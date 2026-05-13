@@ -123,10 +123,39 @@ ec_wib_deferred_drain(void *cb_arg, int rc)
 	struct ec_rmw_ctx *mctx, *tmp;
 
 	if (rc != 0) {
-		SPDK_WARNLOG("EC bdev %s: WIB deferred persist failed "
-			     "(rc=%d); proceeding with deferred writes "
-			     "(degraded crash safety)\n",
-			     ec->bdev.name, rc);
+		/*
+		 * The follow-up WIB persist failed: any dirty bit set after
+		 * the prior persist started is still in memory only, so the
+		 * deferred RMWs' data writes must NOT go out -- doing so would
+		 * leave new data with stale parity protected only by an
+		 * unrecorded write-intent, recreating the write-hole the WIB
+		 * exists to prevent (visible on crash via degraded read of
+		 * the affected stripe). Complete each deferred RMW with NOMEM
+		 * status so SPDK retries the bdev_io from scratch; the next
+		 * attempt will re-enter ec_rmw_persist_and_submit and either
+		 * find the in-memory bit already durable from a later persist
+		 * or trigger a fresh persist. The in-memory bit is left set:
+		 * it correctly reflects "this region needs persisting" and
+		 * will be drained by the next successful persist.
+		 */
+		SPDK_ERRLOG("EC bdev %s: WIB deferred persist failed "
+			    "(rc=%d); failing deferred RMW(s) via NOMEM "
+			    "retry to preserve write-intent ordering\n",
+			    ec->bdev.name, rc);
+		TAILQ_FOREACH_SAFE(mctx, &ec->wib_deferred_writes,
+				   wib_defer_link, tmp) {
+			TAILQ_REMOVE(&ec->wib_deferred_writes, mctx,
+				     wib_defer_link);
+			mctx->status = SPDK_BDEV_IO_STATUS_NOMEM;
+			ec_rmw_complete(mctx);
+		}
+		return;
+	}
+
+	TAILQ_FOREACH_SAFE(mctx, &ec->wib_deferred_writes, wib_defer_link,
+			   tmp) {
+		TAILQ_REMOVE(&ec->wib_deferred_writes, mctx, wib_defer_link);
+		ec_rmw_submit_writes(mctx);
 	}
 }
 
@@ -164,6 +193,9 @@ ec_wib_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 	if (pctx->cb) {
 		pctx->cb(pctx->cb_arg, pctx->status);
 	}
+	/* Save status before free; pctx is freed below but the drain
+	 * branch below needs to know if the persist succeeded. */
+	int persist_status = pctx->status;
 	free(pctx);
 
 	/*
@@ -177,7 +209,14 @@ ec_wib_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 			ec_wib_deferred_drain(ec, -ENOMEM);
 		}
 	} else if (!TAILQ_EMPTY(&ec->wib_deferred_writes)) {
-		ec_wib_deferred_drain(ec, 0);
+		/*
+		 * Propagate the just-completed persist's status: if it failed,
+		 * the in-memory dirty bits set after it started are not on
+		 * disk, so the deferred RMWs must not have their data writes
+		 * submitted (write-hole on crash). ec_wib_deferred_drain
+		 * completes the deferred RMWs with NOMEM so SPDK retries them.
+		 */
+		ec_wib_deferred_drain(ec, persist_status);
 	}
 }
 
