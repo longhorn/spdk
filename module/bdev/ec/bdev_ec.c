@@ -1953,7 +1953,37 @@ static const struct spdk_bdev_fn_table g_ec_fn_table = {
 void
 ec_bdev_delete(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
 {
-	int rc;
+	struct ec_bdev *ec;
+	int             rc;
+
+	/*
+	 * Refuse delete while rebuild or resize is active.
+	 *
+	 * Both contexts own pollers and per-disk channels that ec_destruct ->
+	 * ec_device_unregister_done does NOT abort (it only aborts scrub).
+	 * Without this gate, the unregister chain frees the ec_bdev while the
+	 * rebuild/resize poller is still scheduled, producing a use-after-free
+	 * on the next tick (rebuild) or in the next write-completion callback
+	 * (resize).
+	 *
+	 * Operators must stop rebuilds with bdev_ec_stop_rebuild and let
+	 * resize finish before deleting.
+	 */
+	ec = ec_bdev_find(name);
+	if (ec != NULL) {
+		if (ec->rebuild_ctx != NULL) {
+			SPDK_ERRLOG("EC bdev %s: delete rejected -- "
+				    "rebuild in progress\n", name);
+			cb_fn(cb_arg, -EBUSY);
+			return;
+		}
+		if (ec->resize_ctx != NULL) {
+			SPDK_ERRLOG("EC bdev %s: delete rejected -- "
+				    "resize in progress\n", name);
+			cb_fn(cb_arg, -EBUSY);
+			return;
+		}
+	}
 
 	rc = spdk_bdev_unregister_by_name(name, &ec_if, cb_fn, cb_arg);
 	if (rc != 0) {
