@@ -97,6 +97,73 @@ static void ec_unmap_child_complete(struct spdk_bdev_io *child,
 				    bool success, void *cb_arg);
 
 /*
+ * Multi-segment UNMAP dispatcher state. An unaligned multi-stripe UNMAP
+ * gets split into up to three segments: a partial-stripe head fragment
+ * (RMW zero-fill), the inner stripe-aligned range (native UNMAP
+ * fan-out via the bitmap), and a partial-stripe tail fragment (RMW
+ * zero-fill). Segments are dispatched serially in the order inner ->
+ * head -> tail; the dispatcher waits for each segment's completion
+ * before submitting the next.
+ *
+ * Why inner first: it is the segment most likely to encounter -EAGAIN at
+ * submit time (bitmap-persist contention with concurrent UNMAPs is a
+ * real failure mode under fstrim). If inner fails synchronously, no
+ * other segments have been submitted and the dispatcher can cleanly
+ * return -EAGAIN to the bdev layer for a normal NOMEM-queue requeue.
+ * Head/tail RMW only encounter -EAGAIN on the much rarer scrub-defer
+ * or stripe-busy paths (WIB persist contention is handled internally
+ * by wib_deferred_writes), so post-inner -EAGAIN is rare and treated
+ * as parent-FAILED with kernel-driven retry.
+ *
+ * Why serial rather than parallel: parallel dispatch would have to
+ * either (a) pre-acquire every resource atomically before submitting
+ * any segment, or (b) handle "in-flight earlier segment + sibling segment
+ * submit failure" cleanup. Both are more complex than serial
+ * dispatch and gain at most a few microseconds of overlap on segments
+ * that are bounded by base-bdev I/O latency anyway.
+ *
+ * Bitmap is set only for stripes in [inner_start_stripe,
+ * inner_end_stripe); the head/tail stripes are partially live and
+ * cannot be marked fully unmapped. Their RMW physically zeros only
+ * the requested sub-range and recomputes parity, leaving the rest
+ * of those stripes intact.
+ */
+struct ec_unmap_split_ctx {
+	struct ec_bdev_io       *ec_io;
+
+	/* Head segment: zero-fill the partial stripe at the front of the request.
+	 * head_num_blocks == 0 means the request was already head-aligned. */
+	uint64_t                 head_offset_blocks;
+	uint64_t                 head_num_blocks;
+
+	/* Tail segment: zero-fill the partial stripe at the back of the request.
+	 * tail_num_blocks == 0 means the request was already tail-aligned. */
+	uint64_t                 tail_offset_blocks;
+	uint64_t                 tail_num_blocks;
+
+	/* Which segment to submit next. Set by the entry point after the inner
+	 * segment is submitted; advanced by ec_unmap_split_continue after each
+	 * segment's completion callback fires. */
+	enum {
+		EC_UNMAP_SPLIT_STAGE_HEAD,
+		EC_UNMAP_SPLIT_STAGE_TAIL,
+		EC_UNMAP_SPLIT_STAGE_DONE,
+	} next_stage;
+
+	enum spdk_bdev_io_status status;
+};
+
+static int  ec_submit_unmap_split(struct ec_bdev_io *ec_io,
+				  uint64_t head_off, uint64_t head_len,
+				  uint64_t inner_start_stripe,
+				  uint64_t inner_end_stripe,
+				  uint64_t tail_off, uint64_t tail_len);
+static void ec_unmap_split_continue(struct ec_unmap_split_ctx *sctx);
+static void ec_unmap_split_segment_done(void *cb_arg,
+				    enum spdk_bdev_io_status status);
+static void ec_unmap_split_complete(struct ec_unmap_split_ctx *sctx);
+
+/*
  * Default inner-fanout completion: cb_arg is the parent ec_bdev_io.
  * Used by the aligned-multi-stripe path in ec_submit_unmap; it completes
  * the parent bdev_io directly, with no segment coordination.
@@ -257,6 +324,35 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 		return ec_unmap_inner_fanout(ec_io, start_stripe, end_stripe,
 					     ec_unmap_inner_complete_default,
 					     ec_io);
+	}
+
+	/*
+	 * Unaligned multi-stripe UNMAP: at least one of head_len /
+	 * tail_len > 0, possibly with an empty inner range. Split into
+	 * up to three segments:
+	 *   - head [off, start_stripe*stripe_blocks): partial-stripe RMW
+	 *     zero-fill via ec_submit_rmw_zero_fill_range (skip if 0).
+	 *   - inner [start_stripe, end_stripe): stripe-aligned native
+	 *     UNMAP via ec_unmap_inner_fanout (skip if empty).
+	 *   - tail [end_stripe*stripe_blocks, off+len): same shape as
+	 *     head (skip if 0).
+	 *
+	 * Returning -EINVAL here (the historical behavior for unaligned
+	 * multi-stripe) caused the Linux NVMe driver to disable discard
+	 * for the namespace after enough invalid-field responses,
+	 * silently killing every subsequent fstrim. Splitting fixes that
+	 * AND fully reclaims the partial fragments.
+	 */
+	{
+		uint64_t head_off = off;
+		uint64_t head_len = (start_stripe * ec->stripe_blocks) - off;
+		uint64_t tail_off = end_stripe * ec->stripe_blocks;
+		uint64_t tail_len = end - tail_off;
+
+		return ec_submit_unmap_split(ec_io,
+					     head_off, head_len,
+					     start_stripe, end_stripe,
+					     tail_off, tail_len);
 	}
 }
 
@@ -427,12 +523,14 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
 		 * staged bits never became visible to readers (live was
 		 * untouched), so there is nothing to roll back. Surface the
 		 * failure to the caller; the next UNMAP retry will rebuild
-		 * the staged shadow from a fresh snapshot of live.
+		 * the staged shadow from a fresh snapshot of live. WARNLOG
+		 * (not ERRLOG) because the kernel-side retry path will
+		 * succeed once a fresh persist lands.
 		 */
-		SPDK_ERRLOG("EC bdev %s: bitmap persist failed (rc=%d) "
-			    "before UNMAP fan-out at stripes [%" PRIu64 "..%" PRIu64 ")\n",
-			    ec->bdev.name, rc,
-			    uctx->start_stripe, uctx->end_stripe);
+		SPDK_WARNLOG("EC bdev %s: bitmap persist failed (rc=%d) "
+			     "before UNMAP fan-out at stripes [%" PRIu64 "..%" PRIu64 ")\n",
+			     ec->bdev.name, rc,
+			     uctx->start_stripe, uctx->end_stripe);
 		ec_unmap_release_claims(ec, uctx->start_stripe,
 					uctx->end_stripe);
 		{
@@ -567,4 +665,171 @@ ec_unmap_child_complete(struct spdk_bdev_io *child, bool success, void *cb_arg)
 		free(uctx);
 		cb_fn(cb_arg, status);
 	}
+}
+
+/* =========================================================================
+ * Multi-segment dispatcher
+ *
+ * See the long comment above struct ec_unmap_split_ctx for the design
+ * rationale (serial-not-parallel, inner-first ordering, why the head
+ * and tail RMW segments leave the bitmap untouched).
+ * ========================================================================= */
+
+static int
+ec_submit_unmap_split(struct ec_bdev_io *ec_io,
+		      uint64_t head_off, uint64_t head_len,
+		      uint64_t inner_start_stripe, uint64_t inner_end_stripe,
+		      uint64_t tail_off, uint64_t tail_len)
+{
+	struct ec_unmap_split_ctx *sctx;
+	bool                       has_inner = (inner_start_stripe <
+						inner_end_stripe);
+	bool                       has_head  = (head_len > 0);
+	int                        rc;
+
+	sctx = calloc(1, sizeof(*sctx));
+	if (sctx == NULL) {
+		return -ENOMEM;
+	}
+
+	sctx->ec_io               = ec_io;
+	sctx->head_offset_blocks  = head_off;
+	sctx->head_num_blocks     = head_len;
+	sctx->tail_offset_blocks  = tail_off;
+	sctx->tail_num_blocks     = tail_len;
+	sctx->status              = SPDK_BDEV_IO_STATUS_SUCCESS;
+
+	/*
+	 * Submit the FIRST present segment synchronously from the entry point
+	 * so a sync error (-EAGAIN from persist or stripe-busy contention,
+	 * -ENOMEM from context alloc) propagates back to the bdev layer
+	 * for a clean NOMEM-queue requeue with nothing in flight.
+	 *
+	 * Inner first when present (largest reclamation; most likely to
+	 * -EAGAIN on bitmap persist contention). Otherwise the boundary-
+	 * straddler case (crosses exactly one stripe boundary with no full
+	 * inner stripe) starts with head. has_head must be true in that
+	 * case: tail-only is unreachable here because off would be stripe-
+	 * aligned with start_stripe == end_stripe, which the single-stripe
+	 * shortcut in ec_submit_unmap would have routed to write-zeros
+	 * before reaching this dispatcher.
+	 */
+	if (has_inner) {
+		sctx->next_stage = EC_UNMAP_SPLIT_STAGE_HEAD;
+		rc = ec_unmap_inner_fanout(ec_io,
+					   inner_start_stripe, inner_end_stripe,
+					   ec_unmap_split_segment_done, sctx);
+	} else {
+		assert(has_head);
+		sctx->next_stage = EC_UNMAP_SPLIT_STAGE_TAIL;
+		rc = ec_submit_rmw_zero_fill_range(ec_io,
+						   head_off, head_len,
+						   ec_unmap_split_segment_done,
+						   sctx);
+	}
+
+	if (rc != 0) {
+		free(sctx);
+		return rc;
+	}
+
+	/* First segment is async; ec_unmap_split_segment_done -> _advance will
+	 * drive the remaining segments. */
+	return 0;
+}
+
+/*
+ * Submit one zero-fill segment (head or tail), or skip it and advance if the segment
+ * is empty. The caller sets sctx->next_stage before calling. On a synchronous
+ * submit failure the parent is marked FAILED and completed -- the kernel
+ * retries the whole UNMAP, and RMW zero-fill plus the already-applied bitmap
+ * state are idempotent, so the retry converges. On success the segment completes
+ * asynchronously via ec_unmap_split_segment_done, which re-enters advance.
+ */
+static void
+ec_unmap_split_submit_segment(struct ec_unmap_split_ctx *sctx,
+			  uint64_t off, uint64_t len)
+{
+	int rc;
+
+	if (len == 0) {
+		ec_unmap_split_continue(sctx);
+		return;
+	}
+
+	rc = ec_submit_rmw_zero_fill_range(sctx->ec_io, off, len,
+					   ec_unmap_split_segment_done, sctx);
+	if (rc != 0) {
+		sctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+		ec_unmap_split_complete(sctx);
+	}
+}
+
+/*
+ * Submit the next segment, or complete the parent if none remain or the
+ * status has already gone FAILED. Recursion is bounded at three frames
+ * (one per stage) because every stage either submits async (returns
+ * without recursing) or advances on a missing segment / status==FAILED.
+ */
+static void
+ec_unmap_split_continue(struct ec_unmap_split_ctx *sctx)
+{
+	/*
+	 * Short-circuit on prior failure. We don't waste I/O on remaining
+	 * segments because the parent bdev_io is going to complete FAILED
+	 * regardless and the kernel will retry the whole UNMAP -- at
+	 * which point every segment runs fresh (RMW zero-fill and bitmap
+	 * persist are both idempotent).
+	 */
+	if (sctx->status != SPDK_BDEV_IO_STATUS_SUCCESS) {
+		ec_unmap_split_complete(sctx);
+		return;
+	}
+
+	switch (sctx->next_stage) {
+	case EC_UNMAP_SPLIT_STAGE_HEAD:
+		sctx->next_stage = EC_UNMAP_SPLIT_STAGE_TAIL;
+		ec_unmap_split_submit_segment(sctx, sctx->head_offset_blocks,
+					  sctx->head_num_blocks);
+		return;
+
+	case EC_UNMAP_SPLIT_STAGE_TAIL:
+		sctx->next_stage = EC_UNMAP_SPLIT_STAGE_DONE;
+		ec_unmap_split_submit_segment(sctx, sctx->tail_offset_blocks,
+					  sctx->tail_num_blocks);
+		return;
+
+	case EC_UNMAP_SPLIT_STAGE_DONE:
+		ec_unmap_split_complete(sctx);
+		return;
+	}
+}
+
+static void
+ec_unmap_split_segment_done(void *cb_arg, enum spdk_bdev_io_status status)
+{
+	struct ec_unmap_split_ctx *sctx = cb_arg;
+
+	if (status != SPDK_BDEV_IO_STATUS_SUCCESS) {
+		sctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+	}
+	ec_unmap_split_continue(sctx);
+}
+
+static void
+ec_unmap_split_complete(struct ec_unmap_split_ctx *sctx)
+{
+	struct ec_bdev_io       *ec_io  = sctx->ec_io;
+	struct ec_bdev          *ec     = ec_from_bdev_io(ec_io->bdev_io);
+	enum spdk_bdev_io_status status = sctx->status;
+
+	/*
+	 * Bump unmaps_completed at the parent-completion boundary (same
+	 * convention as ec_unmap_inner_complete_default).
+	 */
+	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+		ec->unmaps_completed++;
+	}
+	free(sctx);
+	spdk_bdev_io_complete(ec_io->bdev_io, status);
 }
