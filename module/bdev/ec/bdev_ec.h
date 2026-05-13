@@ -21,6 +21,7 @@
 
 /* Opaque forward declarations for the public API. */
 struct ec_bdev;
+struct spdk_json_write_ctx;
 
 /* =========================================================================
  * Callback typedefs
@@ -71,6 +72,24 @@ typedef void (*ec_bitmap_persist_cb_fn)(void *cb_arg, int rc);
  * Safe to call only from the EC bdev's home thread.
  */
 struct ec_bdev *ec_bdev_find(const char *name);
+
+/*
+ * Shared JSON writers used by both the bdev dump_info path
+ * (ec_dump_info_json) and the bdev_ec_get_bdevs RPC.
+ *
+ *   ec_write_base_bdevs_array_json: writes the "base_bdevs": [...] array
+ *     describing each slot's role/state/needs_rebuild and the live base
+ *     bdev name (or "<failed>" / "<unknown>" sentinels).
+ *
+ *   ec_write_io_stats_json: writes the shared RMW / full-stripe-write /
+ *     UNMAP / degraded-read counter run -- the fields common to both
+ *     callers, in identical order. Each caller writes its own trailing
+ *     fields (e.g. degraded_read_eio_dirty, WIB/scrub stats) after it.
+ */
+void ec_write_base_bdevs_array_json(struct spdk_json_write_ctx *w,
+				    const struct ec_bdev *ec);
+void ec_write_io_stats_json(struct spdk_json_write_ctx *w,
+			    const struct ec_bdev *ec);
 
 /*
  * Asynchronously create an EC bdev. Loads the persisted WIB and the

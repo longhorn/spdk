@@ -1041,6 +1041,167 @@ ec_get_io_channel(void *ctx)
 	return spdk_get_io_channel(ec);
 }
 
+/*
+ * Resolve a live base bdev name for a non-FAILED slot, or "<unknown>"
+ * if the descriptor is missing (state machine inconsistency) or the
+ * descriptor has no backing bdev. Caller writes "<failed>" directly
+ * for FAILED slots, so this helper covers only NORMAL/REPLACING.
+ */
+static const char *
+ec_slot_name_for_json(const struct ec_bdev *ec, uint32_t slot)
+{
+	struct spdk_bdev *base;
+
+	if (!ec->descs[slot]) {
+		return "<unknown>";
+	}
+	base = spdk_bdev_desc_get_bdev(ec->descs[slot]);
+	return base ? spdk_bdev_get_name(base) : "<unknown>";
+}
+
+/*
+ * ec_write_base_bdevs_array_json -- write the "base_bdevs": [...] array.
+ *
+ * Used by both ec_dump_info_json (bdev_get_bdevs path) and
+ * rpc_bdev_ec_get_bdevs (bdev_ec_get_bdevs RPC). Per-slot fields:
+ *
+ *   slot           uint32
+ *   role           "data" | "parity"
+ *   name           live base bdev name, or "<failed>" / "<unknown>"
+ *   state          "normal" | "failed" | "replacing"
+ *   needs_rebuild  bool   (only when state == "replacing")
+ *
+ * When descs[i] is NULL on a non-FAILED slot (state machine
+ * inconsistency, should not happen in normal operation), writes
+ * name="<unknown>" defensively.
+ */
+void
+ec_write_base_bdevs_array_json(struct spdk_json_write_ctx *w,
+			       const struct ec_bdev *ec)
+{
+	uint32_t i;
+
+	spdk_json_write_named_array_begin(w, "base_bdevs");
+	for (i = 0; i < ec->n; i++) {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_uint32(w, "slot", i);
+		spdk_json_write_named_string(w, "role",
+					     i < ec->k ? "data" : "parity");
+
+		switch (ec->base_states[i]) {
+		case EC_BASE_STATE_FAILED:
+			spdk_json_write_named_string(w, "name",  "<failed>");
+			spdk_json_write_named_string(w, "state", "failed");
+			break;
+		case EC_BASE_STATE_REPLACING:
+			spdk_json_write_named_string(w, "name",
+				ec_slot_name_for_json(ec, i));
+			spdk_json_write_named_string(w, "state", "replacing");
+			spdk_json_write_named_bool(w,   "needs_rebuild",
+				ec->needs_rebuild[i]);
+			break;
+		case EC_BASE_STATE_NORMAL:
+		default:
+			spdk_json_write_named_string(w, "name",
+				ec_slot_name_for_json(ec, i));
+			spdk_json_write_named_string(w, "state", "normal");
+			break;
+		}
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+}
+
+/*
+ * ec_write_io_stats_json -- write the RMW / full-stripe-write / UNMAP /
+ * degraded-read counter run shared verbatim by ec_dump_info_json and the
+ * bdev_ec_get_bdevs RPC. Only this common, identically-ordered run is
+ * factored out; each caller writes its own trailing fields afterward.
+ */
+void
+ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
+{
+	spdk_json_write_named_uint32(w, "rmw_in_flight", ec->rmw_in_flight);
+	spdk_json_write_named_uint64(w, "rmw_total",
+				     ec->rmw_total);
+	spdk_json_write_named_uint64(w, "rmw_deferred_scrub",
+				     ec->rmw_deferred_scrub);
+	spdk_json_write_named_uint64(w, "rmw_deferred_dirty",
+				     ec->rmw_deferred_dirty);
+	spdk_json_write_named_uint64(w, "rmw_deferred_inflight",
+				     ec->rmw_deferred_inflight);
+	spdk_json_write_named_uint64(w, "full_stripe_writes",
+				     ec->full_stripe_writes);
+	spdk_json_write_named_uint64(w, "full_stripe_writes_deferred",
+				     ec->full_stripe_writes_deferred);
+	spdk_json_write_named_uint64(w, "unmaps_submitted",
+				     ec->unmaps_submitted);
+	spdk_json_write_named_uint64(w, "unmaps_completed",
+				     ec->unmaps_completed);
+	spdk_json_write_named_uint64(w, "unmaps_deferred_busy",
+				     ec->unmaps_deferred_busy);
+	spdk_json_write_named_uint64(w, "unmaps_via_write_zeros",
+				     ec->unmaps_via_write_zeros);
+	spdk_json_write_named_uint64(w, "unmap_fanout_misses",
+				     ec->unmap_fanout_misses);
+	spdk_json_write_named_uint64(w, "unmapped_reads_synthesized",
+				     ec->unmapped_reads_synthesized);
+	spdk_json_write_named_uint64(w, "writes_into_unmapped",
+				     ec->writes_into_unmapped);
+	spdk_json_write_named_uint64(w, "writes_into_unmapped_failed",
+				     ec->writes_into_unmapped_failed);
+	spdk_json_write_named_uint64(w, "degraded_reads_reconstructed",
+				     ec->degraded_reads_reconstructed);
+}
+
+static int
+ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
+{
+	struct ec_bdev *ec = ctx;
+
+	spdk_json_write_named_object_begin(w, "ec");
+	spdk_json_write_named_uint32(w, "data_chunk_count",   ec->k);
+	spdk_json_write_named_uint32(w, "parity_chunk_count", ec->m);
+	spdk_json_write_named_uint32(w, "strip_size_kb",      ec->strip_size_kb);
+	spdk_json_write_named_uint32(w, "num_base_bdevs",     ec->n);
+	spdk_json_write_named_uint32(w, "failed_count",       ec->failed_count);
+	spdk_json_write_named_bool(w,   "offline",            ec->offline);
+	spdk_json_write_named_bool(w,   "replace_in_progress", ec->replace_in_progress);
+
+	ec_write_base_bdevs_array_json(w, ec);
+
+	spdk_json_write_object_end(w);
+	return 0;
+}
+
+static void
+ec_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	struct ec_bdev   *ec = SPDK_CONTAINEROF(bdev, struct ec_bdev, bdev);
+	struct spdk_bdev *base_bdev;
+	uint32_t          i;
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "bdev_ec_create");
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name",               bdev->name);
+	spdk_json_write_named_uint32(w, "data_chunk_count",   ec->k);
+	spdk_json_write_named_uint32(w, "parity_chunk_count", ec->m);
+	spdk_json_write_named_uint32(w, "strip_size_kb",      ec->strip_size_kb);
+	spdk_json_write_named_array_begin(w, "base_bdevs");
+	for (i = 0; i < ec->n; i++) {
+		if (ec->descs[i]) {
+			base_bdev = spdk_bdev_desc_get_bdev(ec->descs[i]);
+			if (base_bdev) {
+				spdk_json_write_string(w, spdk_bdev_get_name(base_bdev));
+			}
+		}
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+	spdk_json_write_object_end(w);
+}
+
 static void
 ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
