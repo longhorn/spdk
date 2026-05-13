@@ -177,6 +177,99 @@ struct ec_replace_ctx {
 };
 
 /* =========================================================================
+ * Background rebuild context
+ * ========================================================================= */
+
+/*
+ * Deferred-stripe queue entry. Used when the rebuild poller picks a stripe
+ * that is currently claimed by a foreground writer (RMW, full-stripe write,
+ * or UNMAP). The stripe index is parked on ec_rebuild_ctx::deferred_stripes
+ * and revisited after the main per-slot scan completes.
+ */
+struct ec_rebuild_deferred_stripe {
+	uint64_t                                 stripe_index;
+	TAILQ_ENTRY(ec_rebuild_deferred_stripe)  link;
+};
+
+/*
+ * One instance per ec_bdev_start_rebuild() call. Freed by ec_rebuild_finish().
+ * Entirely single-threaded on the SPDK app thread; no locking needed.
+ * One stripe per poller tick: reads -> reconstruct -> write.
+ */
+struct ec_rebuild_ctx {
+	struct ec_bdev  *ec;
+
+	/* current REPLACING slot being rebuilt (slot index 0..n-1) */
+	uint32_t         current_slot;
+
+	/* stripe index within current_slot (0..num_stripes-1) */
+	uint64_t         current_stripe;
+
+	/* total stripes = ec->bdev.blockcnt / ec->stripe_blocks */
+	uint64_t         num_stripes;
+
+	/* bytes per chunk = ec->strip_size * ec->bdev.blocklen */
+	uint64_t         chunk_bytes;
+
+	/* DMA-safe I/O buffers, one per slot; reused across all stripes. */
+	uint8_t         *chunk_bufs[EC_MAX_BASE_BDEVS];
+	struct iovec     chunk_iovs[EC_MAX_BASE_BDEVS];
+
+	/* Dedicated I/O channels, separate from user ec_io_channel instances. */
+	struct spdk_io_channel *rebuild_chans[EC_MAX_BASE_BDEVS];
+
+	/* True while reads or a write are outstanding; guards the poller. */
+	bool             io_in_flight;
+
+	/* countdown of outstanding reads for the current stripe */
+	uint32_t         reads_remaining;
+
+	/* accumulated I/O status for the current stripe */
+	enum spdk_bdev_io_status io_status;
+
+	/* total stripes written successfully (across all rebuilt slots) */
+	uint64_t         stripes_rebuilt;
+
+	/* REPLACING slot count at rebuild start; for percent_complete calc. */
+	uint32_t         slots_to_rebuild;
+
+	/* Heartbeat progress logging (see EC_REBUILD_HEARTBEAT_*). */
+	uint64_t  start_ticks;           /* ticks when rebuild was registered */
+	uint64_t  last_heartbeat_ticks;  /* ticks at last heartbeat NOTICE */
+	uint32_t  next_heartbeat_percent;    /* next percent milestone (10, 20, ...) */
+
+	/* SPDK poller driving the rebuild loop */
+	struct spdk_poller *poller;
+
+	/* QoS: rate-limit rebuild to reduce foreground I/O impact. */
+	uint32_t  max_stripes_per_sec;  /* 0 = unlimited */
+	uint64_t  window_start_ticks;   /* start of current 1-second window */
+	uint32_t  stripes_this_window;  /* stripes submitted in current window */
+	bool      paused;               /* manual pause via RPC */
+	bool      cancel_requested;     /* set by stop_rebuild; poller drains I/O then finishes */
+
+	/*
+	 * Stripe-busy interlock.
+	 *
+	 * Rebuild now participates in the universal stripe-busy claim that
+	 * gates RMW, full-stripe writes, and UNMAP. When the poller picks a
+	 * stripe that is already claimed by a foreground writer it parks the
+	 * index on deferred_stripes and moves on. After the main per-slot
+	 * scan completes the poller flips into draining_deferred_stripes mode and
+	 * drains the queue. stripe_claimed tracks whether current_stripe is
+	 * presently held in ec->stripe_dirty_map so failure / cancel paths
+	 * can release it.
+	 */
+	bool      stripe_claimed;
+	bool      draining_deferred_stripes;
+	TAILQ_HEAD(ec_rebuild_deferred_tailq, ec_rebuild_deferred_stripe) deferred_stripes;
+
+	/* completion callback and opaque argument from the RPC layer */
+	ec_rebuild_cb_fn cb_fn;
+	void            *cb_arg;
+};
+
+/* =========================================================================
  * Write-Intent Bitmap (WIB)
  *
  * Protects against the RMW write-hole. One dirty bit per region of
