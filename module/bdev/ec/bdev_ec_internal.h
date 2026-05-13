@@ -103,6 +103,17 @@
 /* Maximum length (including NUL) of an EC bdev or base-bdev name. */
 #define EC_BDEV_NAME_MAX 256
 
+/* ISA-L gf_gen_decode_matrix() requires (k * m * 32) bytes for the
+ * encode / decode tables. */
+#define EC_ISAL_GF_TABLE_BYTES 32u
+
+/*
+ * ISA-L ec_init_tables requires 32 bytes per (k * f) entry to build
+ * the GF lookup tables. Used to size the on-stack decode_tbls[] scratch
+ * for both single- and multi-failure reconstruction paths.
+ */
+#define EC_ISAL_GF_TABLE_BYTES 32u
+
 /*
  * Thread-local context for EC bdev I/O. One instance per (bdev, thread).
  * base_chans[i] is the SPDK I/O channel for base bdev i, opened when the
@@ -373,6 +384,80 @@ struct ec_bdev {
 	TAILQ_ENTRY(ec_bdev) link;
 };
 
+/*
+ * struct ec_bdev_io
+ *
+ * Per-I/O context stored in bdev_io->driver_ctx.
+ */
+struct ec_bdev_io {
+	struct spdk_bdev_io *bdev_io;
+	struct ec_io_channel *ch;
+
+	uint64_t offset_blocks;
+	uint64_t num_blocks;
+	struct iovec *iovs;
+	int iovcnt;
+
+	/*
+	 * Zero-fill semantics. Set by EC's own UNMAP and zero-fill-range
+	 * paths (bdev_ec_unmap.c, ec_submit_rmw_zero_fill_range); native
+	 * WRITE_ZEROES is not advertised (see ec_io_type_supported), so it
+	 * never reaches here. The full-stripe and RMW modify steps skip the
+	 * iov-copy and rely on the zero-initialised DMA buffers / a memset of
+	 * the modified region. iovs/iovcnt are unused on the zero-fill path.
+	 */
+	bool     is_zero_fill;
+
+	uint32_t base_io_remaining;   /* outstanding child base I/Os; parent completes at 0 */
+	enum spdk_bdev_io_status status;
+
+	/*
+	 * One contiguous, DMA-aligned buffer holding a full stripe's data. The
+	 * caller's scattered write iovs are gathered into it so each of the k
+	 * data chunks is a contiguous slice -- what ISA-L encode and the base
+	 * writes need.
+	 */
+	void *bounce_buf;
+	struct iovec *data_iovs;
+	struct iovec *parity_iovs;
+	void **parity_bufs;
+
+	/*
+	 * Stripe-dirty claim release info. Set by ec_submit_full_write when
+	 * it claims its stripe; cleared by ec_child_io_complete on final
+	 * completion. Lets the shared completion path release the claim
+	 * without re-deriving the stripe from offset_blocks.
+	 *
+	 * stripe_claimed = true means "release stripe_claim_index on
+	 * completion." Other callers (read path) leave it false.
+	 */
+	bool     stripe_claimed;
+	uint64_t stripe_claim_index;
+
+	/*
+	 * WIB region inflight tracking for full-stripe writes. Set by
+	 * ec_submit_full_write after incrementing wib_region_inflight[];
+	 * cleared by ec_child_io_complete on final completion, which
+	 * decrements the counter. Required so the idle WIB poller does
+	 * not clear and persist the region bit while child writes are
+	 * still in flight (mirror of the same field on ec_rmw_ctx and
+	 * ec_unmap_ctx). Other callers (read path, RMW path, UNMAP path)
+	 * leave it false.
+	 */
+	bool     wib_inflight_held;
+	uint32_t wib_region;
+
+	/*
+	 * Write-into-unmapped flag. Set by ec_submit_write_into_unmapped
+	 * to mark this bdev_io as taking the post-completion bit-clear
+	 * path: ec_child_io_complete intercepts at base_io_remaining == 0,
+	 * submits a bit-clear via ec_submit_bit_clear_async, and defers
+	 * bdev_io completion (and stripe-busy release / buffer free) until
+	 * the bit-clear's persist acks at m+1. False on all other paths.
+	 */
+	bool     is_write_into_unmapped;
+};
+
 /* Global list type */
 TAILQ_HEAD(ec_all_tailq, ec_bdev);
 extern struct ec_all_tailq g_ec_bdev_list;
@@ -461,5 +546,25 @@ ec_only_parity_failed(const struct ec_bdev *ec)
 	}
 	return true;
 }
+
+/* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
+int ec_reconstruct_data_chunk(const struct ec_bdev *ec,
+			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
+			      uint8_t *out_buf, uint32_t failed_slot,
+			      uint64_t chunk_len);
+int ec_reconstruct_multi_data(const struct ec_bdev *ec,
+			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
+			      uint8_t *out_bufs[],
+			      const uint32_t failed_data_slots[],
+			      uint32_t f, uint64_t chunk_len);
+
+/*
+ * I/O entry points defined in bdev_ec_io.c and dispatched from
+ * ec_submit_request in bdev_ec.c.
+ */
+void ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
+		     struct spdk_bdev_io *bdev_io);
+int  ec_submit_read(struct ec_bdev_io *ec_io);
+int  ec_submit_write(struct ec_bdev_io *ec_io);
 
 #endif /* SPDK_BDEV_EC_INTERNAL_H */

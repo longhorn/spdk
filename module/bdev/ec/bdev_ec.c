@@ -875,10 +875,10 @@ ec_init_isa_l_tables(struct ec_bdev *ec)
 		return -ENOMEM;
 	}
 
-	ec->g_tbls = malloc(32 * ec->k * ec->m);
+	ec->g_tbls = malloc(EC_ISAL_GF_TABLE_BYTES * ec->k * ec->m);
 	if (!ec->g_tbls) {
 		SPDK_ERRLOG("EC bdev %s: OOM for g_tbls (%u bytes, k=%u m=%u)\n",
-			    ec->bdev.name, 32 * ec->k * ec->m, ec->k, ec->m);
+			    ec->bdev.name, EC_ISAL_GF_TABLE_BYTES * ec->k * ec->m, ec->k, ec->m);
 		free(ec->encode_matrix);
 		ec->encode_matrix = NULL;
 		return -ENOMEM;
@@ -1539,7 +1539,12 @@ ec_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 static void
 ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	struct ec_bdev *ec = ec_from_bdev_io(bdev_io);
+	struct ec_bdev_io    *ec_io = (struct ec_bdev_io *)bdev_io->driver_ctx;
+	struct ec_io_channel *ec_ch = spdk_io_channel_get_ctx(ch);
+	struct ec_bdev       *ec    = ec_from_bdev_io(bdev_io);
+	int                   rc    = 0;
+
+	ec_bdev_io_init(ec_io, ec_ch, bdev_io);
 
 	if (ec->offline) {
 		SPDK_DEBUGLOG(bdev_ec, "EC bdev %s OFFLINE -- rejecting I/O\n", ec->bdev.name);
@@ -1548,14 +1553,25 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 	}
 
 	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		rc = ec_submit_read(ec_io);
+		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 		return;
 	default:
 		SPDK_ERRLOG("Invalid IO type %d\n", bdev_io->type);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
+		rc = -EINVAL;
+		break;
+	}
+
+	if (rc != 0) {
+		if (rc == -EAGAIN || rc == -ENOMEM) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
+		} else {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
 	}
 }
 
