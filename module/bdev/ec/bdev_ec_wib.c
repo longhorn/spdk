@@ -126,17 +126,18 @@ ec_wib_deferred_drain(void *cb_arg, int rc)
 		/*
 		 * The follow-up WIB persist failed: any dirty bit set after
 		 * the prior persist started is still in memory only, so the
-		 * deferred RMWs' data writes must NOT go out -- doing so would
-		 * leave new data with stale parity protected only by an
-		 * unrecorded write-intent, recreating the write-hole the WIB
-		 * exists to prevent (visible on crash via degraded read of
-		 * the affected stripe). Complete each deferred RMW with NOMEM
-		 * status so SPDK retries the bdev_io from scratch; the next
-		 * attempt will re-enter ec_rmw_persist_and_submit and either
-		 * find the in-memory bit already durable from a later persist
-		 * or trigger a fresh persist. The in-memory bit is left set:
-		 * it correctly reflects "this region needs persisting" and
-		 * will be drained by the next successful persist.
+		 * deferred RMWs' resumed reads must NOT proceed -- doing so
+		 * would (after a successful subsequent persist) let writes
+		 * land with stale parity protected only by an unrecorded
+		 * write-intent, recreating the write-hole the WIB exists to
+		 * prevent (visible on crash via degraded read of the affected
+		 * stripe). Complete each deferred RMW with NOMEM status so
+		 * SPDK retries the bdev_io from scratch; the next attempt will
+		 * re-enter ec_rmw_persist_and_dispatch and either find the
+		 * in-memory bit already durable from a later persist or
+		 * trigger a fresh persist. The in-memory bit is left set: it
+		 * correctly reflects "this region needs persisting" and will
+		 * be drained by the next successful persist.
 		 */
 		SPDK_ERRLOG("EC bdev %s: WIB deferred persist failed "
 			    "(rc=%d); failing deferred RMW(s) via NOMEM "
@@ -152,10 +153,22 @@ ec_wib_deferred_drain(void *cb_arg, int rc)
 		return;
 	}
 
+	/*
+	 * Persist succeeded: resume each deferred RMW at the read-dispatch
+	 * step (post-B1, the WIB persist runs BEFORE reads, so a deferred
+	 * RMW has not read anything yet -- its chunk_bufs are zeroed DMA).
+	 * Resuming at ec_rmw_submit_writes would fan out all-zero data +
+	 * parity-encoded-from-zeros over live stripe data -> silent
+	 * corruption.
+	 *
+	 * TAILQ_FOREACH_SAFE captures tmp before the body runs, so the
+	 * post-call ownership transfer in ec_rmw_dispatch_reads (which may
+	 * self-complete and free mctx on total submit failure) is safe.
+	 */
 	TAILQ_FOREACH_SAFE(mctx, &ec->wib_deferred_writes, wib_defer_link,
 			   tmp) {
 		TAILQ_REMOVE(&ec->wib_deferred_writes, mctx, wib_defer_link);
-		ec_rmw_submit_writes(mctx);
+		ec_rmw_dispatch_reads(mctx);
 	}
 }
 
@@ -289,7 +302,7 @@ ec_wib_persist_sync_finish(struct ec_bdev *ec, struct ec_wib_persist_ctx *pctx)
  * persist at a time.
  *
  * Routing is the cleaner long-term answer, but the I/O-path callers
- * (ec_submit_full_write, ec_rmw_persist_and_submit) currently consume
+ * (ec_submit_full_write, ec_rmw_persist_and_dispatch) currently consume
  * the synchronous rc from ec_wib_persist to drive rollback / NOMEM
  * retry. Translating those sync failures into cb-delivered
  * SPDK_BDEV_IO_STATUS_NOMEM completions at every caller is the same

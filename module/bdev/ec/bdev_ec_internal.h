@@ -1472,17 +1472,20 @@ int ec_reconstruct_multi_data(const struct ec_bdev *ec,
  * arrays. Two function calls bridge them:
  *
  *   bdev_ec_rmw.c -> bdev_ec_wib.c
- *     ec_rmw_persist_and_submit calls ec_wib_persist to set a region's
- *     on-disk dirty bit before the data + parity writes go out. When
- *     a persist is already in flight, the RMW context is queued on
- *     wib_deferred_writes and wib_repersist_needed is set.
+ *     ec_rmw_persist_and_dispatch calls ec_wib_persist to set a
+ *     region's on-disk dirty bit BEFORE the reads go out (the B1
+ *     restructure moved the persist from after-modify to right after
+ *     setup, so the persist-completion -> reads edge is the single
+ *     multi-reactor hop point). When a persist is already in flight,
+ *     the RMW context is queued on wib_deferred_writes and (on the
+ *     was_clean = true branch) wib_repersist_needed is set.
  *
  *   bdev_ec_wib.c -> bdev_ec_rmw.c
  *     ec_wib_persist_write_cb, on the final write completion, drains
  *     wib_deferred_writes via ec_wib_deferred_drain, which calls
- *     ec_rmw_submit_writes for each queued context.
+ *     ec_rmw_dispatch_reads for each queued context.
  *
- * Both bridge functions (ec_wib_persist and ec_rmw_submit_writes) are
+ * Both bridge functions (ec_wib_persist and ec_rmw_dispatch_reads) are
  * declared in the section immediately below.
  * ========================================================================= */
 
@@ -1513,9 +1516,12 @@ int      ec_wib_idle_poller_cb(void *arg);
 void     ec_wib_load_async(struct ec_bdev *ec,
 			   ec_bdev_create_cb_fn done_fn, void *done_arg);
 
-/* WIB->RMW bridge: drained by ec_wib_deferred_drain. See the
- * WIB <-> RMW protocol section above. */
-void     ec_rmw_submit_writes(struct ec_rmw_ctx *mctx);
+/* WIB->RMW bridges. ec_wib_deferred_drain resumes each queued RMW by
+ * dispatching its reads -- after the B1 restructure the WIB persist
+ * runs before reads, so a deferred RMW has not read yet and its DMA
+ * bufs are still zeroed (resuming at writes would fan out zeros over
+ * live stripe data). See the WIB <-> RMW protocol section above. */
+void     ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx);
 
 /*
  * Complete a deferred RMW with mctx->status (set by the caller) and tear

@@ -10,7 +10,8 @@
  * reads the surviving data chunks, overlays the payload, re-encodes
  * parity, then writes back. Each function's header documents its place
  * in the async chain; the WIB persist that gates the writes lives in
- * bdev_ec_wib.c (ordering enforced in ec_rmw_persist_and_submit).
+ * bdev_ec_wib.c (ordering enforced in ec_rmw_persist_and_dispatch,
+ * which runs the persist BEFORE reads -- see the B1 design doc).
  */
 
 #include "bdev_ec_internal.h"
@@ -105,21 +106,13 @@ ec_rmw_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 }
 
-/* Forward decls for the WIB set callback. ec_rmw_submit_writes is also
- * exposed in bdev_ec_internal.h -- ec_wib_deferred_drain calls it. */
-static void ec_rmw_persist_and_submit(struct ec_rmw_ctx *mctx);
+/* Forward decls. ec_rmw_dispatch_reads is also exposed in
+ * bdev_ec_internal.h -- ec_wib_deferred_drain calls it post-B1, since
+ * a deferred RMW resumes at the read-dispatch step (its DMA bufs are
+ * still zeroed and a write fan-out would corrupt the stripe). */
+static void ec_rmw_persist_and_dispatch(struct ec_rmw_ctx *mctx, bool was_clean);
 static void ec_rmw_wib_set_cb(void *cb_arg, int rc);
-
-/*
- * send_msg target for routing the write dispatch to the submitter
- * thread. Re-enters ec_rmw_submit_writes; on the submitter thread the
- * routing check at the top inlines and runs the dispatch body.
- */
-static void
-ec_rmw_dispatch_writes_on_submitter(void *ctx)
-{
-	ec_rmw_submit_writes((struct ec_rmw_ctx *)ctx);
-}
+static void ec_rmw_submit_writes(struct ec_rmw_ctx *mctx);
 
 /*
  * send_msg target for routing the bdev_io completion to the submitter
@@ -134,18 +127,19 @@ ec_rmw_complete_on_submitter(void *ctx)
 }
 
 /*
- * Called when the WIB persist (marking the region dirty on disk) completes.
- * On success, the write-intent ordering is satisfied (the dirty bit is
- * durable, so a crash mid-write is recoverable via the startup scrub) and
- * we submit the data and parity writes.
+ * Called when the WIB persist (marking the region dirty on disk)
+ * completes. The persist now happens BEFORE reads (moved from after-
+ * modify/encode by the B1 restructure), so on success this resumes
+ * by dispatching the reads -- not by submitting writes (the RMW
+ * hasn't read anything yet and its chunk_bufs are zeroed DMA).
  *
- * On persist failure, the on-disk WIB bit is not durable. Submitting the
- * writes anyway would risk silent corruption: stale parity could land
- * with no on-disk dirty bit to trigger the startup scrub. Instead we
- * clear the in-memory dirty bit (so the next RMW for this region re-
- * persists rather than taking the skip-persist fast path) and complete
- * with NOMEM so SPDK requeues. ec_rmw_complete unwinds the stripe-busy
- * claim, the in-flight counters, and the DMA buffers.
+ * On persist failure, the on-disk WIB bit is not durable. Resuming
+ * reads/writes anyway would risk silent corruption: stale parity
+ * could land with no on-disk dirty bit to trigger the startup scrub.
+ * Instead we clear the in-memory dirty bit (so the next RMW for this
+ * region re-persists rather than taking the skip-persist fast path)
+ * and complete with NOMEM so SPDK requeues. ec_rmw_complete unwinds
+ * the stripe-busy claim, the in-flight counters, and the DMA buffers.
  */
 static void
 ec_rmw_wib_set_cb(void *cb_arg, int rc)
@@ -160,7 +154,7 @@ ec_rmw_wib_set_cb(void *cb_arg, int rc)
 		 * requeues the bdev_io. WARNLOG (not ERRLOG) so monitoring
 		 * does not alert on a retryable error. */
 		SPDK_WARNLOG("EC bdev %s: WIB set persist failed (rc=%d) "
-			     "before RMW write fan-out at stripe %" PRIu64 "; "
+			     "before RMW read dispatch at stripe %" PRIu64 "; "
 			     "requeueing to preserve write-intent ordering\n",
 			     ec->bdev.name, rc, mctx->stripe_index);
 
@@ -170,7 +164,7 @@ ec_rmw_wib_set_cb(void *cb_arg, int rc)
 		return;
 	}
 
-	ec_rmw_submit_writes(mctx);
+	ec_rmw_dispatch_reads(mctx);
 }
 
 /*
@@ -326,83 +320,84 @@ ec_rmw_reads_done(struct ec_rmw_ctx *mctx)
 			       parity_ptrs);
 	}
 
-	/* Step 4: persist the WIB dirty bit (if needed) and submit writes. */
-	ec_rmw_persist_and_submit(mctx);
+	/*
+	 * The WIB persist already happened in the setup phase (before reads),
+	 * so all that's left is dispatching the writes. The single-writer-on-
+	 * home invariant for stripe_dirty_map, wib_region_inflight, etc. is
+	 * preserved because the persist decision lived in setup -- we never
+	 * reach here without those state mutations having been performed on
+	 * home. The reads_done -> writes transition stays on submitter (no
+	 * home thread state mutation between here and submit_writes).
+	 */
+	ec_rmw_submit_writes(mctx);
 }
 
 /*
- * Final phase of the RMW chain: ensure the WIB region bit is on disk
- * before the data/parity writes go out, then submit those writes.
+ * WIB persist decision + dispatch hand-off. Runs on the home thread
+ * (called from ec_rmw_submit_core's setup tail). The persist must
+ * land on disk BEFORE the read fan-out (and therefore before any
+ * write) -- the B1 restructure moved this from after-modify/encode
+ * to right after setup.
  *
- * The decision tree:
+ * was_clean reflects whether the in-memory WIB region bit was clear
+ * before the setup-phase set_dirty call (captured BEFORE set_dirty
+ * so the dirty_ticks recording in setup is accurate). It drives the
+ * persist decision:
  *
- *   region already dirty on disk
- *     -> proceed directly to ec_rmw_submit_writes
+ *   was_clean = false  (region already dirty in memory pre-setup)
+ *     The bit may or may not be on disk yet. If wib_persist_in_flight,
+ *     a persist is in flight whose buffer snapshot might or might
+ *     not include this bit; defer this RMW on wib_deferred_writes
+ *     until durability is confirmed. Otherwise the bit is durable
+ *     and we proceed directly to ec_rmw_dispatch_reads.
  *
- *   region clean, no persist in flight
- *     -> set in-memory bit, start a persist with ec_rmw_wib_set_cb
- *     -> ec_rmw_wib_set_cb invokes ec_rmw_submit_writes on completion
+ *   was_clean = true  (setup just set the bit)
+ *     If wib_persist_in_flight, a persist is in flight whose buffer
+ *     snapshot predates the bit; defer and set wib_repersist_needed
+ *     so the follow-up persist puts the new bit on disk. Otherwise
+ *     start a persist (ec_rmw_wib_set_cb -> dispatch_reads).
  *
- *   region clean, persist already in flight
- *     -> set in-memory bit, queue this RMW on wib_deferred_writes
- *        and set wib_repersist_needed; the in-flight persist
- *        snapshotted wib_region_map into wib_buf before this bit
- *        was set, so a follow-up persist is required to put the
- *        new bit on disk. ec_wib_deferred_drain calls
- *        ec_rmw_submit_writes once that follow-up completes.
+ * Two deferral paths both queue on wib_deferred_writes;
+ * ec_wib_deferred_drain calls ec_rmw_dispatch_reads on each entry
+ * once the in-flight persist (or its follow-up) completes.
  *
- * wib_region_inflight[region] was already incremented in
- * ec_submit_rmw_write (paired with ec_stripe_set_dirty), so every
- * exit path through ec_rmw_complete has a matching decrement
+ * wib_region_inflight[region] was already incremented in setup, so
+ * every exit path through ec_rmw_complete has a matching decrement
  * regardless of which branch fires here.
  */
 static void
-ec_rmw_persist_and_submit(struct ec_rmw_ctx *mctx)
+ec_rmw_persist_and_dispatch(struct ec_rmw_ctx *mctx, bool was_clean)
 {
 	struct ec_bdev *ec     = ec_from_bdev_io(mctx->ec_io->bdev_io);
 	uint32_t        region = ec_wib_stripe_to_region(mctx->stripe_index);
 	int             persist_rc;
 
-	/*
-	 * This function runs on the home thread because the WIB persist
-	 * below (ec_wib_persist) uses ec->wib_chans[], which are owned by
-	 * that thread.
-	 *
-	 * Routing the call to home when entered from a different thread is
-	 * deferred to the multi-reactor follow-up. It would mean replacing
-	 * the synchronous error returns here (-EAGAIN for retry, or a hard
-	 * failure that avoids data/parity inconsistency on crash) with
-	 * cb-delivered SPDK_BDEV_IO_STATUS_NOMEM completions; the UNMAP
-	 * and full-stripe-write paths need the same change.
-	 *
-	 * Only single-reactor SPDK targets are supported. The assert
-	 * catches accidental cross-thread use; without it the persist
-	 * would dispatch I/O on a channel it doesn't own.
-	 */
+	/* Home-thread invariant: ec_wib_persist uses ec->wib_chans[]. */
 	assert(spdk_get_thread() == ec->home_thread);
 
-	if (ec_wib_region_is_dirty(ec, region)) {
+	if (!was_clean) {
 		if (ec->wib_persist_in_flight) {
-			/* Bit set but possibly not yet on disk (set before
-			 * or after the in-flight persist's snapshot). Defer
-			 * until durability is confirmed; ec_wib_deferred_drain
-			 * submits the writes. */
+			/* Bit was set pre-setup but may not be on disk
+			 * (set before or after the in-flight persist's
+			 * snapshot). Defer reads until durability is
+			 * confirmed; ec_wib_deferred_drain dispatches
+			 * reads when the persist completes. */
 			TAILQ_INSERT_TAIL(&ec->wib_deferred_writes, mctx,
 					  wib_defer_link);
 			return;
 		}
-		/* No persist in flight: bit is durable. */
-		ec_rmw_submit_writes(mctx);
+		/* No persist in flight: the pre-setup bit is durable. */
+		ec_rmw_dispatch_reads(mctx);
 		return;
 	}
 
-	/* First RMW into this region -- set the in-memory bit. */
-	ec_wib_region_set_dirty(ec, region);
-
+	/* Setup just set the in-memory bit (this is the first RMW into
+	 * this region in the current dirty window). */
 	if (ec->wib_persist_in_flight) {
-		/* A persist is in flight whose buffer snapshot predates the
-		 * bit we just set. Defer until a follow-up persist puts it
-		 * on disk. ec_wib_deferred_drain submits the writes. */
+		/* The in-flight persist's buffer snapshot predates the
+		 * bit setup just wrote. Defer and request a follow-up
+		 * persist; ec_wib_deferred_drain dispatches reads once
+		 * the bit is durable. */
 		ec->wib_repersist_needed = true;
 		TAILQ_INSERT_TAIL(&ec->wib_deferred_writes, mctx,
 				  wib_defer_link);
@@ -416,22 +411,24 @@ ec_rmw_persist_and_submit(struct ec_rmw_ctx *mctx)
 		SPDK_ERRLOG("EC bdev %s: WIB persist alloc failed (rc=%d); "
 			    "failing I/O\n", ec->bdev.name, persist_rc);
 		/*
-		 * Roll back the region bit we set above: no persist recorded it
+		 * Roll back the region bit setup wrote: no persist recorded it
 		 * and ec_rmw_complete does not clear it, so leaving it set would
 		 * let a retry skip the WIB persist and write with no on-disk
-		 * intent. No writes were issued, so nothing needs scrubbing.
+		 * intent. No reads/writes have been issued, so nothing needs
+		 * scrubbing.
 		 */
 		ec_wib_region_clear_dirty(ec, region);
 		mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 		ec_rmw_complete(mctx);
 	}
-	/* else: ec_rmw_wib_set_cb will call ec_rmw_submit_writes. */
+	/* else: ec_rmw_wib_set_cb will call ec_rmw_dispatch_reads. */
 }
 
 /*
- * Submit the data and parity writes for a completed RMW. Called either
- * directly from ec_rmw_reads_done (when the WIB region was already dirty)
- * or from ec_rmw_wib_set_cb (after the region bit has been persisted to disk).
+ * Submit the data and parity writes for a completed RMW. Sole caller is
+ * ec_rmw_reads_done; the WIB persist already ran in the setup phase, so by
+ * the time the reads complete the region bit is on disk and the writes can
+ * fan out unconditionally.
  *
  * Only the modified data chunks in [modified_chunk_first, modified_chunk_last]
  * are written back. For ordinary WRITE this is always a single chunk
@@ -442,7 +439,7 @@ ec_rmw_persist_and_submit(struct ec_rmw_ctx *mctx)
  * All m writable parity chunks are always written (recomputed from all k
  * data chunks).
  */
-void
+static void
 ec_rmw_submit_writes(struct ec_rmw_ctx *mctx)
 {
 	struct ec_bdev_io *ec_io = mctx->ec_io;
@@ -452,53 +449,10 @@ ec_rmw_submit_writes(struct ec_rmw_ctx *mctx)
 	uint32_t           writable_count = 0;
 
 	/*
-	 * Route the write dispatch to the submitter thread. This function
-	 * is reached from three home-thread call sites:
-	 *
-	 *   - ec_rmw_wib_set_cb (after a successful WIB persist)
-	 *   - ec_rmw_persist_and_submit inline path (when the bit was
-	 *     already durable on entry)
-	 *   - ec_wib_deferred_drain (queued RMWs flushed after the
-	 *     in-flight persist that gated them completes)
-	 *
-	 * All three need to dispatch base I/O on ec_io->ch->base_chans[],
-	 * which are owned by the submitter thread. In single-reactor
-	 * deployments submitter == home, so the inline branch runs and
-	 * behavior is bit-identical to before.
-	 */
-	if (spdk_unlikely(spdk_get_thread() != ec_io->submitter_thread)) {
-		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
-			ec_rmw_dispatch_writes_on_submitter, mctx);
-		if (send_rc != 0) {
-			/*
-			 * Persist already completed; we cannot reach the
-			 * submitter for the write dispatch. The on-disk WIB
-			 * bit is set, so a crash here is scrub-recoverable.
-			 * Fail the bdev_io via a second send_msg to the
-			 * submitter (spdk_bdev_io_complete asserts owner
-			 * thread). Same shape as Site 2.
-			 */
-			SPDK_ERRLOG("EC bdev %s: cannot hand off RMW writes "
-				    "to submitter thread (rc=%d) at stripe "
-				    "%" PRIu64 "; failing bdev_io\n",
-				    ec->bdev.name, send_rc, mctx->stripe_index);
-			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
-			int complete_rc = spdk_thread_send_msg(
-				ec_io->submitter_thread,
-				ec_rmw_complete_on_submitter, mctx);
-			if (complete_rc != 0) {
-				SPDK_ERRLOG("EC bdev %s: also cannot hand off "
-					    "failure completion (rc=%d); "
-					    "bdev_io stays in-flight\n",
-					    ec->bdev.name, complete_rc);
-			}
-		}
-		return;
-	}
-
-	/*
-	 * Dispatch invariant: post-routing, we run on the submitter
-	 * thread. ec_io->ch->base_chans[] are owned here.
+	 * Dispatch invariant: the sole caller (ec_rmw_reads_done) runs on
+	 * the submitter thread because base-bdev read completions land on
+	 * the channel's owning thread. ec_io->ch->base_chans[] are owned
+	 * here, so dispatch can run inline with no routing hop.
 	 */
 	assert(spdk_get_thread() == ec_io->submitter_thread);
 
@@ -768,23 +722,41 @@ ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
  * completion accounting.
  */
 /*
- * Submitter-side half of the RMW core: dispatches reads on
- * ec_io->ch->base_chans[] (submitter-owned). Separated from
- * ec_rmw_submit_core's setup half so the persist-done -> submitter hop
- * (planned for a subsequent commit) can land cleanly between them.
+ * Submitter-side resume of the RMW chain: dispatches reads on
+ * ec_io->ch->base_chans[] (submitter-owned). Reached from three
+ * home-thread call sites after the B1 restructure:
  *
- * On partial submit failure, undoes the home-side bookkeeping
- * (stripe-busy claim, in-flight counters) before returning. All the
- * state mutated here uses atomic ops (ec_stripe_clear_dirty,
- * ec_rmw_in_flight_dec, ec_wib_region_inflight_dec), so this cleanup
- * is safe to run on the submitter thread.
+ *   - ec_rmw_persist_and_dispatch (inline, when the region bit was
+ *     already durable -- no persist needed).
+ *   - ec_rmw_wib_set_cb (after a successful WIB persist).
+ *   - ec_wib_deferred_drain (after a deferred persist completes).
  *
- * Returns 0 on success (read I/O submitted asynchronously). Returns
- * -EIO if all read submits failed synchronously and the chain was
- * torn down inline. Some-succeeded-some-failed is treated as success
- * here -- the completion path uses the recorded FAILED status.
+ * In single-reactor home == submitter and the function runs inline;
+ * the multi-reactor send_msg hop will land here as in-function
+ * routing (mirroring C5a in ec_rmw_submit_writes) in a subsequent
+ * commit.
+ *
+ * Takes ownership of mctx on the all-reads-failed path: undoes the
+ * home-side bookkeeping (claim, counters) using atomic ops (which
+ * are safe from any thread after C3), self-completes the bdev_io
+ * with FAILED status (we are on the submitter = bdev_io owner
+ * thread, so spdk_bdev_io_complete is safe), and frees the ctx. The
+ * caller must NOT touch mctx after this returns.
+ *
+ * Note on the in-memory WIB region bit on the all-failed path: the
+ * bit is left as setup wrote it (not cleared here). On the cold-
+ * region first-RMW transition setup's set_dirty already published
+ * the bit, and a successful persist may have put it on disk; even
+ * if no writes were issued, the in-flight counter dec lets the idle
+ * WIB poller clear the bit once the region is quiescent. Not a
+ * write-hole: no data was written, the on-disk bit is durable, and
+ * the poller is the clean owner. The cold-region read-failure leaves
+ * the region dirty in memory until the idle poller -- a small
+ * behavior delta from pre-B1 (where the bit was set after reads, so
+ * a failed read meant no bit was ever set) that folds into the same
+ * idle-clear window every successful RMW already exercises.
  */
-static int
+void
 ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 {
 	struct ec_bdev_io *ec_io           = mctx->ec_io;
@@ -838,18 +810,23 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 			    ec->bdev.name, reads_submitted, ec->k, stripe_index);
 
 		if (mctx->reads_remaining == 0) {
+			struct spdk_bdev_io *bdev_io = ec_io->bdev_io;
+
 			/*
 			 * All submits failed synchronously. No callbacks will
-			 * fire. Clean up the dirty state and context now,
-			 * including the wib_region_inflight decrement that
-			 * ec_rmw_complete would normally perform.
+			 * fire. Tear down the home-side bookkeeping (claim,
+			 * counters) and self-complete the bdev_io. The
+			 * in-memory WIB bit is intentionally NOT cleared here
+			 * -- see the function preamble.
 			 */
 			ec_stripe_clear_dirty(ec, stripe_index);
 			ec_rmw_in_flight_dec(ec);
 			ec_wib_region_inflight_dec(ec,
 				ec_wib_stripe_to_region(stripe_index));
 			ec_rmw_free_ctx(mctx, ec);
-			return -EIO;
+			spdk_bdev_io_complete(bdev_io,
+					      SPDK_BDEV_IO_STATUS_FAILED);
+			return;
 		}
 
 		/*
@@ -858,8 +835,6 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 		 */
 		mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 	}
-
-	return 0;
 }
 
 /*
@@ -989,20 +964,41 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 	 * step 4. If reconstruction fails at step 1, or OOM at step 2,
 	 * ec_rmw_complete is called directly and decrements this counter; the
 	 * increment here ensures the counter stays consistent.
+	 *
+	 * The B1 restructure moved the WIB region in-memory bit set + persist
+	 * decision here (out of the post-modify ec_rmw_persist_and_submit
+	 * function). The persist must land on disk BEFORE the read fan-out so
+	 * a single multi-reactor hop at the persist-completion -> reads edge
+	 * covers the entire submitter half. was_clean is the pre-set snapshot
+	 * of the bit; it drives the persist decision in
+	 * ec_rmw_persist_and_dispatch and ensures dirty_ticks is recorded
+	 * only on the cold-region first-RMW transition.
 	 */
 	{
 		uint32_t region = ec_wib_stripe_to_region(stripe_index);
+		bool     was_clean;
+
+		was_clean = !ec_wib_region_is_dirty(ec, region);
 		ec_wib_region_inflight_inc(ec, region);
-		/* Record when the region first became active (for idle timer) */
-		if (!ec_wib_region_is_dirty(ec, region)) {
-			ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
+		if (was_clean) {
+			ec_wib_region_set_dirty(ec, region);
 		}
+		ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
+
+		/*
+		 * Setup complete. Hand off to the persist + dispatch decision.
+		 * persist_and_dispatch owns the mctx from this point: it either
+		 * starts a persist (ec_rmw_wib_set_cb -> ec_rmw_dispatch_reads),
+		 * queues on wib_deferred_writes (ec_wib_deferred_drain ->
+		 * ec_rmw_dispatch_reads), or proceeds directly to dispatch when
+		 * the bit was already durable. The setup half returns 0 ("queued
+		 * via the cb chain"); any error completion happens through
+		 * ec_rmw_complete -> spdk_bdev_io_complete.
+		 */
+		ec_rmw_persist_and_dispatch(mctx, was_clean);
 	}
 
-	/* Setup complete. Hand off to the submitter-side read dispatch.
-	 * Today both halves run inline on the same thread; the persist-done
-	 * -> submitter hop will be inserted here in a subsequent commit. */
-	return ec_rmw_dispatch_reads(mctx);
+	return 0;
 }
 
 /*
