@@ -111,6 +111,29 @@ static void ec_rmw_persist_and_submit(struct ec_rmw_ctx *mctx);
 static void ec_rmw_wib_set_cb(void *cb_arg, int rc);
 
 /*
+ * send_msg target for routing the write dispatch to the submitter
+ * thread. Re-enters ec_rmw_submit_writes; on the submitter thread the
+ * routing check at the top inlines and runs the dispatch body.
+ */
+static void
+ec_rmw_dispatch_writes_on_submitter(void *ctx)
+{
+	ec_rmw_submit_writes((struct ec_rmw_ctx *)ctx);
+}
+
+/*
+ * send_msg target for routing the bdev_io completion to the submitter
+ * thread on the unhappy path where the post-persist write dispatch
+ * cannot be handed off to the submitter (a second-stage send_msg
+ * failure). Same shape as Site 2.
+ */
+static void
+ec_rmw_complete_on_submitter(void *ctx)
+{
+	ec_rmw_complete((struct ec_rmw_ctx *)ctx);
+}
+
+/*
  * Called when the WIB persist (marking the region dirty on disk) completes.
  * On success, the write-intent ordering is satisfied (the dirty bit is
  * durable, so a crash mid-write is recoverable via the startup scrub) and
@@ -429,11 +452,53 @@ ec_rmw_submit_writes(struct ec_rmw_ctx *mctx)
 	uint32_t           writable_count = 0;
 
 	/*
-	 * Dispatch invariant: RMW writes use ec_io->ch->base_chans[],
-	 * which are owned by the submitter thread. The RMW persist-done ->
-	 * submitter hop (planned for a subsequent commit) ensures this
-	 * assertion holds for the multi-reactor path; today single-reactor
-	 * makes submitter == home, so it passes trivially.
+	 * Route the write dispatch to the submitter thread. This function
+	 * is reached from three home-thread call sites:
+	 *
+	 *   - ec_rmw_wib_set_cb (after a successful WIB persist)
+	 *   - ec_rmw_persist_and_submit inline path (when the bit was
+	 *     already durable on entry)
+	 *   - ec_wib_deferred_drain (queued RMWs flushed after the
+	 *     in-flight persist that gated them completes)
+	 *
+	 * All three need to dispatch base I/O on ec_io->ch->base_chans[],
+	 * which are owned by the submitter thread. In single-reactor
+	 * deployments submitter == home, so the inline branch runs and
+	 * behavior is bit-identical to before.
+	 */
+	if (spdk_unlikely(spdk_get_thread() != ec_io->submitter_thread)) {
+		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_rmw_dispatch_writes_on_submitter, mctx);
+		if (send_rc != 0) {
+			/*
+			 * Persist already completed; we cannot reach the
+			 * submitter for the write dispatch. The on-disk WIB
+			 * bit is set, so a crash here is scrub-recoverable.
+			 * Fail the bdev_io via a second send_msg to the
+			 * submitter (spdk_bdev_io_complete asserts owner
+			 * thread). Same shape as Site 2.
+			 */
+			SPDK_ERRLOG("EC bdev %s: cannot hand off RMW writes "
+				    "to submitter thread (rc=%d) at stripe "
+				    "%" PRIu64 "; failing bdev_io\n",
+				    ec->bdev.name, send_rc, mctx->stripe_index);
+			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+			int complete_rc = spdk_thread_send_msg(
+				ec_io->submitter_thread,
+				ec_rmw_complete_on_submitter, mctx);
+			if (complete_rc != 0) {
+				SPDK_ERRLOG("EC bdev %s: also cannot hand off "
+					    "failure completion (rc=%d); "
+					    "bdev_io stays in-flight\n",
+					    ec->bdev.name, complete_rc);
+			}
+		}
+		return;
+	}
+
+	/*
+	 * Dispatch invariant: post-routing, we run on the submitter
+	 * thread. ec_io->ch->base_chans[] are owned here.
 	 */
 	assert(spdk_get_thread() == ec_io->submitter_thread);
 
