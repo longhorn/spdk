@@ -127,6 +127,32 @@ ec_rmw_complete_on_submitter(void *ctx)
 }
 
 /*
+ * send_msg target for routing the read dispatch to the submitter
+ * thread. Re-enters ec_rmw_dispatch_reads; on the submitter thread
+ * the routing check at the top inlines and runs the dispatch body.
+ */
+static void
+ec_rmw_dispatch_reads_on_submitter(void *ctx)
+{
+	ec_rmw_dispatch_reads((struct ec_rmw_ctx *)ctx);
+}
+
+/*
+ * send_msg target for routing a FAILED bdev_io completion to the
+ * submitter when the read-dispatch hand-off itself fails AND the
+ * mctx has already been freed by the time we discover the failure.
+ * Takes ec_bdev_io (which lives inside bdev_io->driver_ctx and
+ * therefore outlives mctx).
+ */
+static void
+ec_rmw_complete_bdev_io_failed_on_submitter(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+
+	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+}
+
+/*
  * Called when the WIB persist (marking the region dirty on disk)
  * completes. The persist now happens BEFORE reads (moved from after-
  * modify/encode by the B1 restructure), so on success this resumes
@@ -701,60 +727,20 @@ ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
 }
 
 /*
- * Shared RMW submit core. Takes an explicit (offset_blocks, num_blocks,
- * is_zero_fill) so callers can either pull these from a bdev_io
- * (ec_submit_rmw_write) or override them for an internal sub-range
- * operation (ec_submit_rmw_zero_fill_range, used by the multi-segment
- * UNMAP dispatcher to physically reclaim partial-stripe head/tail
- * fragments via RMW zero-fill).
- *
- * cb_fn / cb_arg are stashed on the ctx and consulted in
- * ec_rmw_complete: NULL means "complete the parent bdev_io directly"
- * (the legacy path), non-NULL means "invoke the coordinator callback
- * instead." See struct ec_rmw_ctx in bdev_ec_internal.h.
- *
- * Returns 0 on success (I/O submitted asynchronously, cb_fn or
- * spdk_bdev_io_complete will fire later). Returns -EAGAIN if any RMW
- * guard fires (caller maps to NOMEM/requeue). Returns -ENOMEM on
- * allocation failure. Returns -EINVAL if a non-zero-fill payload
- * spans multiple strips (the production canary for splitter regressions).
- * On non-zero return cb_fn is NOT invoked -- the caller owns
- * completion accounting.
- */
-/*
  * Submitter-side resume of the RMW chain: dispatches reads on
- * ec_io->ch->base_chans[] (submitter-owned). Reached from three
- * home-thread call sites after the B1 restructure:
+ * ec_io->ch->base_chans[] (submitter-owned). Reached from three home-thread
+ * call sites in the post-persist resume:
  *
- *   - ec_rmw_persist_and_dispatch (inline, when the region bit was
- *     already durable -- no persist needed).
+ *   - ec_rmw_persist_and_dispatch (inline, when the region bit was already durable).
  *   - ec_rmw_wib_set_cb (after a successful WIB persist).
  *   - ec_wib_deferred_drain (after a deferred persist completes).
  *
- * In single-reactor home == submitter and the function runs inline;
- * the multi-reactor send_msg hop will land here as in-function
- * routing (mirroring C5a in ec_rmw_submit_writes) in a subsequent
- * commit.
+ * When the caller is already on the submitter the routing check inlines.
  *
- * Takes ownership of mctx on the all-reads-failed path: undoes the
- * home-side bookkeeping (claim, counters) using atomic ops (which
- * are safe from any thread after C3), self-completes the bdev_io
- * with FAILED status (we are on the submitter = bdev_io owner
- * thread, so spdk_bdev_io_complete is safe), and frees the ctx. The
- * caller must NOT touch mctx after this returns.
- *
- * Note on the in-memory WIB region bit on the all-failed path: the
- * bit is left as setup wrote it (not cleared here). On the cold-
- * region first-RMW transition setup's set_dirty already published
- * the bit, and a successful persist may have put it on disk; even
- * if no writes were issued, the in-flight counter dec lets the idle
- * WIB poller clear the bit once the region is quiescent. Not a
- * write-hole: no data was written, the on-disk bit is durable, and
- * the poller is the clean owner. The cold-region read-failure leaves
- * the region dirty in memory until the idle poller -- a small
- * behavior delta from pre-B1 (where the bit was set after reads, so
- * a failed read meant no bit was ever set) that folds into the same
- * idle-clear window every successful RMW already exercises.
+ * Takes ownership of mctx on the all-reads-failed path: undoes the home-side
+ * bookkeeping using relaxed atomics, completes the bdev_io FAILED, frees the
+ * ctx. The in-memory WIB region bit is intentionally left set on this path;
+ * the on-disk bit is durable and the idle WIB poller is the clean owner.
  */
 void
 ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
@@ -766,12 +752,56 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 	uint32_t           disk;
 	int                rc;
 
+	/* Route the read dispatch to the submitter thread; see the function header for the three home-side callers. The inline path runs when the caller is already on submitter. */
+	if (spdk_unlikely(spdk_get_thread() != ec_io->submitter_thread)) {
+		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_rmw_dispatch_reads_on_submitter, mctx);
+		if (send_rc != 0) {
+			/*
+			 * Persist already completed; we cannot reach the
+			 * submitter for the read dispatch. The on-disk WIB
+			 * bit is set, so a crash here is scrub-recoverable.
+			 * Tear down the home-side bookkeeping (claim,
+			 * counters) inline -- the atomic helpers are safe
+			 * from home -- then complete the bdev_io with
+			 * FAILED via a second send_msg
+			 * (spdk_bdev_io_complete asserts owner thread).
+			 * Capture ec_io before freeing mctx; ec_io lives in
+			 * bdev_io->driver_ctx so it outlives mctx. Same
+			 * shape as Site 2.
+			 */
+			SPDK_ERRLOG("EC bdev %s: cannot hand off RMW reads "
+				    "to submitter thread '%s' (rc=%d %s) at stripe "
+				    "%" PRIu64 "; failing bdev_io\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec_io->submitter_thread),
+				    send_rc, spdk_strerror(-send_rc), stripe_index);
+			ec_stripe_clear_dirty(ec, stripe_index);
+			ec_rmw_in_flight_dec(ec);
+			ec_wib_region_inflight_dec(ec,
+				ec_wib_stripe_to_region(stripe_index));
+			ec_rmw_free_ctx(mctx, ec);
+
+			int complete_rc = spdk_thread_send_msg(
+				ec_io->submitter_thread,
+				ec_rmw_complete_bdev_io_failed_on_submitter,
+				ec_io);
+			if (complete_rc != 0) {
+				SPDK_ERRLOG("EC bdev %s: also cannot hand "
+					    "off failure completion to submitter "
+					    "thread '%s' (rc=%d %s); bdev_io stays "
+					    "in-flight\n",
+					    ec->bdev.name,
+					    spdk_thread_get_name(ec_io->submitter_thread),
+					    complete_rc, spdk_strerror(-complete_rc));
+			}
+		}
+		return;
+	}
+
 	/*
-	 * Dispatch invariant: reads use ec_io->ch->base_chans[], owned by
-	 * the submitter thread. See ec_rmw_submit_writes for the rationale.
-	 * Today this passes trivially because the caller is on the same
-	 * thread; once the persist-done -> submitter hop lands, this
-	 * function will be entered via send_msg on the submitter.
+	 * Dispatch invariant: post-routing, we run on the submitter
+	 * thread. ec_io->ch->base_chans[] are owned here.
 	 */
 	assert(spdk_get_thread() == ec_io->submitter_thread);
 	mctx->reads_remaining = 0;

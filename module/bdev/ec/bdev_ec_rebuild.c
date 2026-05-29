@@ -961,9 +961,9 @@ ec_scrub_free_resources(struct ec_scrub_ctx *sctx)
 }
 
 /*
- * Called when all dirty regions have been scrubbed (or the scrub is aborted).
- * Persists the cleared WIB (fire-and-forget), frees resources, clears
- * ec->scrub_ctx so RMW writes are no longer gated.
+ * Called when all dirty regions have been scrubbed. Persists the cleared
+ * WIB (fire-and-forget), frees resources, and clears ec->scrub_ctx so
+ * RMW writes are no longer gated.
  */
 static void
 ec_scrub_finish(struct ec_scrub_ctx *sctx)
