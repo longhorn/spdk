@@ -850,7 +850,7 @@ ec_alloc_runtime_arrays(struct ec_bdev *ec)
 	}
 
 	{
-		uint64_t wib_buf_bytes = ec->strip_size * ec->bdev.blocklen;
+		uint64_t wib_buf_bytes = (uint64_t)ec->strip_size * ec->bdev.blocklen;
 
 		ec->wib_buf = spdk_dma_zmalloc(wib_buf_bytes, EC_DMA_ALIGN, NULL);
 		if (!ec->wib_buf) {
