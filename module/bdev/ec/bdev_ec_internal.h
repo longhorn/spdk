@@ -597,19 +597,39 @@ struct ec_bdev {
 	uint64_t full_stripe_writes;             /* full-stripe writes accepted      */
 	uint64_t full_stripe_writes_deferred;    /* full-stripe EAGAIN: scrub guard  */
 	/*
-	 * UNMAP accounting. Every parent UNMAP request lands in exactly one
-	 * of: native fan-out (-> unmaps_completed on parent success), write-
-	 * zeros fast path for single-stripe UNMAPs (-> unmaps_via_write_zeros),
-	 * deferred-busy NOMEM retry (-> unmaps_deferred_busy), or a rejection
-	 * (-EINVAL / -ENOMEM at submit). The invariant
-	 *   submitted = completed + via_zeros + deferred + rejected
-	 * holds in both single- and multi-reactor configurations and is used
-	 * by the integration test to detect silent rejections.
+	 * UNMAP accounting. Each call to ec_submit_unmap that gets past the
+	 * cross-thread routing hop bumps unmaps_submitted exactly once and
+	 * then terminates in one of four buckets:
+	 *
+	 *   completed   -- native fan-out parent completion landed SUCCESS.
+	 *   via_zeros   -- single-stripe UNMAP took the RMW zero-fill fast
+	 *                  path (no native fan-out, no bitmap set).
+	 *   deferred    -- stripe-busy or persist-in-flight returned -EAGAIN;
+	 *                  the bdev layer requeues via NOMEM and the next
+	 *                  attempt is a fresh submitted++ bump.
+	 *   failed      -- terminal failure: a sync error other than -EAGAIN
+	 *                  at submit, a fan-out submit failure, a bitmap
+	 *                  persist failure, or an async cb_fn(FAILED).
+	 *
+	 * Closed identity (steady state, no in-flight UNMAPs):
+	 *   submitted == completed + via_zeros + deferred + failed
+	 *
+	 * In the in-flight window the residual
+	 *   submitted - completed - via_zeros - deferred - failed
+	 * counts UNMAPs that have been accepted by the EC layer but whose
+	 * terminal outcome has not yet landed. A nonzero steady-state
+	 * residual is a real bug (silent drop in the EC layer).
+	 *
+	 * The len == 0 fast path bumps submitted and completed together: it
+	 * is a no-op the EC layer hands off to SPDK as SUCCESS with no
+	 * fan-out, but operators counting "UNMAPs the EC saw" expect both
+	 * counters to advance so the identity stays closed.
 	 */
 	uint64_t unmaps_submitted;               /* parent UNMAP submits (once per request) */
 	uint64_t unmaps_completed;               /* native fan-out completed successfully */
 	uint64_t unmaps_deferred_busy;           /* UNMAP EAGAIN: stripe-busy/persist */
 	uint64_t unmaps_via_write_zeros;         /* single-stripe UNMAP -> RMW zero-fill */
+	uint64_t unmaps_failed;                  /* terminal failure (sync error or cb_fn FAILED) */
 	uint64_t unmap_fanout_misses;            /* per-disk spdk_bdev_unmap_blocks
 						  * failure -- physical space not
 						  * reclaimed on that disk; not a

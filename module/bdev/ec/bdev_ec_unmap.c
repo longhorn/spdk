@@ -184,6 +184,8 @@ ec_unmap_inner_complete_default(void *cb_arg,
 
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
 		ec->unmaps_completed++;
+	} else {
+		ec->unmaps_failed++;
 	}
 	spdk_bdev_io_complete(ec_io->bdev_io, status);
 }
@@ -269,6 +271,7 @@ int
 ec_submit_unmap(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev *ec  = ec_from_bdev_io(ec_io->bdev_io);
+	int             rc;
 	uint64_t        off = ec_io->offset_blocks;
 	uint64_t        len = ec_io->num_blocks;
 	uint64_t        end = off + len;
@@ -277,6 +280,9 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 	ec->unmaps_submitted++;
 
 	if (len == 0) {
+		/* Count the no-op completion so the closed accounting
+		 * identity in bdev_ec_internal.h's field cluster holds. */
+		ec->unmaps_completed++;
 		spdk_bdev_io_complete(ec_io->bdev_io,
 				      SPDK_BDEV_IO_STATUS_SUCCESS);
 		return 0;
@@ -289,6 +295,17 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 	 * must fall through to the multi-stripe path below -- routing it to the
 	 * RMW zero-fill helper would overflow that helper's one-stripe scratch.
 	 */
+	/*
+	 * Dispatch by alignment shape. Every branch sets rc; non-zero,
+	 * non-EAGAIN returns are sync-terminal failures that no async cb_fn
+	 * will ever close out, so they bump unmaps_failed at the tail to
+	 * keep the closed identity in bdev_ec_internal.h's field cluster.
+	 * -EAGAIN is the deferred-busy bucket (deferred_busy was bumped
+	 * inside the helper) and -EINPROGRESS-style returns of 0 mean the
+	 * cb_fn will land later in inner_complete_default or
+	 * ec_unmap_split_complete, which handle their own SUCCESS / FAILED
+	 * accounting.
+	 */
 	if (off / ec->stripe_blocks == (end - 1) / ec->stripe_blocks) {
 		/*
 		 * Single-stripe UNMAP: route through the WRITE_ZEROES / RMW
@@ -299,7 +316,8 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 		 * unmaps_via_write_zeros counts these. Bitmap-backed reclaim is
 		 * reserved for the stripe-aligned multi-stripe paths below.
 		 */
-		return ec_unmap_route_to_zeros(ec_io);
+		rc = ec_unmap_route_to_zeros(ec_io);
+		goto out;
 	}
 
 	/*
@@ -321,9 +339,10 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 	 */
 	if (off == start_stripe * ec->stripe_blocks &&
 	    end == end_stripe   * ec->stripe_blocks) {
-		return ec_unmap_inner_fanout(ec_io, start_stripe, end_stripe,
-					     ec_unmap_inner_complete_default,
-					     ec_io);
+		rc = ec_unmap_inner_fanout(ec_io, start_stripe, end_stripe,
+					   ec_unmap_inner_complete_default,
+					   ec_io);
+		goto out;
 	}
 
 	/*
@@ -349,11 +368,17 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 		uint64_t tail_off = end_stripe * ec->stripe_blocks;
 		uint64_t tail_len = end - tail_off;
 
-		return ec_submit_unmap_split(ec_io,
-					     head_off, head_len,
-					     start_stripe, end_stripe,
-					     tail_off, tail_len);
+		rc = ec_submit_unmap_split(ec_io,
+					   head_off, head_len,
+					   start_stripe, end_stripe,
+					   tail_off, tail_len);
 	}
+
+out:
+	if (rc != 0 && rc != -EAGAIN) {
+		ec->unmaps_failed++;
+	}
+	return rc;
 }
 
 /*
@@ -824,11 +849,14 @@ ec_unmap_split_complete(struct ec_unmap_split_ctx *sctx)
 	enum spdk_bdev_io_status status = sctx->status;
 
 	/*
-	 * Bump unmaps_completed at the parent-completion boundary (same
-	 * convention as ec_unmap_inner_complete_default).
+	 * Bump unmaps_completed / unmaps_failed at the parent-completion
+	 * boundary (same convention as ec_unmap_inner_complete_default) so
+	 * the closed accounting identity in bdev_ec_internal.h holds.
 	 */
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
 		ec->unmaps_completed++;
+	} else {
+		ec->unmaps_failed++;
 	}
 	free(sctx);
 	spdk_bdev_io_complete(ec_io->bdev_io, status);

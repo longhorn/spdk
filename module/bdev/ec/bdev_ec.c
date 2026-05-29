@@ -1746,6 +1746,8 @@ ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 				     ec->unmaps_deferred_busy);
 	spdk_json_write_named_uint64(w, "unmaps_via_write_zeros",
 				     ec->unmaps_via_write_zeros);
+	spdk_json_write_named_uint64(w, "unmaps_failed",
+				     ec->unmaps_failed);
 	spdk_json_write_named_uint64(w, "unmap_fanout_misses",
 				     ec->unmap_fanout_misses);
 	spdk_json_write_named_uint64(w, "unmapped_reads_synthesized",
