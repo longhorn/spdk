@@ -756,6 +756,17 @@ struct ec_bdev_io {
 	 * the bit-clear's persist acks at m+1. False on all other paths.
 	 */
 	bool     is_write_into_unmapped;
+
+	/*
+	 * Thread that submitted this I/O -- the channel's owner thread.
+	 * Captured at ec_bdev_io_init so the multi-reactor routing layer
+	 * can dispatch completion back to the bdev_io's owner thread for
+	 * spdk_bdev_io_complete, which SPDK requires to run on that thread.
+	 *
+	 * In single-reactor deployments this is always ec->home_thread, so
+	 * no routing is needed and the field is effectively unused.
+	 */
+	struct spdk_thread *submitter_thread;
 };
 
 /* =========================================================================

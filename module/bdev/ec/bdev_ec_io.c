@@ -143,6 +143,14 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
 	ec_io->wib_region         = 0;
 
 	ec_io->is_write_into_unmapped = false;
+
+	/*
+	 * ec_bdev_io_init runs on the channel's owner thread (= the thread
+	 * that submitted the bdev_io), since SPDK invokes submit_request on
+	 * that thread. Capture it here so completion routing can dispatch
+	 * spdk_bdev_io_complete back to this thread when needed.
+	 */
+	ec_io->submitter_thread = spdk_get_thread();
 }
 
 /*
