@@ -540,7 +540,6 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
 {
 	struct ec_unmap_ctx *uctx = cb_arg;
 	struct ec_bdev      *ec   = ec_from_bdev_io(uctx->ec_io->bdev_io);
-	uint64_t             map_words;
 
 	if (rc != 0) {
 		/*
@@ -570,14 +569,33 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
 	}
 
 	/*
-	 * Atomic apply: durability is established, so the new bits become
-	 * visible to readers now. Single-reactor model means this memcpy
-	 * is observably atomic to every other path that reads
-	 * ec->stripe_unmapped_map. The staged shadow is no longer needed.
+	 * Apply: durability is established, so the new bits become visible
+	 * to readers now.
+	 *
+	 * The shadow differs from live only in [start_stripe, end_stripe),
+	 * so a per-stripe loop calling ec_stripe_set_unmapped is equivalent
+	 * to a whole-map memcpy but has two important properties the memcpy
+	 * lacks:
+	 *
+	 *   1. Release-store semantics. The helper publishes each bit with
+	 *      __ATOMIC_RELEASE, so a submitter-thread reader using
+	 *      acquire-load sees the post-state correctly. A whole-map
+	 *      memcpy is a plain word-by-word copy with no ordering, racing
+	 *      the reader formally (and surfacing under TSAN even when
+	 *      benign on x86).
+	 *
+	 *   2. Touches only the changed words. At large geometries the
+	 *      whole-map is tens of MiB; the per-stripe loop touches one
+	 *      word per up-to-64 stripes (the TODO(perf) at the staging
+	 *      site notes the same cost).
 	 */
-	map_words = EC_BITMAP_WORDS(ec->num_stripes);
-	memcpy(ec->stripe_unmapped_map, uctx->staged_map,
-	       map_words * sizeof(uint64_t));
+	{
+		uint64_t stripe;
+
+		for (stripe = uctx->start_stripe; stripe < uctx->end_stripe; stripe++) {
+			ec_stripe_set_unmapped(ec, stripe);
+		}
+	}
 	free(uctx->staged_map);
 	uctx->staged_map = NULL;
 

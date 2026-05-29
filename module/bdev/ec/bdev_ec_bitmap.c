@@ -211,6 +211,16 @@ ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
  * ec_bitmap_apply_buf -- copy a validated blob's span into
  * ec->stripe_unmapped_map. Call only after ec_bitmap_validate_buf has
  * returned 0 for this buffer.
+ *
+ * Threading: this runs once at load time, on the home thread, before
+ * the bdev is registered (ec_bdev_create_async's load chain completes
+ * before spdk_bdev_register is called -- see bdev_ec.c). At this point
+ * no I/O channel exists yet, so no cross-reactor reader can observe
+ * the map. The plain memcpy is therefore equivalent to a sequence of
+ * release-stores on stripe_unmapped_map; readers using acquire-load
+ * after the bdev becomes visible to consumers see the fully-applied
+ * post-load state. Bypassing ec_stripe_set_unmapped here is safe by
+ * the same logic that lets resize.c:165 use memcpy under quiesce.
  */
 void
 ec_bitmap_apply_buf(struct ec_bdev *ec, const void *buf)
