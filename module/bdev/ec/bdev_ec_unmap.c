@@ -1050,14 +1050,59 @@ ec_unmap_split_continue(struct ec_unmap_split_ctx *sctx)
 	}
 }
 
+/*
+ * send_msg target that re-enters ec_unmap_split_continue on the home
+ * thread. Used by ec_unmap_split_segment_done to route the post-
+ * segment dispatch chain back to home, because the next segment's
+ * dispatch eventually reaches ec_rmw_submit_core (head/tail RMW
+ * zero-fill via ec_submit_rmw_zero_fill_range) which asserts home.
+ */
+static void
+ec_unmap_split_continue_on_home(void *ctx)
+{
+	ec_unmap_split_continue((struct ec_unmap_split_ctx *)ctx);
+}
+
 static void
 ec_unmap_split_segment_done(void *cb_arg, enum spdk_bdev_io_status status)
 {
 	struct ec_unmap_split_ctx *sctx = cb_arg;
+	struct ec_bdev            *ec   = ec_from_bdev_io(sctx->ec_io->bdev_io);
 
 	if (status != SPDK_BDEV_IO_STATUS_SUCCESS) {
 		sctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 	}
+
+	/*
+	 * Route continue+dispatch to home. cb_fn can fire on submitter (success
+	 * path: fan-out completions land on submitter) or on home (persist failure).
+	 * The next-segment dispatch needs home (ec_submit_rmw_zero_fill_range ->
+	 * ec_rmw_submit_core asserts home). The final spdk_bdev_io_complete in
+	 * ec_unmap_split_complete handles its own owner-thread routing.
+	 */
+	if (spdk_unlikely(spdk_get_thread() != ec->home_thread)) {
+		int send_rc = spdk_thread_send_msg(ec->home_thread,
+			ec_unmap_split_continue_on_home, sctx);
+		if (send_rc != 0) {
+			/*
+			 * Cannot reach home to advance the chain. The bitmap
+			 * apply may have already happened for inner; mark
+			 * FAILED and let ec_unmap_split_complete run inline
+			 * here to finalize. The complete function will route
+			 * the bdev_io completion to the submitter (= owner).
+			 */
+			SPDK_ERRLOG("EC bdev %s: cannot hand off multi-segment "
+				    "UNMAP advance to home thread '%s' (rc=%d %s); "
+				    "failing\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec->home_thread),
+				    send_rc, spdk_strerror(-send_rc));
+			sctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+			ec_unmap_split_complete(sctx);
+		}
+		return;
+	}
+
 	ec_unmap_split_continue(sctx);
 }
 
@@ -1079,5 +1124,31 @@ ec_unmap_split_complete(struct ec_unmap_split_ctx *sctx)
 		__atomic_fetch_add(&ec->unmaps_failed,    1, __ATOMIC_RELAXED);
 	}
 	free(sctx);
-	spdk_bdev_io_complete(ec_io->bdev_io, status);
+
+	/*
+	 * spdk_bdev_io_complete asserts the owner thread. After C7b,
+	 * ec_unmap_split_continue may run on home (routed in
+	 * ec_unmap_split_segment_done), so this function can be reached
+	 * with submitter != current. Route via send_msg in that case.
+	 * Stash status in ec_io->status so the helper can read it on the
+	 * other thread.
+	 */
+	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
+		spdk_bdev_io_complete(ec_io->bdev_io, status);
+		return;
+	}
+
+	ec_io->status = status;
+	{
+		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_io_complete_status_on_submitter, ec_io);
+		if (send_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: cannot hand off multi-segment "
+				    "UNMAP completion to submitter thread '%s' "
+				    "(rc=%d %s); bdev_io stays in-flight\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec_io->submitter_thread),
+				    send_rc, spdk_strerror(-send_rc));
+		}
+	}
 }
