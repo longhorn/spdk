@@ -56,19 +56,67 @@ ec_rmw_free_ctx(struct ec_rmw_ctx *mctx, const struct ec_bdev *ec)
  * WIB region in-flight counter (the region clear is handled by the idle
  * poller), frees the context, and completes the parent bdev_io.
  */
+static void ec_rmw_complete_on_submitter(void *ctx);
+
 void
 ec_rmw_complete(struct ec_rmw_ctx *mctx)
 {
 	struct ec_bdev_io *ec_io = mctx->ec_io;
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
-	enum spdk_bdev_io_status status = mctx->status;
+	enum spdk_bdev_io_status status;
 	uint32_t region = ec_wib_stripe_to_region(mctx->stripe_index);
-	void (*cb_fn)(void *, enum spdk_bdev_io_status) = mctx->cb_fn;
-	void *cb_arg = mctx->cb_arg;
+	void (*cb_fn)(void *, enum spdk_bdev_io_status);
+	void *cb_arg;
+
+	/*
+	 * Route to the submitter (= bdev_io owner) thread so the eventual
+	 * spdk_bdev_io_complete (or cb_fn that walks to one) runs on the
+	 * thread SPDK requires. ec_rmw_complete is reached from:
+	 *
+	 *   - ec_rmw_write_cb (writes' final completion) -- on submitter
+	 *     (writes dispatched on submitter's base_chans complete there);
+	 *     the routing inlines.
+	 *   - ec_rmw_wib_set_cb persist-failure -- on home;
+	 *     hops to submitter.
+	 *   - ec_rmw_persist_and_dispatch's persist-alloc-failure -- on home;
+	 *     hops to submitter.
+	 *   - ec_wib_deferred_drain's failure path -- on home; hops.
+	 *
+	 * Routing the WHOLE function (cleanup + completion) is safe
+	 * because the cleanup ops are atomic (C3): ec_stripe_clear_dirty,
+	 * ec_rmw_in_flight_dec, ec_wib_region_inflight_dec all work from
+	 * any thread.
+	 *
+	 * On send_msg failure, perform the cleanup inline here (so mctx
+	 * is not leaked) and accept the bdev_io hang -- the on-disk WIB
+	 * bit is set, so a crash is scrub-recoverable (Site 2 pattern).
+	 */
+	if (spdk_unlikely(spdk_get_thread() != ec_io->submitter_thread)) {
+		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_rmw_complete_on_submitter, mctx);
+		if (send_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: cannot hand off RMW "
+				    "completion to submitter thread '%s' (rc=%d %s) "
+				    "at stripe %" PRIu64 "; bdev_io stays "
+				    "in-flight\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec_io->submitter_thread),
+				    send_rc, spdk_strerror(-send_rc), mctx->stripe_index);
+			ec_stripe_clear_dirty(ec, mctx->stripe_index);
+			ec_rmw_in_flight_dec(ec);
+			ec_wib_region_inflight_dec(ec, region);
+			ec_rmw_free_ctx(mctx, ec);
+		}
+		return;
+	}
 
 	ec_stripe_clear_dirty(ec, mctx->stripe_index);
 	ec_rmw_in_flight_dec(ec);
 	ec_wib_region_inflight_dec(ec, region);
+
+	status = mctx->status;
+	cb_fn  = mctx->cb_fn;
+	cb_arg = mctx->cb_arg;
 
 	ec_rmw_free_ctx(mctx, ec);
 
