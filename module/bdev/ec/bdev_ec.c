@@ -1568,6 +1568,18 @@ ec_destruct(void *ctx)
  * bdev fn_table callbacks
  * ========================================================================= */
 
+/*
+ * Advertises which I/O types the EC bdev accepts to the SPDK bdev layer.
+ *
+ * This switch is the consumer-facing contract; g_ec_submit_dispatch[]
+ * (defined further down in this file) is the implementation that handles
+ * each accepted type. Both MUST be edited together when adding or
+ * removing an I/O type:
+ *   - new "return true" arm here   <-> add a row to g_ec_submit_dispatch
+ *   - new "return false" arm here  <-> ensure the dispatch row is absent
+ *                                       or points at a reject helper
+ *                                       (see ec_submit_reject_write_zeroes)
+ */
 static bool
 ec_io_type_supported(void *ctx, enum spdk_bdev_io_type type)
 {
@@ -1842,13 +1854,60 @@ ec_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 	spdk_json_write_object_end(w);
 }
 
+/*
+ * RESET / FLUSH have no payload at the EC layer: complete immediately
+ * with SUCCESS. Returning 0 keeps the dispatch table's "non-zero rc =>
+ * status mapping" invariant uniform across every entry.
+ */
+static int
+ec_submit_noop_success(struct ec_bdev_io *ec_io)
+{
+	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	return 0;
+}
+
+/*
+ * Defensive: ec_io_type_supported returns false for WRITE_ZEROES so the
+ * bdev layer always emulates it as a buffer-backed WRITE. Reaching this
+ * dispatch entry means that contract changed and the RMW heap-overflow
+ * regression is back -- fail loudly instead of corrupting memory.
+ */
+static int
+ec_submit_reject_write_zeroes(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+	SPDK_ERRLOG("EC bdev %s: unexpected native WRITE_ZEROES "
+		    "(emulation not engaged)\n", ec->bdev.name);
+	return -EINVAL;
+}
+
+/*
+ * Type-indexed dispatch table for ec_submit_request. This is the
+ * implementation side of the contract advertised by
+ * ec_io_type_supported above; the two MUST be edited together (see the
+ * comment above ec_io_type_supported for the pairing rules).
+ * NULL entries are unsupported types: the dispatcher logs and fails them.
+ */
+typedef int (*ec_io_submit_fn)(struct ec_bdev_io *ec_io);
+
+static const ec_io_submit_fn g_ec_submit_dispatch[] = {
+	[SPDK_BDEV_IO_TYPE_READ]         = ec_submit_read,
+	[SPDK_BDEV_IO_TYPE_WRITE]        = ec_submit_write,
+	[SPDK_BDEV_IO_TYPE_WRITE_ZEROES] = ec_submit_reject_write_zeroes,
+	[SPDK_BDEV_IO_TYPE_UNMAP]        = ec_submit_unmap,
+	[SPDK_BDEV_IO_TYPE_RESET]        = ec_submit_noop_success,
+	[SPDK_BDEV_IO_TYPE_FLUSH]        = ec_submit_noop_success,
+};
+
 static void
 ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct ec_bdev_io    *ec_io = (struct ec_bdev_io *)bdev_io->driver_ctx;
 	struct ec_io_channel *ec_ch = spdk_io_channel_get_ctx(ch);
 	struct ec_bdev       *ec    = ec_from_bdev_io(bdev_io);
-	int                   rc    = 0;
+	ec_io_submit_fn       submit;
+	int                   rc;
 
 	ec_bdev_io_init(ec_io, ec_ch, bdev_io);
 
@@ -1858,38 +1917,16 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 		return;
 	}
 
-	switch (bdev_io->type) {
-	case SPDK_BDEV_IO_TYPE_READ:
-		rc = ec_submit_read(ec_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_WRITE:
-		rc = ec_submit_write(ec_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
-		/*
-		 * Defensive: ec_io_type_supported returns false for
-		 * WRITE_ZEROES so the bdev layer always emulates it as
-		 * WRITE. Reaching here means that contract changed and the
-		 * RMW heap-overflow regression is back -- fail loudly
-		 * instead of corrupting memory.
-		 */
-		SPDK_ERRLOG("EC bdev %s: unexpected native WRITE_ZEROES "
-			    "(emulation not engaged)\n", ec->bdev.name);
-		rc = -EINVAL;
-		break;
-	case SPDK_BDEV_IO_TYPE_UNMAP:
-		rc = ec_submit_unmap(ec_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_RESET:
-	case SPDK_BDEV_IO_TYPE_FLUSH:
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	if ((size_t)bdev_io->type >= SPDK_COUNTOF(g_ec_submit_dispatch) ||
+	    g_ec_submit_dispatch[bdev_io->type] == NULL) {
+		SPDK_ERRLOG("EC bdev %s: unsupported IO type %d\n",
+			    ec->bdev.name, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
-	default:
-		SPDK_ERRLOG("Invalid IO type %d\n", bdev_io->type);
-		rc = -EINVAL;
-		break;
 	}
 
+	submit = g_ec_submit_dispatch[bdev_io->type];
+	rc     = submit(ec_io);
 	if (rc != 0) {
 		/*
 		 * -EAGAIN: RMW stripe dirty conflict -- requeue via NOMEM.
