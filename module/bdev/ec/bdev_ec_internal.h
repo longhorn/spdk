@@ -962,49 +962,100 @@ ec_only_parity_failed(const struct ec_bdev *ec)
 
 /*
  * Stripe dirty bitmap helpers. One bit per stripe, set during in-flight
- * RMW. All operations O(1); no locking (single-threaded reactor).
+ * RMW or full-stripe write to gate concurrent claimers (returns -EAGAIN
+ * for a second claim on the same stripe).
+ *
+ * Threading: under the multi-reactor design, sets happen only on home
+ * (all submit paths reach the claim through entry-routing), but clears
+ * happen on the submitter thread that completes the last base I/O. The
+ * set/clear pair is therefore cross-thread, so the word-level read-
+ * modify-write ops must be atomic. Relaxed ordering is sufficient: the
+ * bit is just a serialization gate, not a data-publication signal.
  */
 static inline void
 ec_stripe_set_dirty(struct ec_bdev *ec, uint64_t stripe_index)
 {
-	ec->stripe_dirty_map[stripe_index / 64] |= (UINT64_C(1) << (stripe_index % 64));
+	uint64_t mask = UINT64_C(1) << (stripe_index % 64);
+
+	__atomic_or_fetch(&ec->stripe_dirty_map[stripe_index / 64], mask,
+			  __ATOMIC_RELAXED);
 }
 
 static inline void
 ec_stripe_clear_dirty(struct ec_bdev *ec, uint64_t stripe_index)
 {
-	ec->stripe_dirty_map[stripe_index / 64] &= ~(UINT64_C(1) << (stripe_index % 64));
+	uint64_t mask = UINT64_C(1) << (stripe_index % 64);
+
+	__atomic_and_fetch(&ec->stripe_dirty_map[stripe_index / 64], ~mask,
+			   __ATOMIC_RELAXED);
 }
 
 static inline bool
 ec_stripe_is_dirty(const struct ec_bdev *ec, uint64_t stripe_index)
 {
-	return !!(ec->stripe_dirty_map[stripe_index / 64] &
-		  (UINT64_C(1) << (stripe_index % 64)));
+	uint64_t mask = UINT64_C(1) << (stripe_index % 64);
+	uint64_t word = __atomic_load_n(&ec->stripe_dirty_map[stripe_index / 64],
+					__ATOMIC_RELAXED);
+
+	return !!(word & mask);
 }
 
 /*
  * Stripe unmapped bitmap helpers. One bit per user stripe, 1 = the
- * stripe is logically zero (unmapped). Same single-thread O(1)
- * discipline and same user-stripe indexing as the dirty bitmap.
+ * stripe is logically zero (unmapped); reads return synthesized zeros
+ * for set bits.
+ *
+ * Threading: mutations happen on home (UNMAP apply-staged, write-into-
+ * unmapped bit-clear via the bit-clear queue, both routed to home).
+ * Reads happen on the submitter thread (ec_submit_read consults the
+ * map before dispatching base reads). Because a stale "bit=0" read
+ * could return garbage from a base bdev whose stripe was just logically
+ * unmapped, the mutator must publish with release-store and the reader
+ * must observe with acquire-load -- that guarantees a reader who sees
+ * the post-mutation bit also sees the post-mutation base-bdev state.
  */
 static inline void
 ec_stripe_set_unmapped(struct ec_bdev *ec, uint64_t stripe_index)
 {
-	ec->stripe_unmapped_map[stripe_index / 64] |= (UINT64_C(1) << (stripe_index % 64));
+	uint64_t mask = UINT64_C(1) << (stripe_index % 64);
+	uint64_t *word = &ec->stripe_unmapped_map[stripe_index / 64];
+	uint64_t old;
+
+	/*
+	 * Release-store on the whole word. __atomic_or_fetch with release
+	 * publishes both the bit set and any prior writes (the base-bdev
+	 * UNMAP fan-out, the bit-clear's data-write) to readers using
+	 * acquire-load.
+	 */
+	old = __atomic_load_n(word, __ATOMIC_RELAXED);
+	while (!__atomic_compare_exchange_n(word, &old, old | mask, false,
+					    __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+		/* old updated to current word; retry */
+	}
 }
 
 static inline void
 ec_stripe_clear_unmapped(struct ec_bdev *ec, uint64_t stripe_index)
 {
-	ec->stripe_unmapped_map[stripe_index / 64] &= ~(UINT64_C(1) << (stripe_index % 64));
+	uint64_t mask = UINT64_C(1) << (stripe_index % 64);
+	uint64_t *word = &ec->stripe_unmapped_map[stripe_index / 64];
+	uint64_t old;
+
+	old = __atomic_load_n(word, __ATOMIC_RELAXED);
+	while (!__atomic_compare_exchange_n(word, &old, old & ~mask, false,
+					    __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+		/* old updated to current word; retry */
+	}
 }
 
 static inline bool
 ec_stripe_is_unmapped(const struct ec_bdev *ec, uint64_t stripe_index)
 {
-	return !!(ec->stripe_unmapped_map[stripe_index / 64] &
-		  (UINT64_C(1) << (stripe_index % 64)));
+	uint64_t mask = UINT64_C(1) << (stripe_index % 64);
+	uint64_t word = __atomic_load_n(&ec->stripe_unmapped_map[stripe_index / 64],
+					__ATOMIC_ACQUIRE);
+
+	return !!(word & mask);
 }
 
 /*
@@ -1027,7 +1078,25 @@ ec_bitmap_word_clear(uint64_t *map, uint64_t idx)
 	map[idx / 64] &= ~(UINT64_C(1) << (idx % 64));
 }
 
-/* WIB region dirty-bit helpers. Same single-thread O(1) discipline. */
+/*
+ * WIB region dirty-bit helpers.
+ *
+ * Threading: mutations happen on home (RMW/full-stripe-write setup
+ * sets the bit; idle WIB poller and error-rollback paths clear it).
+ * Reads happen on home for the persist decision, but also on the
+ * SUBMITTER during ec_submit_degraded_read's guard
+ * (ec_wib_region_is_dirty gates degraded reconstruction so it does
+ * not read potentially-stale parity for a region with an in-flight
+ * write).
+ *
+ * Because a stale 'clean' read on the submitter could let a degraded
+ * reconstruction proceed against in-flight-modified parity and
+ * surface silently wrong bytes, the mutator side must publish with
+ * release-store and the reader side must observe with acquire-load
+ * (same shape as stripe_unmapped_map's R2 discipline). Per-word
+ * ordering is sufficient because each region's bit lives in exactly
+ * one word.
+ */
 static inline uint32_t
 ec_wib_stripe_to_region(uint64_t stripe_index)
 {
@@ -1037,20 +1106,39 @@ ec_wib_stripe_to_region(uint64_t stripe_index)
 static inline bool
 ec_wib_region_is_dirty(const struct ec_bdev *ec, uint32_t region)
 {
-	return !!(ec->wib_region_map[region / 64] &
-		  (UINT64_C(1) << (region % 64)));
+	uint64_t mask = UINT64_C(1) << (region % 64);
+	uint64_t word = __atomic_load_n(&ec->wib_region_map[region / 64],
+					__ATOMIC_ACQUIRE);
+
+	return !!(word & mask);
 }
 
 static inline void
 ec_wib_region_set_dirty(struct ec_bdev *ec, uint32_t region)
 {
-	ec->wib_region_map[region / 64] |= (UINT64_C(1) << (region % 64));
+	uint64_t mask = UINT64_C(1) << (region % 64);
+	uint64_t *word = &ec->wib_region_map[region / 64];
+	uint64_t old;
+
+	old = __atomic_load_n(word, __ATOMIC_RELAXED);
+	while (!__atomic_compare_exchange_n(word, &old, old | mask, false,
+					    __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+		/* old updated to current word; retry */
+	}
 }
 
 static inline void
 ec_wib_region_clear_dirty(struct ec_bdev *ec, uint32_t region)
 {
-	ec->wib_region_map[region / 64] &= ~(UINT64_C(1) << (region % 64));
+	uint64_t mask = UINT64_C(1) << (region % 64);
+	uint64_t *word = &ec->wib_region_map[region / 64];
+	uint64_t old;
+
+	old = __atomic_load_n(word, __ATOMIC_RELAXED);
+	while (!__atomic_compare_exchange_n(word, &old, old & ~mask, false,
+					    __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+		/* old updated to current word; retry */
+	}
 }
 
 /*
@@ -1063,21 +1151,47 @@ ec_wib_region_clear_dirty(struct ec_bdev *ec, uint32_t region)
  * guards against underflow defensively; underflow indicates a
  * balance bug higher up the chain.
  */
+/*
+ * Threading: inc happens on home (during submit claim), dec happens on
+ * submitter (during completion cleanup). Inc must be atomic even though
+ * home is the only incrementer, because submitter is a concurrent
+ * decrementer; the read-modify-write pair would otherwise race. Relaxed
+ * ordering is sufficient (the counter is internal state, not a data-
+ * publication signal).
+ *
+ * The dec uses a CAS loop with an underflow guard: a plain fetch_sub
+ * would briefly observe UINT32_MAX before being restored, creating a
+ * window where the idle WIB poller could read garbage. The CAS loop
+ * atomically transitions only when the current value is positive.
+ */
 static inline void
 ec_wib_region_inflight_inc(struct ec_bdev *ec, uint32_t region)
 {
-	ec->wib_region_inflight[region]++;
+	__atomic_fetch_add(&ec->wib_region_inflight[region], 1, __ATOMIC_RELAXED);
 }
 
 static inline void
 ec_wib_region_inflight_dec(struct ec_bdev *ec, uint32_t region)
 {
-	if (ec->wib_region_inflight[region] > 0) {
-		ec->wib_region_inflight[region]--;
-	} else {
-		SPDK_ERRLOG("EC bdev %s: wib_region_inflight[%u] underflow\n",
-			    ec->bdev.name, region);
+	uint32_t current;
+
+	current = __atomic_load_n(&ec->wib_region_inflight[region], __ATOMIC_RELAXED);
+	while (current > 0) {
+		if (__atomic_compare_exchange_n(&ec->wib_region_inflight[region],
+						&current, current - 1, false,
+						__ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+			return;
+		}
+		/* current updated with latest value; loop and re-check > 0 */
 	}
+	SPDK_ERRLOG("EC bdev %s: wib_region_inflight[%u] underflow\n",
+		    ec->bdev.name, region);
+}
+
+static inline uint32_t
+ec_wib_region_inflight_get(const struct ec_bdev *ec, uint32_t region)
+{
+	return __atomic_load_n(&ec->wib_region_inflight[region], __ATOMIC_RELAXED);
 }
 
 /* =========================================================================

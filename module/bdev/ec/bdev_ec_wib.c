@@ -417,7 +417,7 @@ ec_wib_idle_poller_cb(void *arg)
 		if (!ec_wib_region_is_dirty(ec, region)) {
 			continue;
 		}
-		if (ec->wib_region_inflight[region] > 0) {
+		if (ec_wib_region_inflight_get(ec, region) > 0) {
 			continue;
 		}
 		if ((now - ec->wib_region_dirty_ticks[region]) < idle_ticks) {
