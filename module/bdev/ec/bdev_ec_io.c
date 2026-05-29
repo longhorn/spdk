@@ -882,11 +882,43 @@ ec_full_write_unwind(struct ec_bdev_io *ec_io, struct ec_bdev *ec)
 }
 
 /*
+ * send_msg target that completes the bdev_io with FAILED on the submitter
+ * (= bdev_io owner) thread. Used by the multi-reactor failure path when
+ * the WIB persist completes on home but the bdev_io owner is elsewhere
+ * -- spdk_bdev_io_complete asserts owner-thread, so the completion must
+ * be routed via send_msg.
+ */
+static void
+ec_full_write_complete_failed_on_submitter(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+
+	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+}
+
+/* send_msg trampoline to run ec_full_write_fanout on the submitter thread. */
+static void
+ec_full_write_dispatch_on_submitter(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+
+	ec_full_write_fanout(ec_io);
+}
+
+/*
  * Callback fired by ec_wib_persist when the WIB region bit for this
  * full-stripe write has been persisted to disk. On success, continues
  * the submission chain by encoding parity and fanning out child writes.
  * On failure, releases the stripe-busy claim and the WIB inflight count,
  * then completes the bdev_io with FAILED status.
+ *
+ * Thread routing: this cb fires on the WIB persist completion thread
+ * (= ec->home_thread, since ec->wib_chans[] are home-owned). The
+ * downstream fan-out dispatches base I/O on the submitter's per-channel
+ * base_chans[], so it must run on the submitter thread. Similarly, the
+ * failure path's spdk_bdev_io_complete must run on the bdev_io owner
+ * thread (= submitter). Both are routed via spdk_thread_send_msg; the
+ * single-reactor inline path skips the hop when submitter == home.
  */
 static void
 ec_full_write_wib_set_cb(void *cb_arg, int rc)
@@ -899,11 +931,60 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 			    "before write fan-out at stripe %" PRIu64 "\n",
 			    ec->bdev.name, rc, ec_io->stripe_claim_index);
 		ec_full_write_release(ec_io, ec);
-		spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+
+		if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
+			spdk_bdev_io_complete(ec_io->bdev_io,
+					      SPDK_BDEV_IO_STATUS_FAILED);
+		} else {
+			int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+				ec_full_write_complete_failed_on_submitter, ec_io);
+			if (send_rc != 0) {
+				SPDK_ERRLOG("EC bdev %s: cannot hand off failure "
+					    "completion to owner thread '%s' (rc=%d %s); "
+					    "bdev_io stays in-flight until SPDK "
+					    "timeout fires\n",
+					    ec->bdev.name,
+					    spdk_thread_get_name(ec_io->submitter_thread),
+					    send_rc, spdk_strerror(-send_rc));
+			}
+		}
 		return;
 	}
 
-	ec_full_write_fanout(ec_io);
+	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
+		ec_full_write_fanout(ec_io);
+		return;
+	}
+
+	int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+		ec_full_write_dispatch_on_submitter, ec_io);
+	if (send_rc != 0) {
+		/*
+		 * Persist succeeded but we cannot reach the submitter for the
+		 * data fan-out. The on-disk WIB bit is set, so a crash here is
+		 * scrub-recoverable; release in-memory EC-layer state and fail
+		 * the bdev_io via a second send_msg. If even that fails, log
+		 * and accept the hang (same as Site 2 pattern).
+		 */
+		SPDK_ERRLOG("EC bdev %s: cannot hand off fan-out to submitter "
+			    "thread '%s' (rc=%d %s) at stripe %" PRIu64 "; releasing "
+			    "EC-layer state\n",
+			    ec->bdev.name,
+			    spdk_thread_get_name(ec_io->submitter_thread),
+			    send_rc, spdk_strerror(-send_rc), ec_io->stripe_claim_index);
+		ec_full_write_release(ec_io, ec);
+
+		int complete_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_full_write_complete_failed_on_submitter, ec_io);
+		if (complete_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: also cannot hand off failure "
+				    "completion to submitter thread '%s' (rc=%d %s); "
+				    "bdev_io stays in-flight\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec_io->submitter_thread),
+				    complete_rc, spdk_strerror(-complete_rc));
+		}
+	}
 }
 
 static int
@@ -1098,7 +1179,22 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 		goto error;
 	}
 
-	ec_full_write_fanout(ec_io);
+	/*
+	 * Fan-out routing: dispatches base I/O on ec_io->ch->base_chans[]
+	 * (submitter-owned). In single-reactor submitter == home and the
+	 * inline path runs; in multi-reactor we hop to the submitter so the
+	 * base I/O dispatch happens on the channel-owning thread.
+	 */
+	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
+		ec_full_write_fanout(ec_io);
+		return 0;
+	}
+
+	rc = spdk_thread_send_msg(ec_io->submitter_thread,
+				  ec_full_write_dispatch_on_submitter, ec_io);
+	if (rc != 0) {
+		goto error;
+	}
 	return 0;
 
 error:
