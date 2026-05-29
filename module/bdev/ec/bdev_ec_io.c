@@ -1468,9 +1468,38 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	 * ec_child_io_complete sees is_write_into_unmapped and routes
 	 * through the bit-clear path instead of immediate bdev_io
 	 * completion.
+	 *
+	 * Fan-out routing mirrors the C2 pattern in ec_submit_full_write:
+	 * dispatch on ec_io->ch->base_chans[] (submitter-owned). In
+	 * single-reactor submitter == home and the inline path runs; in
+	 * multi-reactor we hop to the submitter so base I/O dispatch
+	 * happens on the channel-owning thread.
 	 */
 	ec->writes_into_unmapped++;
-	ec_full_write_fanout(ec_io);
+
+	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
+		ec_full_write_fanout(ec_io);
+		return 0;
+	}
+
+	rc = spdk_thread_send_msg(ec_io->submitter_thread,
+				  ec_full_write_dispatch_on_submitter, ec_io);
+	if (rc != 0) {
+		/*
+		 * Cannot reach submitter; roll back the same state the
+		 * alloc-failure rollback above does. The bit-clear path
+		 * was not engaged (no fan-out happened), so the
+		 * stripe_unmapped_map stays in its pre-call state and a
+		 * caller retry replays the whole sequence cleanly.
+		 */
+		ec_stripe_clear_dirty(ec, stripe_idx);
+		ec_io->stripe_claimed         = false;
+		ec_io->is_write_into_unmapped = false;
+		ec_free_io_buffers(ec_io, ec);
+		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1,
+				   __ATOMIC_RELAXED);
+		return rc;
+	}
 	return 0;
 }
 
