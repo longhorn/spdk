@@ -636,6 +636,15 @@ ec_unmap_fanout(struct ec_unmap_ctx *uctx)
 	uint32_t           writable = 0;
 	int                rc;
 
+	/*
+	 * Dispatch invariant: base UNMAPs use ec_io->ch->base_chans[],
+	 * owned by the submitter thread. The bitmap-persist-done ->
+	 * submitter hop (planned for a subsequent commit) ensures this
+	 * holds for multi-reactor; today single-reactor makes submitter
+	 * == home so it passes trivially.
+	 */
+	assert(spdk_get_thread() == ec_io->submitter_thread);
+
 	for (i = 0; i < ec->n; i++) {
 		if (ec_slot_is_writable(ec, i)) {
 			writable++;

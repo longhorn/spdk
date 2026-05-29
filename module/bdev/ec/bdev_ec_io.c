@@ -789,6 +789,14 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 	uint32_t        chunk_idx;
 
 	/*
+	 * Dispatch invariant: reads use ec_io->ch->base_chans[], which are
+	 * owned by the submitter thread. The read path is already cross-
+	 * thread safe (no home-only state touched on the hot path), but the
+	 * assertion documents the contract for any future refactor.
+	 */
+	assert(spdk_get_thread() == ec_io->submitter_thread);
+
+	/*
 	 * Unmapped-bitmap consultation. The EC bdev publishes
 	 * optimal_io_boundary = strip_size with split_on_optimal_io_boundary,
 	 * so every read arrives here within a single strip (and therefore
@@ -1119,6 +1127,17 @@ ec_full_write_fanout(struct ec_bdev_io *ec_io)
 	uint64_t        offset_in_disk;
 	uint32_t        writable_count;
 	int             rc;
+
+	/*
+	 * Dispatch invariant: base I/O is submitted on
+	 * ec_io->ch->base_chans[], which are owned by the submitter thread
+	 * (= the bdev_io's owner thread). Dispatching from any other thread
+	 * is undefined behavior (channel ownership). The persist-done ->
+	 * submitter hop in ec_full_write_wib_set_cb / ec_submit_full_write
+	 * ensures this assertion holds; if a future routing commit drops a
+	 * hop, this catches it in debug instead of silently corrupting.
+	 */
+	assert(spdk_get_thread() == ec_io->submitter_thread);
 
 	for (i = 0; i < ec->k; i++) {
 		data_ptrs[i] = ec_io->data_iovs[i].iov_base;

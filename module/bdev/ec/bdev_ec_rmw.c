@@ -429,6 +429,15 @@ ec_rmw_submit_writes(struct ec_rmw_ctx *mctx)
 	uint32_t           writable_count = 0;
 
 	/*
+	 * Dispatch invariant: RMW writes use ec_io->ch->base_chans[],
+	 * which are owned by the submitter thread. The RMW persist-done ->
+	 * submitter hop (planned for a subsequent commit) ensures this
+	 * assertion holds for the multi-reactor path; today single-reactor
+	 * makes submitter == home, so it passes trivially.
+	 */
+	assert(spdk_get_thread() == ec_io->submitter_thread);
+
+	/*
 	 * Count writable slots: every modified data chunk in the range plus
 	 * every writable parity chunk. Data chunks outside the modified
 	 * range are not written back (unchanged on disk).
@@ -823,6 +832,15 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 	/* disks until we have k reads. In degraded mode we may read from   */
 	/* parity disks to accumulate k rows for reconstruction.              */
 	/* ------------------------------------------------------------------ */
+	/*
+	 * Dispatch invariant: reads use ec_io->ch->base_chans[], owned by
+	 * the submitter thread. See ec_rmw_submit_writes for the rationale.
+	 * Today this passes trivially because the whole function runs on
+	 * one thread; once the persist-done -> submitter hop lands, the
+	 * dispatch portion of ec_rmw_submit_core will run on submitter and
+	 * the assertion holds in multi-reactor as well.
+	 */
+	assert(spdk_get_thread() == ec_io->submitter_thread);
 	mctx->reads_remaining = 0;
 
 	for (disk = 0; disk < ec->n; disk++) {

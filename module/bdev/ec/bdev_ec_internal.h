@@ -180,8 +180,10 @@ struct ec_rebuild_deferred_stripe {
 
 /*
  * One instance per ec_bdev_start_rebuild() call. Freed by ec_rebuild_finish().
- * Entirely single-threaded on the SPDK app thread; no locking needed.
- * One stripe per poller tick: reads -> reconstruct -> write.
+ * Mutated only on the home thread (poller, RPC handlers, async completion
+ * callbacks for the rebuild_chans[] I/O channels which the home thread
+ * owns); no locking needed. One stripe per poller tick: reads ->
+ * reconstruct -> write.
  */
 struct ec_rebuild_ctx {
 	struct ec_bdev  *ec;
