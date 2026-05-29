@@ -1733,7 +1733,7 @@ ec_write_rebuild_progress_json(struct spdk_json_write_ctx *w,
 void
 ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 {
-	spdk_json_write_named_uint32(w, "rmw_in_flight", ec->rmw_in_flight);
+	spdk_json_write_named_uint32(w, "rmw_in_flight", ec_rmw_in_flight_get(ec));
 	if (ec->stripe_dirty_map) {
 		spdk_json_write_named_uint64(w, "dirty_stripes",
 					     ec_stripe_count_dirty(ec));
@@ -1753,21 +1753,21 @@ ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 	spdk_json_write_named_uint64(w, "unmaps_submitted",
 				     __atomic_load_n(&ec->unmaps_submitted, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmaps_completed",
-				     ec->unmaps_completed);
+				     __atomic_load_n(&ec->unmaps_completed, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmaps_deferred_busy",
 				     ec->unmaps_deferred_busy);
 	spdk_json_write_named_uint64(w, "unmaps_via_write_zeros",
 				     ec->unmaps_via_write_zeros);
 	spdk_json_write_named_uint64(w, "unmaps_failed",
-				     ec->unmaps_failed);
+				     __atomic_load_n(&ec->unmaps_failed, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmap_fanout_misses",
-				     ec->unmap_fanout_misses);
+				     __atomic_load_n(&ec->unmap_fanout_misses, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmapped_reads_synthesized",
-				     ec->unmapped_reads_synthesized);
+				     __atomic_load_n(&ec->unmapped_reads_synthesized, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "writes_into_unmapped",
 				     ec->writes_into_unmapped);
 	spdk_json_write_named_uint64(w, "writes_into_unmapped_failed",
-				     ec->writes_into_unmapped_failed);
+				     __atomic_load_n(&ec->writes_into_unmapped_failed, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmapped_stripes",
 				     ec_count_unmapped_stripes(ec));
 	spdk_json_write_named_uint64(w, "degraded_reads_reconstructed",

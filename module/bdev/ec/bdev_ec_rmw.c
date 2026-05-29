@@ -66,7 +66,7 @@ ec_rmw_complete(struct ec_rmw_ctx *mctx)
 	void *cb_arg = mctx->cb_arg;
 
 	ec_stripe_clear_dirty(ec, mctx->stripe_index);
-	ec->rmw_in_flight--;
+	ec_rmw_in_flight_dec(ec);
 	ec_wib_region_inflight_dec(ec, region);
 
 	ec_rmw_free_ctx(mctx, ec);
@@ -774,10 +774,10 @@ ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
  * (planned for a subsequent commit) can land cleanly between them.
  *
  * On partial submit failure, undoes the home-side bookkeeping
- * (stripe-busy claim, in-flight counters) before returning. The state
- * mutated here uses atomic ops (ec_stripe_clear_dirty,
- * ec_wib_region_inflight_dec), so this cleanup is safe to run on the
- * submitter thread.
+ * (stripe-busy claim, in-flight counters) before returning. All the
+ * state mutated here uses atomic ops (ec_stripe_clear_dirty,
+ * ec_rmw_in_flight_dec, ec_wib_region_inflight_dec), so this cleanup
+ * is safe to run on the submitter thread.
  *
  * Returns 0 on success (read I/O submitted asynchronously). Returns
  * -EIO if all read submits failed synchronously and the chain was
@@ -845,7 +845,7 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 			 * ec_rmw_complete would normally perform.
 			 */
 			ec_stripe_clear_dirty(ec, stripe_index);
-			ec->rmw_in_flight--;
+			ec_rmw_in_flight_dec(ec);
 			ec_wib_region_inflight_dec(ec,
 				ec_wib_stripe_to_region(stripe_index));
 			ec_rmw_free_ctx(mctx, ec);
@@ -980,7 +980,7 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 	}
 
 	ec_stripe_set_dirty(ec, stripe_index);
-	ec->rmw_in_flight++;
+	ec_rmw_in_flight_inc(ec);
 
 	/*
 	 * Increment per-region in-flight count here -- not in

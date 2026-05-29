@@ -569,6 +569,13 @@ struct ec_bdev {
 	 * twice to derive rates. The per-I/O DEBUG logs that used to cover
 	 * these were removed because they flooded; counters are the supported
 	 * trace surface.
+	 *
+	 * Thread discipline (do not "fix" without checking): a counter touched
+	 * only on the home thread uses a plain ++ and relies on the home-thread
+	 * assert at its increment site; a counter touched from a submitter (or
+	 * read cross-thread) uses __atomic_fetch_add / __atomic_load_n. Making a
+	 * home-only counter atomic is harmless but needless; making a
+	 * cross-thread counter plain is a data race.
 	 */
 	uint64_t degraded_read_eio_dirty;        /* reads rejected: dirty WIB region */
 	uint64_t degraded_reads_reconstructed;   /* reads served via reconstruction  */
@@ -1194,6 +1201,44 @@ static inline uint32_t
 ec_wib_region_inflight_get(const struct ec_bdev *ec, uint32_t region)
 {
 	return __atomic_load_n(&ec->wib_region_inflight[region], __ATOMIC_RELAXED);
+}
+
+/*
+ * Global in-flight RMW counter helpers. Same shape as
+ * wib_region_inflight: inc on home during RMW setup, dec on submitter
+ * during completion / partial-failure cleanup. Stats-only today (the
+ * JSON dump reports it; nothing branches on the value), but kept
+ * atomic for consistency with the per-region counter and so that any
+ * future drain/teardown gate that reads it cannot observe a torn
+ * value across the inc-home/dec-submitter boundary.
+ */
+static inline void
+ec_rmw_in_flight_inc(struct ec_bdev *ec)
+{
+	__atomic_fetch_add(&ec->rmw_in_flight, 1, __ATOMIC_RELAXED);
+}
+
+static inline void
+ec_rmw_in_flight_dec(struct ec_bdev *ec)
+{
+	uint32_t current;
+
+	current = __atomic_load_n(&ec->rmw_in_flight, __ATOMIC_RELAXED);
+	while (current > 0) {
+		if (__atomic_compare_exchange_n(&ec->rmw_in_flight,
+						&current, current - 1, false,
+						__ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+			return;
+		}
+		/* current updated; re-check > 0 */
+	}
+	SPDK_ERRLOG("EC bdev %s: rmw_in_flight underflow\n", ec->bdev.name);
+}
+
+static inline uint32_t
+ec_rmw_in_flight_get(const struct ec_bdev *ec)
+{
+	return __atomic_load_n(&ec->rmw_in_flight, __ATOMIC_RELAXED);
 }
 
 /* =========================================================================

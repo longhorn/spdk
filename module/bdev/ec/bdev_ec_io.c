@@ -215,7 +215,7 @@ ec_write_into_unmapped_bit_cleared(void *cb_arg, int rc)
 			    "Data is on disk but masked by bitmap.\n",
 			    ec->bdev.name, rc, ec_io->stripe_claim_index);
 		ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
-		ec->writes_into_unmapped_failed++;
+		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
 	}
 
 	owner = spdk_bdev_io_get_thread(ec_io->bdev_io);
@@ -294,7 +294,7 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 				    ec->bdev.name, rc,
 				    ec_io->stripe_claim_index);
 			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
-			ec->writes_into_unmapped_failed++;
+			__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
 		}
 
 		if (ec_io->stripe_claimed) {
@@ -831,7 +831,7 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 				memset(ec_io->iovs[i].iov_base, 0,
 				       ec_io->iovs[i].iov_len);
 			}
-			ec->unmapped_reads_synthesized++;
+			__atomic_fetch_add(&ec->unmapped_reads_synthesized, 1, __ATOMIC_RELAXED);
 			spdk_bdev_io_complete(ec_io->bdev_io,
 					      SPDK_BDEV_IO_STATUS_SUCCESS);
 			return 0;
@@ -1431,7 +1431,7 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 		ec_io->stripe_claimed         = false;
 		ec_io->is_write_into_unmapped = false;
 		ec_free_io_buffers(ec_io, ec);
-		ec->writes_into_unmapped_failed++;
+		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
 		return rc;
 	}
 

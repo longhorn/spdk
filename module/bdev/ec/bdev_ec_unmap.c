@@ -184,9 +184,9 @@ ec_unmap_inner_complete_default(void *cb_arg,
 	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
 
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
-		ec->unmaps_completed++;
+		__atomic_fetch_add(&ec->unmaps_completed, 1, __ATOMIC_RELAXED);
 	} else {
-		ec->unmaps_failed++;
+		__atomic_fetch_add(&ec->unmaps_failed,    1, __ATOMIC_RELAXED);
 	}
 	spdk_bdev_io_complete(ec_io->bdev_io, status);
 }
@@ -286,7 +286,7 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 		 * the closed accounting identity in bdev_ec_internal.h's
 		 * field cluster holds. */
 		__atomic_fetch_add(&ec->unmaps_submitted, 1, __ATOMIC_RELAXED);
-		ec->unmaps_completed++;
+		__atomic_fetch_add(&ec->unmaps_completed, 1, __ATOMIC_RELAXED);
 		spdk_bdev_io_complete(ec_io->bdev_io,
 				      SPDK_BDEV_IO_STATUS_SUCCESS);
 		return 0;
@@ -401,7 +401,7 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 
 out:
 	if (rc != 0 && rc != -EAGAIN) {
-		ec->unmaps_failed++;
+		__atomic_fetch_add(&ec->unmaps_failed, 1, __ATOMIC_RELAXED);
 	}
 	return rc;
 }
@@ -756,7 +756,7 @@ ec_unmap_child_complete(struct spdk_bdev_io *child, bool success, void *cb_arg)
 
 	if (!success) {
 		uctx->status = SPDK_BDEV_IO_STATUS_FAILED;
-		ec->unmap_fanout_misses++;
+		__atomic_fetch_add(&ec->unmap_fanout_misses, 1, __ATOMIC_RELAXED);
 	}
 
 	if (--uctx->writes_remaining > 0) {
@@ -942,9 +942,9 @@ ec_unmap_split_complete(struct ec_unmap_split_ctx *sctx)
 	 * the closed accounting identity in bdev_ec_internal.h holds.
 	 */
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
-		ec->unmaps_completed++;
+		__atomic_fetch_add(&ec->unmaps_completed, 1, __ATOMIC_RELAXED);
 	} else {
-		ec->unmaps_failed++;
+		__atomic_fetch_add(&ec->unmaps_failed,    1, __ATOMIC_RELAXED);
 	}
 	free(sctx);
 	spdk_bdev_io_complete(ec_io->bdev_io, status);
