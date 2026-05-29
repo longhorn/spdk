@@ -93,9 +93,11 @@ static int  ec_unmap_inner_fanout(struct ec_bdev_io *ec_io,
 				  uint64_t start_stripe, uint64_t end_stripe,
 				  ec_unmap_inner_complete_cb cb_fn,
 				  void *cb_arg);
-static void ec_unmap_bitmap_persist_done(void *cb_arg, int rc);
+static void ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc);
 static void ec_unmap_child_complete(struct spdk_bdev_io *child,
 				    bool success, void *cb_arg);
+static void ec_unmap_dispatch_fanout_on_submitter(void *ctx);
+static void ec_unmap_fire_cb_on_submitter(void *ctx);
 
 /*
  * Multi-segment UNMAP dispatcher state. An unaligned multi-stripe UNMAP
@@ -188,7 +190,31 @@ ec_unmap_inner_complete_default(void *cb_arg,
 	} else {
 		__atomic_fetch_add(&ec->unmaps_failed,    1, __ATOMIC_RELAXED);
 	}
-	spdk_bdev_io_complete(ec_io->bdev_io, status);
+
+	/*
+	 * spdk_bdev_io_complete asserts the owner (submitter) thread. The fan-out
+	 * success path lands on submitter (routed there in bitmap_persist_done);
+	 * the persist-failure path runs on home and must hop. Stash status in
+	 * ec_io->status so the helper can read it on the submitter side.
+	 */
+	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
+		spdk_bdev_io_complete(ec_io->bdev_io, status);
+		return;
+	}
+
+	ec_io->status = status;
+	{
+		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_io_complete_status_on_submitter, ec_io);
+		if (send_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: cannot hand off UNMAP "
+				    "completion to submitter thread '%s' (rc=%d %s); "
+				    "bdev_io stays in-flight\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec_io->submitter_thread),
+				    send_rc, spdk_strerror(-send_rc));
+		}
+	}
 }
 
 static void
@@ -597,12 +623,12 @@ ec_unmap_inner_fanout(struct ec_bdev_io *ec_io,
 }
 
 static void
-ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
+ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 {
 	struct ec_unmap_ctx *uctx = cb_arg;
 	struct ec_bdev      *ec   = ec_from_bdev_io(uctx->ec_io->bdev_io);
 
-	if (rc != 0) {
+	if (persist_rc != 0) {
 		/*
 		 * Persist did not reach the m+1 durability threshold. The
 		 * staged bits never became visible to readers (live was
@@ -614,7 +640,7 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
 		 */
 		SPDK_WARNLOG("EC bdev %s: bitmap persist failed (rc=%d) "
 			     "before UNMAP fan-out at stripes [%" PRIu64 "..%" PRIu64 ")\n",
-			     ec->bdev.name, rc,
+			     ec->bdev.name, persist_rc,
 			     uctx->start_stripe, uctx->end_stripe);
 		ec_unmap_release_claims(ec, uctx->start_stripe,
 					uctx->end_stripe);
@@ -660,6 +686,102 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
 	free(uctx->staged_map);
 	uctx->staged_map = NULL;
 
+	/*
+	 * Fan-out routing: base UNMAPs dispatch on
+	 * ec_io->ch->base_chans[] (submitter-owned). In single-reactor
+	 * submitter == home and the inline path runs; in multi-reactor we
+	 * hop to the submitter so spdk_bdev_unmap_blocks goes out on the
+	 * channel-owning thread.
+	 */
+	if (spdk_likely(spdk_get_thread() == uctx->ec_io->submitter_thread)) {
+		int fanout_rc = ec_unmap_fanout(uctx);
+		if (fanout_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: UNMAP fan-out submitted no I/O at "
+				    "stripes [%" PRIu64 "..%" PRIu64 ") (rc=%d); completing FAILED "
+				    "(bitmap already marked unmapped; reads still "
+				    "synthesize zeros)\n",
+				    ec->bdev.name, uctx->start_stripe,
+				    uctx->end_stripe, fanout_rc);
+			/*
+			 * Fan-out could not submit any I/O. The bitmap already
+			 * says "unmapped" so reads of the affected stripes
+			 * return synthesized zeros regardless -- the read-as-
+			 * zero contract is intact. Still complete the bdev_io
+			 * as FAILED because the caller asked for physical
+			 * reclamation and we did not deliver any of it; the
+			 * next UNMAP / rebuild will retry.
+			 */
+			ec_unmap_release_claims(ec, uctx->start_stripe,
+						uctx->end_stripe);
+			{
+				ec_unmap_inner_complete_cb cb_fn  = uctx->cb_fn;
+				void                      *cb_arg = uctx->cb_arg;
+
+				free(uctx);
+				cb_fn(cb_arg, SPDK_BDEV_IO_STATUS_FAILED);
+			}
+		}
+		return;
+	}
+
+	{
+		int send_rc;
+
+		send_rc = spdk_thread_send_msg(uctx->ec_io->submitter_thread,
+			ec_unmap_dispatch_fanout_on_submitter, uctx);
+		if (send_rc != 0) {
+			/*
+			 * Cannot reach the submitter. Release the stripe-busy
+			 * claims, mark FAILED, and route the cb_fn invocation
+			 * back via a second send_msg (cb_fn ultimately calls
+			 * spdk_bdev_io_complete, which asserts owner thread).
+			 * Same shape as Site 2. The bitmap apply already
+			 * happened, so the read-as-zero contract is intact;
+			 * the FAILED return tells the caller no physical
+			 * reclamation occurred.
+			 */
+			int complete_rc;
+
+			SPDK_ERRLOG("EC bdev %s: cannot hand off UNMAP fan-out "
+				    "to submitter thread '%s' (rc=%d %s) at stripes "
+				    "[%" PRIu64 "..%" PRIu64 "); failing\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(uctx->ec_io->submitter_thread),
+				    send_rc, spdk_strerror(-send_rc),
+				    uctx->start_stripe, uctx->end_stripe);
+			ec_unmap_release_claims(ec, uctx->start_stripe,
+						uctx->end_stripe);
+			uctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+			complete_rc = spdk_thread_send_msg(
+				uctx->ec_io->submitter_thread,
+				ec_unmap_fire_cb_on_submitter, uctx);
+			if (complete_rc != 0) {
+				SPDK_ERRLOG("EC bdev %s: also cannot hand off "
+					    "failure completion to submitter thread "
+					    "'%s' (rc=%d %s); bdev_io stays in-flight\n",
+					    ec->bdev.name,
+					    spdk_thread_get_name(uctx->ec_io->submitter_thread),
+					    complete_rc, spdk_strerror(-complete_rc));
+				free(uctx);
+			}
+		}
+	}
+}
+
+/*
+ * send_msg target for routing the UNMAP fan-out to the submitter
+ * thread after the bitmap persist completes on home. Runs ec_unmap_fanout
+ * on the submitter; on synchronous fan-out failure, fires cb_fn(FAILED)
+ * directly here (we are on submitter = bdev_io owner, so cb_fn's
+ * eventual spdk_bdev_io_complete is safe).
+ */
+static void
+ec_unmap_dispatch_fanout_on_submitter(void *ctx)
+{
+	struct ec_unmap_ctx *uctx = ctx;
+	struct ec_bdev      *ec   = ec_from_bdev_io(uctx->ec_io->bdev_io);
+	int                  rc;
+
 	rc = ec_unmap_fanout(uctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("EC bdev %s: UNMAP fan-out submitted no I/O at "
@@ -668,14 +790,6 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
 			    "synthesize zeros)\n",
 			    ec->bdev.name, uctx->start_stripe,
 			    uctx->end_stripe, rc);
-		/*
-		 * Fan-out could not submit any I/O. The bitmap already says
-		 * "unmapped" so reads of the affected stripes will return
-		 * synthesized zeros regardless -- the read-as-zero contract
-		 * is intact. Still complete the bdev_io as FAILED because
-		 * the caller asked for physical reclamation and we did not
-		 * deliver any of it; the next UNMAP / rebuild will retry.
-		 */
 		ec_unmap_release_claims(ec, uctx->start_stripe,
 					uctx->end_stripe);
 		{
@@ -686,6 +800,24 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int rc)
 			cb_fn(cb_arg, SPDK_BDEV_IO_STATUS_FAILED);
 		}
 	}
+}
+
+/*
+ * send_msg target for routing the cb_fn invocation back to the
+ * submitter on the second-stage failure where the fan-out hand-off
+ * itself failed. uctx->status carries the completion status (set by
+ * the caller to FAILED before send_msg). Frees uctx after firing.
+ */
+static void
+ec_unmap_fire_cb_on_submitter(void *ctx)
+{
+	struct ec_unmap_ctx        *uctx   = ctx;
+	ec_unmap_inner_complete_cb  cb_fn  = uctx->cb_fn;
+	void                       *cb_arg = uctx->cb_arg;
+	enum spdk_bdev_io_status    status = uctx->status;
+
+	free(uctx);
+	cb_fn(cb_arg, status);
 }
 
 static int
