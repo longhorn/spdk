@@ -212,15 +212,26 @@ ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
  * ec->stripe_unmapped_map. Call only after ec_bitmap_validate_buf has
  * returned 0 for this buffer.
  *
- * Threading: this runs once at load time, on the home thread, before
- * the bdev is registered (ec_bdev_create_async's load chain completes
- * before spdk_bdev_register is called -- see bdev_ec.c). At this point
- * no I/O channel exists yet, so no cross-reactor reader can observe
- * the map. The plain memcpy is therefore equivalent to a sequence of
- * release-stores on stripe_unmapped_map; readers using acquire-load
- * after the bdev becomes visible to consumers see the fully-applied
- * post-load state. Bypassing ec_stripe_set_unmapped here is safe by
- * the same logic that lets resize.c:165 use memcpy under quiesce.
+ * Threading: this runs on the home thread (the creation thread that
+ * issued the async load chain). The bdev IS already registered at
+ * this point -- spdk_bdev_register fires before the load chain runs
+ * apply_buf -- so a strict "no reader exists" argument does not hold.
+ *
+ * The window from register to apply_buf is non-empty, but the only
+ * reader that can enter it is SPDK examine (lvol superblock import
+ * etc.), which runs on the same spdk_thread that registered the bdev
+ * -- i.e. home. Examine and apply_buf therefore serialize on home,
+ * and the memcpy is observably atomic to examine reads.
+ *
+ * Workload (cross-reactor) readers cannot reach the bdev until the
+ * create-RPC returns, which waits for both apply_buf and
+ * spdk_bdev_wait_for_examine to finish (see the create-finalize
+ * comment in bdev_ec.c). So by the time any non-home reader runs an
+ * acquire-load on stripe_unmapped_map, the memcpy is complete and
+ * its effect is published by the post-create release barriers SPDK
+ * inserts when handing the bdev to its consumers.
+ *
+ * The same logic lets resize.c:165 use memcpy under quiesce.
  */
 void
 ec_bitmap_apply_buf(struct ec_bdev *ec, const void *buf)
