@@ -702,6 +702,113 @@ ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
  * On non-zero return cb_fn is NOT invoked -- the caller owns
  * completion accounting.
  */
+/*
+ * Submitter-side half of the RMW core: dispatches reads on
+ * ec_io->ch->base_chans[] (submitter-owned). Separated from
+ * ec_rmw_submit_core's setup half so the persist-done -> submitter hop
+ * (planned for a subsequent commit) can land cleanly between them.
+ *
+ * On partial submit failure, undoes the home-side bookkeeping
+ * (stripe-busy claim, in-flight counters) before returning. The state
+ * mutated here uses atomic ops (ec_stripe_clear_dirty,
+ * ec_wib_region_inflight_dec), so this cleanup is safe to run on the
+ * submitter thread.
+ *
+ * Returns 0 on success (read I/O submitted asynchronously). Returns
+ * -EIO if all read submits failed synchronously and the chain was
+ * torn down inline. Some-succeeded-some-failed is treated as success
+ * here -- the completion path uses the recorded FAILED status.
+ */
+static int
+ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
+{
+	struct ec_bdev_io *ec_io           = mctx->ec_io;
+	struct ec_bdev    *ec              = ec_from_bdev_io(ec_io->bdev_io);
+	uint64_t           stripe_index    = mctx->stripe_index;
+	uint32_t           reads_submitted = 0;
+	uint32_t           disk;
+	int                rc;
+
+	/*
+	 * Dispatch invariant: reads use ec_io->ch->base_chans[], owned by
+	 * the submitter thread. See ec_rmw_submit_writes for the rationale.
+	 * Today this passes trivially because the caller is on the same
+	 * thread; once the persist-done -> submitter hop lands, this
+	 * function will be entered via send_msg on the submitter.
+	 */
+	assert(spdk_get_thread() == ec_io->submitter_thread);
+	mctx->reads_remaining = 0;
+
+	for (disk = 0; disk < ec->n; disk++) {
+		if (!ec_slot_is_readable(ec, disk)) {
+			continue;
+		}
+		if (reads_submitted >= ec->k) {
+			break;
+		}
+
+		mctx->reads_remaining++;
+
+		rc = spdk_bdev_readv_blocks(ec->descs[disk],
+					    ec_io->ch->base_chans[disk],
+					    &mctx->chunk_iovs[disk], 1,
+					    mctx->disk_lba,
+					    ec->strip_size,
+					    ec_rmw_read_cb,
+					    mctx);
+		if (rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: RMW read submit failed for "
+				    "disk %u stripe %" PRIu64 " (rc=%d)\n",
+				    ec->bdev.name, disk, stripe_index, rc);
+			mctx->reads_remaining--;
+			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+		} else {
+			reads_submitted++;
+		}
+	}
+
+	if (reads_submitted < ec->k) {
+		SPDK_ERRLOG("EC bdev %s: RMW only %u/%u reads submitted for "
+			    "stripe %" PRIu64 "\n",
+			    ec->bdev.name, reads_submitted, ec->k, stripe_index);
+
+		if (mctx->reads_remaining == 0) {
+			/*
+			 * All submits failed synchronously. No callbacks will
+			 * fire. Clean up the dirty state and context now,
+			 * including the wib_region_inflight decrement that
+			 * ec_rmw_complete would normally perform.
+			 */
+			ec_stripe_clear_dirty(ec, stripe_index);
+			ec->rmw_in_flight--;
+			ec_wib_region_inflight_dec(ec,
+				ec_wib_stripe_to_region(stripe_index));
+			ec_rmw_free_ctx(mctx, ec);
+			return -EIO;
+		}
+
+		/*
+		 * Some submits succeeded. Their callbacks will eventually
+		 * call ec_rmw_complete with the FAILED status we already set.
+		 */
+		mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+	}
+
+	return 0;
+}
+
+/*
+ * Setup half of the RMW core: validates the request, allocates the
+ * ec_rmw_ctx + DMA buffers, claims the stripe-busy bit, and bumps the
+ * per-region in-flight counter. All mutations here touch home-owned
+ * state (claim test-and-set, WIB region map, dirty_ticks); the home-
+ * thread assertion enforces that.
+ *
+ * After setup, hands off to ec_rmw_dispatch_reads for the base I/O
+ * dispatch. Today both halves run inline on the same thread (single-
+ * reactor: home == submitter); a subsequent commit will insert a
+ * send_msg hop between them so the dispatch lands on the submitter.
+ */
 static int
 ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 		   uint64_t offset_blocks, uint64_t num_blocks,
@@ -714,8 +821,10 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 	uint64_t           stripe_index;
 	struct ec_rmw_ctx *mctx;
 	uint32_t           disk;
-	uint32_t           reads_submitted = 0;
 	int                rc;
+
+	/* Setup invariant: the stripe-busy claim is a non-atomic test-and-set, and home is the only setter for stripe_dirty_map / wib_region_inflight / dirty_ticks. Running setup off home would race a concurrent claimant. */
+	assert(spdk_get_thread() == ec->home_thread);
 
 	stripe_index = offset_blocks / ec->stripe_blocks;
 
@@ -825,80 +934,10 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 		}
 	}
 
-	/* ------------------------------------------------------------------ */
-	/* Submit reads for the k readable disks                              */
-	/*                                                                    */
-	/* Identical loop to degraded read: iterate 0..n-1, read from readable */
-	/* disks until we have k reads. In degraded mode we may read from   */
-	/* parity disks to accumulate k rows for reconstruction.              */
-	/* ------------------------------------------------------------------ */
-	/*
-	 * Dispatch invariant: reads use ec_io->ch->base_chans[], owned by
-	 * the submitter thread. See ec_rmw_submit_writes for the rationale.
-	 * Today this passes trivially because the whole function runs on
-	 * one thread; once the persist-done -> submitter hop lands, the
-	 * dispatch portion of ec_rmw_submit_core will run on submitter and
-	 * the assertion holds in multi-reactor as well.
-	 */
-	assert(spdk_get_thread() == ec_io->submitter_thread);
-	mctx->reads_remaining = 0;
-
-	for (disk = 0; disk < ec->n; disk++) {
-		if (!ec_slot_is_readable(ec, disk)) {
-			continue;
-		}
-		if (reads_submitted >= ec->k) {
-			break;
-		}
-
-		mctx->reads_remaining++;
-
-		rc = spdk_bdev_readv_blocks(ec->descs[disk],
-					    ec_io->ch->base_chans[disk],
-					    &mctx->chunk_iovs[disk], 1,
-					    mctx->disk_lba,
-					    ec->strip_size,
-					    ec_rmw_read_cb,
-					    mctx);
-		if (rc != 0) {
-			SPDK_ERRLOG("EC bdev %s: RMW read submit failed for "
-				    "disk %u stripe %" PRIu64 " (rc=%d)\n",
-				    ec->bdev.name, disk, stripe_index, rc);
-			mctx->reads_remaining--;
-			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
-		} else {
-			reads_submitted++;
-		}
-	}
-
-	if (reads_submitted < ec->k) {
-		SPDK_ERRLOG("EC bdev %s: RMW only %u/%u reads submitted for "
-			    "stripe %" PRIu64 "\n",
-			    ec->bdev.name, reads_submitted, ec->k, stripe_index);
-
-		if (mctx->reads_remaining == 0) {
-			/*
-			 * All submits failed synchronously. No callbacks will
-			 * fire. Clean up the dirty state and context now,
-			 * including the wib_region_inflight decrement that
-			 * ec_rmw_complete would normally perform.
-			 */
-			ec_stripe_clear_dirty(ec, stripe_index);
-			ec->rmw_in_flight--;
-			ec_wib_region_inflight_dec(ec,
-				ec_wib_stripe_to_region(stripe_index));
-			ec_rmw_free_ctx(mctx, ec);
-			return -EIO;
-		}
-
-		/*
-		 * Some submits succeeded. Their callbacks will eventually
-		 * call ec_rmw_complete with the FAILED status we already set.
-		 */
-		mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
-	}
-
-	return 0;
+	/* Setup complete. Hand off to the submitter-side read dispatch.
+	 * Today both halves run inline on the same thread; the persist-done
+	 * -> submitter hop will be inserted here in a subsequent commit. */
+	return ec_rmw_dispatch_reads(mctx);
 }
 
 /*
