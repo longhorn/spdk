@@ -1550,4 +1550,14 @@ int  ec_submit_write(struct ec_bdev_io *ec_io);
  */
 int  ec_submit_unmap(struct ec_bdev_io *ec_io);
 
+/*
+ * Shared spdk_thread_send_msg target that fires the parent bdev_io
+ * completion with ec_io->status on the submitter (= owner) thread.
+ * Used by every owner-route hand-off across the write / UNMAP paths
+ * (entry-routing failure, inner-fanout completion, split-segment
+ * completion). Callers stash the final status into ec_io->status
+ * before invoking spdk_thread_send_msg.
+ */
+void ec_io_complete_status_on_submitter(void *ctx);
+
 #endif /* SPDK_BDEV_EC_INTERNAL_H */

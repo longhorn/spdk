@@ -1378,10 +1378,46 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	return 0;
 }
 
+/*
+ * Shared send_msg target for owner-routed parent-bdev_io completion.
+ * Declared in bdev_ec_internal.h so all owner-route hand-offs (write
+ * entry-routing failure here, UNMAP entry-routing failure, inner-fanout
+ * completion, split-segment completion) share one implementation.
+ * Callers stash the final status into ec_io->status before invoking
+ * spdk_thread_send_msg.
+ */
+void
+ec_io_complete_status_on_submitter(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+
+	spdk_bdev_io_complete(ec_io->bdev_io, ec_io->status);
+}
+
+static void ec_submit_write_on_home(void *ctx);
+
 int
 ec_submit_write(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+	/*
+	 * Entry routing: the write path mutates home-only state
+	 * (stripe-busy claim, WIB region map, scrub_ctx counters, persist
+	 * orchestration) inside ec_submit_write_into_unmapped /
+	 * ec_submit_full_write / ec_submit_rmw_write. Route the entire
+	 * call to home if we're not already there. In single-reactor
+	 * submitter == home and the inline branch runs.
+	 *
+	 * The bitmap consult below (ec_stripe_is_unmapped) uses
+	 * __ATOMIC_ACQUIRE per the C3 release/acquire discipline, so the
+	 * outcome of the unmapped check is reproducible on home after
+	 * the hop.
+	 */
+	if (spdk_unlikely(spdk_get_thread() != ec->home_thread)) {
+		return spdk_thread_send_msg(ec->home_thread,
+					    ec_submit_write_on_home, ec_io);
+	}
 
 	/*
 	 * Unmapped-bitmap consultation. A write that lands on an unmapped
@@ -1425,4 +1461,42 @@ ec_submit_write(struct ec_bdev_io *ec_io)
 	}
 
 	return ec_submit_rmw_write(ec_io);
+}
+
+/*
+ * Re-enters ec_submit_write on the home thread. The routing check at
+ * the top of ec_submit_write fast-paths to the body now that we are
+ * on home. On sync failure, route the bdev_io completion back to the
+ * submitter with the appropriate status (NOMEM for retryable errors,
+ * FAILED for hard errors), mirroring ec_submit_request's status
+ * mapping for the inline path. If even the completion hand-off fails,
+ * log and accept the hang (Site 2 pattern).
+ */
+static void
+ec_submit_write_on_home(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
+	int                rc;
+
+	rc = ec_submit_write(ec_io);
+	if (rc == 0) {
+		return;
+	}
+
+	ec_io->status = (rc == -EAGAIN || rc == -ENOMEM)
+			? SPDK_BDEV_IO_STATUS_NOMEM
+			: SPDK_BDEV_IO_STATUS_FAILED;
+	{
+		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_io_complete_status_on_submitter, ec_io);
+		if (send_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: cannot hand off submit "
+				    "failure to submitter thread '%s' (rc=%d %s); "
+				    "bdev_io stays in-flight\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec_io->submitter_thread),
+				    send_rc, spdk_strerror(-send_rc));
+		}
+	}
 }

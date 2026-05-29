@@ -51,6 +51,7 @@
 #include "bdev_ec_internal.h"
 
 #include "spdk/bdev_module.h"
+#include "spdk/string.h"
 #include "spdk/util.h"
 #include "spdk/log.h"
 
@@ -267,6 +268,8 @@ ec_unmap_must_defer_for_scrub(struct ec_bdev *ec,
 	return false;
 }
 
+static void ec_submit_unmap_on_home(void *ctx);
+
 int
 ec_submit_unmap(struct ec_bdev_io *ec_io)
 {
@@ -277,16 +280,38 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 	uint64_t        end = off + len;
 	uint64_t        start_stripe, end_stripe;
 
-	ec->unmaps_submitted++;
-
 	if (len == 0) {
-		/* Count the no-op completion so the closed accounting
-		 * identity in bdev_ec_internal.h's field cluster holds. */
+		/* No home-thread state touched; complete inline on the
+		 * submitter (= owner) thread. Count the no-op completion so
+		 * the closed accounting identity in bdev_ec_internal.h's
+		 * field cluster holds. */
+		__atomic_fetch_add(&ec->unmaps_submitted, 1, __ATOMIC_RELAXED);
 		ec->unmaps_completed++;
 		spdk_bdev_io_complete(ec_io->bdev_io,
 				      SPDK_BDEV_IO_STATUS_SUCCESS);
 		return 0;
 	}
+
+	/*
+	 * Entry routing: the unmap path mutates home-only state
+	 * (stripe-busy claim range, bitmap shadow / persist orchestration,
+	 * unmap_fanout_misses) below. Route to home if we're not already
+	 * there. In single-reactor submitter == home and the inline path
+	 * runs.
+	 *
+	 * unmaps_submitted is bumped AFTER this check so the cross-thread
+	 * re-entry through ec_submit_unmap_on_home -> ec_submit_unmap
+	 * counts the request exactly once (on home). Counting before the
+	 * hop would double every cross-thread UNMAP and break the
+	 * "submitted = completed + via_zeros + deferred + rejected"
+	 * accounting that downstream observers rely on.
+	 */
+	if (spdk_unlikely(spdk_get_thread() != ec->home_thread)) {
+		return spdk_thread_send_msg(ec->home_thread,
+					    ec_submit_unmap_on_home, ec_io);
+	}
+
+	__atomic_fetch_add(&ec->unmaps_submitted, 1, __ATOMIC_RELAXED);
 
 	/*
 	 * Single-stripe shortcut: every block of the request lies within one
@@ -379,6 +404,42 @@ out:
 		ec->unmaps_failed++;
 	}
 	return rc;
+}
+
+/*
+ * Re-enters ec_submit_unmap on the home thread. On sync failure, route the
+ * bdev_io completion back to the submitter with the appropriate status
+ * (NOMEM for retryable, FAILED for hard). If the completion hand-off also
+ * fails the bdev_io stays in flight rather than being completed on the
+ * wrong thread.
+ */
+static void
+ec_submit_unmap_on_home(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
+	int                rc;
+
+	rc = ec_submit_unmap(ec_io);
+	if (rc == 0) {
+		return;
+	}
+
+	ec_io->status = (rc == -EAGAIN || rc == -ENOMEM)
+			? SPDK_BDEV_IO_STATUS_NOMEM
+			: SPDK_BDEV_IO_STATUS_FAILED;
+	{
+		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+			ec_io_complete_status_on_submitter, ec_io);
+		if (send_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: cannot hand off submit "
+				    "failure to submitter thread '%s' (rc=%d %s); "
+				    "bdev_io stays in-flight\n",
+				    ec->bdev.name,
+				    spdk_thread_get_name(ec_io->submitter_thread),
+				    send_rc, spdk_strerror(-send_rc));
+		}
+	}
 }
 
 /*

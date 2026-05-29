@@ -1751,7 +1751,7 @@ ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 	spdk_json_write_named_uint64(w, "full_stripe_writes_deferred",
 				     ec->full_stripe_writes_deferred);
 	spdk_json_write_named_uint64(w, "unmaps_submitted",
-				     ec->unmaps_submitted);
+				     __atomic_load_n(&ec->unmaps_submitted, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmaps_completed",
 				     ec->unmaps_completed);
 	spdk_json_write_named_uint64(w, "unmaps_deferred_busy",
