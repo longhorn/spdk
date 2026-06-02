@@ -210,6 +210,30 @@ ec_rebuild_finish(struct ec_rebuild_ctx *ctx, int rc)
 		}
 
 		/*
+		 * Attempt the startup scrub if it was deferred at
+		 * boot because a data disk was not NORMAL at that time.
+		 *
+		 * Condition: rebuild succeeded (all data disks now NORMAL),
+		 * no scrub is already running, and at least one WIB region
+		 * is still dirty (set by ec_wib_load_async at startup).
+		 *
+		 * If ec_bdev_start_scrub succeeds it installs ec->scrub_ctx
+		 * and the scrub runs in the background. If it fails or finds
+		 * no dirty regions, the dirty region bits remain set and will
+		 * be re-examined on the next startup.
+		 */
+		if (ec->scrub_ctx == NULL && ec_wib_count_dirty(ec) > 0) {
+			int scrub_rc = ec_bdev_start_scrub(ec);
+			if (scrub_rc != 0) {
+				SPDK_WARNLOG("EC bdev %s: deferred "
+					     "scrub start failed "
+					     "(rc=%d); dirty regions "
+					     "remain set\n",
+					     ec->bdev.name, scrub_rc);
+			}
+		}
+
+		/*
 		 * If deferred-scrub guard was holding RMW backpressure (rebuild
 		 * needed to restore a failed data disk first), clear the flag.
 		 * If a scrub starts here it will install its own backpressure
