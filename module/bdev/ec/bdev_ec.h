@@ -150,6 +150,15 @@ int ec_bdev_get_rebuild_progress(const char *ec_name,
 				 uint64_t *stripes_rebuilt,
 				 uint32_t *slots_to_rebuild);
 
+/* Query live scrub progress. Returns -ENODEV or -ENOENT on error. */
+int ec_bdev_get_scrub_progress(const char *ec_name,
+			       uint32_t   *current_region,
+			       uint32_t   *num_regions,
+			       uint32_t   *total_dirty_regions,
+			       uint64_t   *current_stripe,
+			       uint64_t   *stripes_scrubbed,
+			       uint64_t   *regions_scrubbed);
+
 /*
  * Set rebuild QoS parameters on a running rebuild.
  * max_stripes_per_sec: 0 = unlimited. paused: true = pause rebuild.

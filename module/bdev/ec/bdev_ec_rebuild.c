@@ -925,3 +925,626 @@ ec_bdev_get_rebuild_progress(const char *ec_name,
 
 	return 0;
 }
+
+/* -------------------------------------------------------------------------
+ * Startup scrub chain
+ * ------------------------------------------------------------------------- */
+
+void
+ec_scrub_free_resources(struct ec_scrub_ctx *sctx)
+{
+	ec_free_channels_and_buffers(sctx->scrub_chans, sctx->chunk_bufs, sctx->ec->n);
+}
+
+/*
+ * Called when all dirty regions have been scrubbed (or the scrub is aborted).
+ * Persists the cleared WIB (fire-and-forget), frees resources, clears
+ * ec->scrub_ctx so RMW writes are no longer gated.
+ */
+static void
+ec_scrub_finish(struct ec_scrub_ctx *sctx)
+{
+	struct ec_bdev *ec = sctx->ec;
+
+	if (sctx->poller) {
+		spdk_poller_unregister(&sctx->poller);
+	}
+
+	{
+		uint64_t ticks_per_second = spdk_get_ticks_hz();
+		uint64_t elapsed_seconds  = ticks_per_second != 0 ?
+			(spdk_get_ticks() - sctx->start_ticks) / ticks_per_second : 0;
+
+		SPDK_NOTICELOG("EC bdev %s: startup scrub complete: "
+			       "%" PRIu64 "/%u dirty region(s), "
+			       "%" PRIu64 " stripes scrubbed in %" PRIu64 "s; "
+			       "WIB now clean\n",
+			       ec->bdev.name,
+			       sctx->regions_scrubbed,
+			       sctx->total_dirty_regions,
+			       sctx->stripes_scrubbed,
+			       elapsed_seconds);
+	}
+
+	ec_rmw_backpressure_end(ec, "scrub finished");
+
+	/*
+	 * Persist the cleared bitmap (all region bits are now cleared in
+	 * memory). Fire-and-forget: if this write fails, the next startup
+	 * will re-scrub the same regions -- safe but not optimal.
+	 */
+	if (!ec->wib_persist_in_flight) {
+		ec_wib_persist(ec, NULL, NULL);
+	}
+
+	ec_scrub_free_resources(sctx);
+	ec->scrub_ctx = NULL;
+	free(sctx);
+}
+
+/*
+ * Same heartbeat shape as ec_rebuild_heartbeat: NOTICE every
+ * EC_REBUILD_HEARTBEAT_SEC seconds or every EC_REBUILD_HEARTBEAT_PERCENT_STEP
+ * percent of regions, whichever fires first. Called once per region
+ * completion; cadence is already low because regions span 1024 stripes.
+ */
+static void
+ec_scrub_heartbeat(struct ec_scrub_ctx *sctx)
+{
+	uint64_t now = spdk_get_ticks();
+	uint64_t ticks_per_second = spdk_get_ticks_hz();
+	uint32_t percent;
+	bool     by_time;
+	bool     by_percent;
+
+	if (sctx->total_dirty_regions == 0 || ticks_per_second == 0) {
+		return;
+	}
+
+	percent = (uint32_t)((sctx->regions_scrubbed * 100) /
+			     sctx->total_dirty_regions);
+
+	/* 100% is owned by the "scrub complete" NOTICE in ec_scrub_finish;
+	 * skip heartbeat at the boundary to avoid two back-to-back lines. */
+	if (percent >= 100) {
+		return;
+	}
+
+	by_time = (now - sctx->last_heartbeat_ticks) >=
+		  (uint64_t)EC_REBUILD_HEARTBEAT_SEC * ticks_per_second;
+	by_percent = percent >= sctx->next_heartbeat_percent;
+
+	if (!by_time && !by_percent) {
+		return;
+	}
+
+	uint64_t elapsed_seconds = (now - sctx->start_ticks) / ticks_per_second;
+	uint64_t remaining_seconds = (percent > 0) ?   /* percent in [1,99]: >=100 returned above, ==0 guarded by ?: */
+			     (elapsed_seconds * (100 - percent) / percent) : 0;
+
+	SPDK_NOTICELOG("EC bdev %s: scrub progress %u%% "
+		       "(%" PRIu64 "/%u regions, %" PRIu64 " stripes scrubbed, "
+		       "%" PRIu64 "s elapsed, ~%" PRIu64 "s remaining)\n",
+		       sctx->ec->bdev.name, percent,
+		       sctx->regions_scrubbed, sctx->total_dirty_regions,
+		       sctx->stripes_scrubbed,
+		       elapsed_seconds, remaining_seconds);
+
+	sctx->last_heartbeat_ticks = now;
+	if (by_percent) {
+		sctx->next_heartbeat_percent = (percent / EC_REBUILD_HEARTBEAT_PERCENT_STEP + 1)
+					   * EC_REBUILD_HEARTBEAT_PERCENT_STEP;
+	}
+}
+
+/*
+ * Move to the next dirty region. If none remain, call ec_scrub_finish.
+ */
+static void
+ec_scrub_move_to_next_region(struct ec_scrub_ctx *sctx)
+{
+	struct ec_bdev *ec = sctx->ec;
+	uint32_t        region;
+
+	for (region = sctx->current_region + 1; region < ec->wib_num_regions; region++) {
+		if (ec_wib_region_is_dirty(ec, region)) {
+			sctx->current_region   = region;
+			sctx->current_stripe   = (uint64_t)region * EC_WIB_REGION_STRIPES;
+			sctx->region_end_stripe = spdk_min(
+				sctx->current_stripe + EC_WIB_REGION_STRIPES,
+				ec->num_stripes);
+			return;
+		}
+	}
+
+	/* No more dirty regions */
+	ec_scrub_finish(sctx);
+}
+
+/*
+ * Called for each parity write submitted during scrub.
+ */
+static void
+ec_scrub_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_scrub_ctx *sctx = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		sctx->io_status = SPDK_BDEV_IO_STATUS_FAILED;
+		SPDK_WARNLOG("EC bdev %s: scrub parity write failed at "
+			     "stripe %" PRIu64 "\n",
+			     sctx->ec->bdev.name, sctx->current_stripe);
+	}
+
+	sctx->writes_remaining--;
+	if (sctx->writes_remaining != 0) {
+		return;
+	}
+
+	/*
+	 * Advance regardless of outcome. On write failure the region bit
+	 * stays set, so the next startup re-scrubs this stripe; only count
+	 * it as scrubbed on success.
+	 */
+	sctx->current_stripe++;
+	if (sctx->io_status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+		sctx->stripes_scrubbed++;
+	}
+
+	sctx->io_in_flight = false;
+}
+
+/*
+ * All k reads for the current stripe completed. Re-encode parity and
+ * write back to all writable parity slots.
+ */
+static void
+ec_scrub_reads_done(struct ec_scrub_ctx *sctx)
+{
+	struct ec_bdev  *ec         = sctx->ec;
+	uint64_t         disk_lba   = ec_stripe_base_lba(ec, sctx->current_stripe);
+	uint8_t         *data_ptrs[EC_MAX_BASE_BDEVS];
+	uint8_t         *parity_ptrs[EC_MAX_BASE_BDEVS];
+	uint32_t         i;
+	uint32_t         writable_parity = 0;
+	uint32_t         failed_data_slots[EC_MAX_BASE_BDEVS];
+	uint8_t         *failed_out_bufs[EC_MAX_BASE_BDEVS];
+	uint32_t         num_failed = 0;
+	int              rc;
+
+	/*
+	 * If a data disk failed mid-scrub, its chunk_bufs entry was not read
+	 * this stripe (ec_scrub_submit_reads skips unreadable slots) and still
+	 * holds stale data from an earlier stripe. Encoding parity from it
+	 * would write corrupt parity, so reconstruct any unreadable data chunk
+	 * from the k survivors first -- same approach as
+	 * ec_rebuild_reconstruct_write.
+	 */
+	for (i = 0; i < ec->k; i++) {
+		if (!ec_slot_is_readable(ec, i)) {
+			failed_data_slots[num_failed] = i;
+			failed_out_bufs[num_failed]   = sctx->chunk_bufs[i];
+			num_failed++;
+		}
+	}
+	if (num_failed > 0) {
+		rc = ec_reconstruct_multi_data(ec,
+					       sctx->chunk_bufs,
+					       failed_out_bufs,
+					       failed_data_slots,
+					       num_failed,
+					       sctx->chunk_bytes);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: scrub -- multi-data "
+				     "reconstruction (num_failed=%u) failed at "
+				     "stripe %" PRIu64 "; skipping\n",
+				     ec->bdev.name, num_failed,
+				     sctx->current_stripe);
+			sctx->current_stripe++;
+			sctx->io_in_flight = false;
+			return;
+		}
+	}
+
+	/* Re-encode parity from k data chunks */
+	for (i = 0; i < ec->k; i++) {
+		data_ptrs[i] = sctx->chunk_bufs[i];
+	}
+	for (i = 0; i < ec->m; i++) {
+		parity_ptrs[i] = sctx->chunk_bufs[ec->k + i];
+	}
+
+	ec_encode_data((int)sctx->chunk_bytes,
+		       (int)ec->k,
+		       (int)ec->m,
+		       ec->g_tbls,
+		       data_ptrs,
+		       parity_ptrs);
+
+	/* Count writable parity slots */
+	for (i = 0; i < ec->m; i++) {
+		if (ec_slot_is_writable(ec, ec->k + i)) {
+			writable_parity++;
+		}
+	}
+
+	if (writable_parity == 0) {
+		/* No parity to write -- stripe is fine, advance */
+		sctx->current_stripe++;
+		sctx->stripes_scrubbed++;
+		sctx->io_in_flight = false;
+		return;
+	}
+
+	sctx->writes_remaining = writable_parity;
+	sctx->io_status        = SPDK_BDEV_IO_STATUS_SUCCESS;
+
+	for (i = 0; i < ec->m; i++) {
+		uint32_t pslot = ec->k + i;
+
+		if (!ec_slot_is_writable(ec, pslot)) {
+			continue;
+		}
+		if (!sctx->scrub_chans[pslot]) {
+			sctx->writes_remaining--;
+			sctx->io_status = SPDK_BDEV_IO_STATUS_FAILED;
+			continue;
+		}
+
+		rc = spdk_bdev_writev_blocks(ec->descs[pslot],
+					     sctx->scrub_chans[pslot],
+					     &sctx->chunk_iovs[pslot], 1,
+					     disk_lba,
+					     ec->strip_size,
+					     ec_scrub_write_cb,
+					     sctx);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: scrub parity write submit "
+				     "failed for slot %u stripe %" PRIu64 " (rc=%d)\n",
+				     ec->bdev.name, pslot,
+				     sctx->current_stripe, rc);
+			sctx->writes_remaining--;
+			sctx->io_status = SPDK_BDEV_IO_STATUS_FAILED;
+		}
+	}
+
+	if (sctx->writes_remaining == 0) {
+		sctx->current_stripe++;
+		sctx->io_in_flight = false;
+	}
+}
+
+static void
+ec_scrub_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_scrub_ctx *sctx = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		sctx->io_status = SPDK_BDEV_IO_STATUS_FAILED;
+	}
+
+	sctx->reads_remaining--;
+	if (sctx->reads_remaining != 0) {
+		return;
+	}
+
+	if (sctx->io_status != SPDK_BDEV_IO_STATUS_SUCCESS) {
+		SPDK_WARNLOG("EC bdev %s: scrub read failed at stripe %" PRIu64 " "
+			     "-- skipping\n",
+			     sctx->ec->bdev.name, sctx->current_stripe);
+		sctx->current_stripe++;
+		sctx->io_in_flight = false;
+		return;
+	}
+
+	ec_scrub_reads_done(sctx);
+}
+
+/*
+ * Submit k reads for the current stripe from readable disks.
+ * Uses sctx->scrub_chans[] -- dedicated per-disk channels opened at scrub
+ * start, covering all n slots (both data and parity disks).
+ */
+static void
+ec_scrub_submit_reads(struct ec_scrub_ctx *sctx)
+{
+	struct ec_bdev *ec       = sctx->ec;
+	uint64_t        disk_lba = ec_stripe_base_lba(ec, sctx->current_stripe);
+	uint32_t        disk;
+	uint32_t        reads_submitted = 0;
+	int             rc;
+
+	sctx->io_status       = SPDK_BDEV_IO_STATUS_SUCCESS;
+	sctx->reads_remaining = 0;
+	sctx->io_in_flight    = true;
+
+	for (disk = 0; disk < ec->n && reads_submitted < ec->k; disk++) {
+		if (!ec_slot_is_readable(ec, disk)) {
+			continue;
+		}
+		if (!sctx->scrub_chans[disk]) {
+			continue;   /* channel not available -- treat as unreadable */
+		}
+
+		sctx->reads_remaining++;
+
+		rc = spdk_bdev_readv_blocks(ec->descs[disk],
+					    sctx->scrub_chans[disk],
+					    &sctx->chunk_iovs[disk], 1,
+					    disk_lba,
+					    ec->strip_size,
+					    ec_scrub_read_cb,
+					    sctx);
+		if (rc != 0) {
+			sctx->reads_remaining--;
+			sctx->io_status = SPDK_BDEV_IO_STATUS_FAILED;
+			SPDK_WARNLOG("EC bdev %s: scrub read submit failed "
+				     "for disk %u stripe %" PRIu64 " (rc=%d)\n",
+				     ec->bdev.name, disk,
+				     sctx->current_stripe, rc);
+		} else {
+			reads_submitted++;
+		}
+	}
+
+	if (reads_submitted < ec->k) {
+		SPDK_WARNLOG("EC bdev %s: scrub stripe %" PRIu64 " -- only %u/%u "
+			     "reads submitted; skipping\n",
+			     ec->bdev.name, sctx->current_stripe,
+			     reads_submitted, ec->k);
+		if (sctx->reads_remaining == 0) {
+			sctx->current_stripe++;
+			sctx->io_in_flight = false;
+		} else {
+			sctx->io_status = SPDK_BDEV_IO_STATUS_FAILED;
+		}
+	}
+}
+
+/*
+ * State machine per tick:
+ *   io_in_flight              -> outstanding I/O; return BUSY
+ *   current_stripe >= region_end_stripe -> clear region bit; advance region
+ *   stripe is dirty in stripe_dirty_map -> skip; foreground writer or rebuild
+ *                                          owns this stripe and is updating
+ *                                          parity correctly
+ *   else                      -> submit reads for current stripe
+ */
+static int
+ec_scrub_poller_cb(void *arg)
+{
+	struct ec_scrub_ctx *sctx = arg;
+	struct ec_bdev      *ec   = sctx->ec;
+
+	if (sctx->io_in_flight) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	/* Current region complete */
+	if (sctx->current_stripe >= sctx->region_end_stripe) {
+		/*
+		 * Clear the region bit now that all its stripes have been
+		 * scrubbed. The next persist (from idle poller or finish)
+		 * will write the cleared state to disk.
+		 */
+		ec_wib_region_clear_dirty(ec, sctx->current_region);
+		sctx->regions_scrubbed++;
+
+		ec_scrub_heartbeat(sctx);
+
+		ec_scrub_move_to_next_region(sctx);
+		/*
+		 * ec_scrub_move_to_next_region either updates current_region and
+		 * returns (poller continues), or calls ec_scrub_finish which
+		 * unregisters the poller.
+		 */
+		return SPDK_POLLER_BUSY;
+	}
+
+	/*
+	 * Stripe-busy interlock.
+	 *
+	 * If another actor (rebuild, full-stripe write, RMW writeback after
+	 * the scrub-guard window, or UNMAP) holds the stripe-dirty claim on
+	 * this stripe, skip it. The claimant is responsible for writing a
+	 * consistent parity for the stripe -- scrub's re-encode would race
+	 * the claimant's parity write and could land stale parity computed
+	 * from a partial view of the data.
+	 *
+	 * Skipping is safe even though we still clear the region bit at the
+	 * region boundary: the claimant's write completes with up-to-date
+	 * parity. The WIB dirty bit on this region only signals that some
+	 * stripe in the region was being modified at crash time; once the
+	 * region has been walked end-to-end (every stripe either re-encoded
+	 * by scrub or owned by an in-flight writer), the region is by
+	 * definition consistent.
+	 */
+	if (ec_stripe_is_dirty(ec, sctx->current_stripe)) {
+		sctx->current_stripe++;
+		return SPDK_POLLER_BUSY;
+	}
+
+	ec_scrub_submit_reads(sctx);
+	return SPDK_POLLER_BUSY;
+}
+
+/*
+ * Allocates the scrub context, finds the first dirty region, and registers
+ * the scrub poller. Called from ec_bdev_create_finalize after the bdev is
+ * registered if ec_wib_load_async found any dirty regions, and from
+ * ec_rebuild_finish when a boot-deferred scrub can finally run.
+ *
+ * The scrub runs in the background; the bdev accepts reads immediately.
+ * RMW writes to a stripe whose region has not yet been scrubbed are
+ * requeued (NOMEM) via the guard in ec_submit_rmw_write.
+ */
+int
+ec_bdev_start_scrub(struct ec_bdev *ec)
+{
+	struct ec_scrub_ctx *sctx;
+	uint32_t             first_dirty = ec->wib_num_regions;
+	uint32_t             region, i;
+
+	/*
+	 * Deferred-scrub guard no longer applies once an active scrub is
+	 * being installed. Close out any deferred-scrub backpressure episode
+	 * now; the active-scrub guard will open a new one when it fires.
+	 */
+	ec_rmw_backpressure_end(ec, "scrub starting");
+
+	/*
+	 * Block scrub while a resize is in progress.
+	 *
+	 * Resize updates geometry (blockcnt, num_stripes) and reallocates
+	 * the dirty bitmap and WIB arrays. If the scrub runs concurrently
+	 * it could access stale pointers or out-of-bounds indices.
+	 */
+	if (ec->resize_ctx != NULL) {
+		SPDK_WARNLOG("EC bdev %s: scrub deferred -- resize "
+			     "in progress\n", ec->bdev.name);
+		return 0;
+	}
+
+	/*
+	 * Correctness pre-condition: all k data disks must be NORMAL.
+	 *
+	 * ec_scrub_reads_done re-encodes parity from chunk_bufs[0..k-1],
+	 * which are filled by ec_scrub_submit_reads iterating over readable
+	 * slots in physical-slot order. If data disk d is FAILED, slot d is
+	 * skipped and chunk_bufs[d] stays zero-filled -- ec_encode_data then
+	 * treats slot d as zero rather than its actual data, producing wrong
+	 * parity for every scrubbed stripe. The corruption is latent: it only
+	 * surfaces when a different disk later fails and reconstruction uses
+	 * the incorrect parity.
+	 *
+	 * Safe course of action: skip the scrub entirely when any data slot
+	 * is not NORMAL. Leave all dirty region bits set. On next startup
+	 * (after the rebuild has restored the failed disk to NORMAL), the
+	 * scrub will run correctly. This is conservative but always safe.
+	 */
+	for (i = 0; i < ec->k; i++) {
+		if (ec->base_states[i] != EC_BASE_STATE_NORMAL) {
+			SPDK_WARNLOG("EC bdev %s: startup scrub deferred -- "
+				     "data slot %u is not NORMAL (state=%d). "
+				     "Scrub will run after rebuild completes.\n",
+				     ec->bdev.name, i, (int)ec->base_states[i]);
+			return 0;
+		}
+	}
+
+	/* Find first dirty region and count total dirty regions */
+	uint32_t dirty_count = 0;
+	for (region = 0; region < ec->wib_num_regions; region++) {
+		if (ec_wib_region_is_dirty(ec, region)) {
+			if (first_dirty == ec->wib_num_regions) {
+				first_dirty = region;
+			}
+			dirty_count++;
+		}
+	}
+	if (first_dirty == ec->wib_num_regions) {
+		return 0;   /* Nothing to scrub */
+	}
+
+	sctx = calloc(1, sizeof(*sctx));
+	if (!sctx) {
+		return -ENOMEM;
+	}
+
+	sctx->ec                  = ec;
+	sctx->current_region      = first_dirty;
+	sctx->current_stripe      = (uint64_t)first_dirty * EC_WIB_REGION_STRIPES;
+	sctx->region_end_stripe = spdk_min(
+		sctx->current_stripe + EC_WIB_REGION_STRIPES,
+		ec->num_stripes);
+	sctx->chunk_bytes = ec->strip_size * ec->bdev.blocklen;
+	sctx->io_in_flight = false;
+	sctx->total_dirty_regions = dirty_count;
+	sctx->start_ticks = spdk_get_ticks();
+	sctx->last_heartbeat_ticks = sctx->start_ticks;
+	sctx->next_heartbeat_percent = EC_REBUILD_HEARTBEAT_PERCENT_STEP;
+
+	/* Open dedicated I/O channels for all n disks */
+	for (i = 0; i < ec->n; i++) {
+		if (!ec->descs[i]) {
+			sctx->scrub_chans[i] = NULL;
+			continue;
+		}
+		sctx->scrub_chans[i] = spdk_bdev_get_io_channel(ec->descs[i]);
+		if (!sctx->scrub_chans[i]) {
+			SPDK_ERRLOG("EC bdev %s: OOM for scrub channel "
+				    "slot %u\n", ec->bdev.name, i);
+			ec_scrub_free_resources(sctx);
+			free(sctx);
+			return -ENOMEM;
+		}
+	}
+
+	/* Allocate DMA buffers for all n slots */
+	for (i = 0; i < ec->n; i++) {
+		sctx->chunk_bufs[i] = spdk_dma_zmalloc(sctx->chunk_bytes,
+						        EC_DMA_ALIGN, NULL);
+		if (!sctx->chunk_bufs[i]) {
+			SPDK_ERRLOG("EC bdev %s: OOM for scrub chunk buf "
+				    "slot %u\n", ec->bdev.name, i);
+			ec_scrub_free_resources(sctx);
+			free(sctx);
+			return -ENOMEM;
+		}
+		sctx->chunk_iovs[i].iov_base = sctx->chunk_bufs[i];
+		sctx->chunk_iovs[i].iov_len  = sctx->chunk_bytes;
+	}
+
+	ec->scrub_ctx = sctx;
+
+	sctx->poller = spdk_poller_register(ec_scrub_poller_cb, sctx,
+					    EC_REBUILD_POLL_PERIOD_US);
+	if (!sctx->poller) {
+		ec_scrub_free_resources(sctx);
+		ec->scrub_ctx = NULL;
+		free(sctx);
+		return -ENOMEM;
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: startup scrub started -- "
+		       "first dirty region %u\n",
+		       ec->bdev.name, first_dirty);
+	return 0;
+}
+
+/*
+ * Returns -ENODEV if the named EC bdev does not exist.
+ * Returns -ENOENT if no scrub is currently in progress.
+ * Returns 0 and fills out-params on success.
+ */
+int
+ec_bdev_get_scrub_progress(const char *ec_name,
+			   uint32_t   *current_region,
+			   uint32_t   *num_regions,
+			   uint32_t   *total_dirty_regions,
+			   uint64_t   *current_stripe,
+			   uint64_t   *stripes_scrubbed,
+			   uint64_t   *regions_scrubbed)
+{
+	struct ec_bdev *ec = ec_bdev_find(ec_name);
+
+	if (!ec) {
+		return -ENODEV;
+	}
+	if (!ec->scrub_ctx) {
+		return -ENOENT;
+	}
+
+	*current_region      = ec->scrub_ctx->current_region;
+	*num_regions         = ec->wib_num_regions;
+	*total_dirty_regions = ec->scrub_ctx->total_dirty_regions;
+	*current_stripe      = ec->scrub_ctx->current_stripe;
+	*stripes_scrubbed    = ec->scrub_ctx->stripes_scrubbed;
+	*regions_scrubbed    = ec->scrub_ctx->regions_scrubbed;
+
+	return 0;
+}

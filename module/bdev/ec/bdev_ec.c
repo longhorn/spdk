@@ -1131,6 +1131,8 @@ ec_bdev_create_finalize(struct ec_bdev_create_async_ctx *ctx)
 {
 	struct ec_bdev *ec = ctx->ec;
 	int             rc;
+
+	rc = ec_bdev_start_scrub(ec);
 	if (rc != 0) {
 		SPDK_WARNLOG("EC bdev %s: failed to start startup scrub "
 			     "(rc=%d); parity may be stale in dirty regions\n",
@@ -1407,6 +1409,16 @@ ec_device_unregister_done(void *io_device)
 
 	ec_release_dedicated_channels(ec);
 
+	/* Abort any in-progress startup scrub. */
+	if (ec->scrub_ctx) {
+		if (ec->scrub_ctx->poller) {
+			spdk_poller_unregister(&ec->scrub_ctx->poller);
+		}
+		ec_scrub_free_resources(ec->scrub_ctx);
+		free(ec->scrub_ctx);
+		ec->scrub_ctx = NULL;
+	}
+
 	/* All per-thread channels destroyed; safe to close descriptors. */
 	ec_close_base_bdevs(ec);
 
@@ -1664,6 +1676,20 @@ ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	if (ec->wib_region_map) {
 		spdk_json_write_named_uint32(w, "wib_dirty_regions",
 					     ec_wib_count_dirty(ec));
+	}
+
+	spdk_json_write_named_uint64(w, "degraded_read_eio_dirty",
+				     ec->degraded_read_eio_dirty);
+	spdk_json_write_named_bool(w, "scrub_in_progress", ec->scrub_ctx != NULL);
+	if (ec->scrub_ctx) {
+		struct ec_scrub_ctx *sctx = ec->scrub_ctx;
+		spdk_json_write_named_object_begin(w, "scrub_progress");
+		spdk_json_write_named_uint32(w, "current_region",    sctx->current_region);
+		spdk_json_write_named_uint32(w, "num_regions",       ec->wib_num_regions);
+		spdk_json_write_named_uint64(w, "current_stripe",    sctx->current_stripe);
+		spdk_json_write_named_uint64(w, "stripes_scrubbed",  sctx->stripes_scrubbed);
+		spdk_json_write_named_uint64(w, "regions_scrubbed",  sctx->regions_scrubbed);
+		spdk_json_write_object_end(w);
 	}
 
 	spdk_json_write_object_end(w);

@@ -309,6 +309,51 @@ struct ec_wib_header {
 };
 
 /* =========================================================================
+ * Startup scrub context
+ *
+ * On startup, dirty WIB regions (mid-RMW at crash) are scrubbed:
+ * re-encode parity from data chunks, then clear the region bit.
+ * RMW writes to a scrubbing region return NOMEM (requeue).
+ * ========================================================================= */
+
+/* One instance during startup if any WIB regions were dirty. */
+struct ec_scrub_ctx {
+	struct ec_bdev  *ec;
+
+	/* Scrub cursor: region/stripe currently being scrubbed. */
+	uint32_t         current_region;   /* region currently being scrubbed */
+	uint64_t         current_stripe;   /* stripe within current_region    */
+	uint64_t         region_end_stripe;/* exclusive end stripe (clamped to num_stripes) */
+
+	/* I/O state -- same gate pattern as rebuild */
+	bool             io_in_flight;
+	uint32_t         reads_remaining;
+	enum spdk_bdev_io_status io_status;
+
+	/* Dedicated per-disk I/O channels; NULL for FAILED slots. */
+	struct spdk_io_channel *scrub_chans[EC_MAX_BASE_BDEVS];
+
+	/* DMA buffers: k data + m parity, reused per stripe */
+	uint8_t         *chunk_bufs[EC_MAX_BASE_BDEVS];
+	struct iovec     chunk_iovs[EC_MAX_BASE_BDEVS];
+	uint64_t         chunk_bytes;
+
+	/* write half: only parity slots */
+	uint32_t         writes_remaining;
+
+	uint64_t         stripes_scrubbed;
+	uint64_t         regions_scrubbed;
+	uint32_t         total_dirty_regions; /* dirty count at scrub start */
+
+	/* Heartbeat progress logging (see EC_REBUILD_HEARTBEAT_*). */
+	uint64_t         start_ticks;          /* ticks when scrub was registered */
+	uint64_t         last_heartbeat_ticks; /* ticks at last heartbeat NOTICE  */
+	uint32_t         next_heartbeat_percent;   /* next percent milestone          */
+
+	struct spdk_poller *poller;
+};
+
+/* =========================================================================
  * ec_bdev -- main EC bdev instance
  * ========================================================================= */
 
@@ -963,6 +1008,9 @@ void     ec_rmw_submit_writes(struct ec_rmw_ctx *mctx);
  */
 void     ec_rmw_complete(struct ec_rmw_ctx *mctx);
 
+/* Startup scrub kick-off, called from create-done and rebuild_finish. */
+int ec_bdev_start_scrub(struct ec_bdev *ec);
+
 /*
  * Backpressure transition logger. Called when the underlying condition
  * that caused RMW deferral ends (scrub finish, scrub start after defer,
@@ -970,6 +1018,13 @@ void     ec_rmw_complete(struct ec_rmw_ctx *mctx);
  * the active flag; no-op if backpressure was not active.
  */
 void ec_rmw_backpressure_end(struct ec_bdev *ec, const char *reason);
+
+/*
+ * Free per-scrub resources (channels, buffers) on a still-active
+ * scrub_ctx. Used by the unregister path to abort an in-flight scrub
+ * after the device-unregister channel walk has completed.
+ */
+void ec_scrub_free_resources(struct ec_scrub_ctx *sctx);
 
 /*
  * Submit a sub-stripe RMW write. Called by ec_submit_write to handle
