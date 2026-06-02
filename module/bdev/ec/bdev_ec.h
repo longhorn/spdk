@@ -10,6 +10,53 @@
  * globals (g_ec_bdev_list) live in bdev_ec_internal.h. Files that
  * constitute the module itself include both headers; future consumers
  * outside the module should include only this one.
+ *
+ * Glossary:
+ *
+ *   EC
+ *     Erasure Code (Reed-Solomon coding across k data + m parity
+ *     chunks; any m disk failures are tolerable).
+ *
+ *   RMW
+ *     Read-Modify-Write. Sub-stripe writes pre-read the affected data
+ *     chunks, overlay the new payload, recompute parity, and write the
+ *     modified data + parity back to the base disks.
+ *
+ *   WIB
+ *     Write-Intent Bitmap. Per-region (1024 stripes per region) bitmap
+ *     persisted on parity disks, marking stripes mid-write so a crash
+ *     recovery scrub can re-encode parity for those stripes and close
+ *     the RMW write hole.
+ *
+ *   UNMAP
+ *     SCSI/NVMe discard. Marked stripes are recorded in the in-band
+ *     unmapped bitmap; subsequent reads synthesise zeros without
+ *     touching the base disks.
+ *
+ *   k / m
+ *     Reed-Solomon data-chunk count / parity-chunk count. n = k + m.
+ *     Strip size is per-chunk; stripe size = k * strip.
+ *
+ *   Units (block < strip < stripe < WIB region)
+ *     block:      the base bdev I/O unit (blocklen).
+ *     strip:      strip_size blocks; the per-disk placement unit.
+ *     stripe:     k data + m parity strips, one per disk; the RMW,
+ *                 scrub, and rebuild walking unit.
+ *     WIB region: EC_WIB_REGION_STRIPES stripes, one bit in the WIB.
+ *
+ *   home thread
+ *     The SPDK thread on which bdev_ec_create ran. Owns shared ec_bdev
+ *     mutable state: rebuild, scrub, and resize contexts; persist
+ *     orchestration; bitmap mutation queues; and the long-lived WIB,
+ *     bitmap, rebuild, and scrub channels.
+ *
+ *   submitter thread
+ *     The SPDK thread on which a given bdev_io was submitted by the
+ *     consumer. Owns the per-thread base-bdev I/O channels
+ *     (ec_io_channel.base_chans) used to dispatch child reads and
+ *     writes. Entry points hop to home as needed before touching shared
+ *     state; data-plane fan-outs hop back to the submitter so child I/O
+ *     dispatch happens on the channel-owning thread.
  */
 
 #ifndef SPDK_BDEV_EC_H
@@ -80,6 +127,10 @@ struct ec_bdev *ec_bdev_find(const char *name);
  *   ec_write_base_bdevs_array_json: writes the "base_bdevs": [...] array
  *     describing each slot's role/state/needs_rebuild and the live base
  *     bdev name (or "<failed>" / "<unknown>" sentinels).
+ *
+ *   ec_write_rebuild_progress_json: writes the named "rebuild_progress"
+ *     object summarising ec->rebuild_ctx. Caller must have verified
+ *     ec->rebuild_ctx != NULL.
  *
  *   ec_write_io_stats_json: writes the shared RMW / full-stripe-write /
  *     UNMAP / degraded-read counter run -- the fields common to both

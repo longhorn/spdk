@@ -4,14 +4,10 @@
  */
 
 /*
- * bdev_ec.c -- module lifecycle, fn_table glue, failure detection,
- * channel management, and hot-swap replace. Other subsystems live in
- * the sibling bdev_ec_*.c files (each carries its own header).
- *
- * Threading: all state changes run on the EC bdev's home thread (the
- * single SPDK reactor that created it). Cross-thread fanout uses
- * spdk_for_each_channel walks. The full channel inventory is at the
- * top of bdev_ec_internal.h under "CHANNEL INVENTORY".
+ * Implementation of the bdev_ec module's lifecycle, JSON config dump,
+ * base-bdev event handling, and Reed-Solomon table management. See
+ * bdev_ec_internal.h's THREADING MODEL block for the home / submitter
+ * thread split that governs every cross-file callback in this file.
  */
 
 #include "bdev_ec_internal.h"
@@ -1765,13 +1761,13 @@ ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 	spdk_json_write_named_uint64(w, "unmapped_reads_synthesized",
 				     __atomic_load_n(&ec->unmapped_reads_synthesized, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "writes_into_unmapped",
-				     ec->writes_into_unmapped);
+				     __atomic_load_n(&ec->writes_into_unmapped, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "writes_into_unmapped_failed",
 				     __atomic_load_n(&ec->writes_into_unmapped_failed, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmapped_stripes",
 				     ec_count_unmapped_stripes(ec));
 	spdk_json_write_named_uint64(w, "degraded_reads_reconstructed",
-				     ec->degraded_reads_reconstructed);
+				     __atomic_load_n(&ec->degraded_reads_reconstructed, __ATOMIC_RELAXED));
 }
 
 static int
@@ -1809,7 +1805,7 @@ ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	}
 
 	spdk_json_write_named_uint64(w, "degraded_read_eio_dirty",
-				     ec->degraded_read_eio_dirty);
+				     __atomic_load_n(&ec->degraded_read_eio_dirty, __ATOMIC_RELAXED));
 	spdk_json_write_named_bool(w, "scrub_in_progress", ec->scrub_ctx != NULL);
 	if (ec->scrub_ctx) {
 		struct ec_scrub_ctx *sctx = ec->scrub_ctx;

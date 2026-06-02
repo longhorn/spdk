@@ -155,9 +155,9 @@ ec_wib_deferred_drain(void *cb_arg, int rc)
 
 	/*
 	 * Persist succeeded: resume each deferred RMW at the read-dispatch
-	 * step (post-B1, the WIB persist runs BEFORE reads, so a deferred
-	 * RMW has not read anything yet -- its chunk_bufs are zeroed DMA).
-	 * Resuming at ec_rmw_submit_writes would fan out all-zero data +
+	 * step. The WIB persist runs BEFORE reads, so a deferred RMW has
+	 * not read anything yet -- its chunk_bufs are zeroed DMA. Resuming
+	 * at ec_rmw_submit_writes would fan out all-zero data +
 	 * parity-encoded-from-zeros over live stripe data -> silent
 	 * corruption.
 	 *
@@ -269,48 +269,25 @@ ec_wib_persist_sync_finish(struct ec_bdev *ec, struct ec_wib_persist_ctx *pctx)
 }
 
 /*
- * Write the current in-memory WIB region_map to the inactive on-disk copy
- * on all m parity disks. On completion, the active copy index is flipped.
+ * Persist the in-memory WIB region_map to the inactive on-disk copy on all
+ * m parity disks, then flip the active copy on completion.
  *
  * cb / cb_arg: invoked when all m writes complete. Pass NULL/NULL for
  *              fire-and-forget (e.g. the idle-clear path).
  *
- * Caller must ensure ec->wib_persist_in_flight is false before calling.
- * Sets ec->wib_persist_in_flight = true.
+ * Caller must ensure ec->wib_persist_in_flight is false; this sets it true.
  *
- * Why I/O-path WIB persists (RMW, full-stripe write) route through the
- * home thread instead of running on each ec_io_channel's own wib_chans[]:
+ * Home-thread only (asserted), so the WIB has a single writer. Each persist
+ * writes the inactive double-buffer slot (1 - active_copy) and bumps
+ * wib_generation, which the load path uses to pick the latest valid copy.
+ * Concurrent writers would collide on the slot (interleaving bytes so the
+ * copy fails CRC) and on the generation counter.
  *
- * The WIB is shared on-disk state replicated to every parity disk. Like
- * the bitmap (see "Why bitmap persists ..." above ec_bitmap_persist_async
- * in bdev_ec_bitmap.c), its consistency model needs a single writer for
- * two coordination signals:
- *
- *   - wib_active_copy. Each persist writes the slot the active copy is
- *     NOT in (next_copy = 1 - active_copy). Two writers both reading
- *     active_copy = 0 would both write slot 1; their bytes interleave
- *     and the loaded blob fails CRC.
- *   - wib_generation. Monotonic counter, incremented by exactly one
- *     writer per persist. Two writers both reading N and both writing
- *     N+1 with different content break the "highest valid generation
- *     wins" rule that the WIB load path relies on to pick a winner.
- *
- * Distributing writers across per-channel wib_chans[] would mean the
- * same coordination-protocol replacement the bitmap rationale rejects.
- * Per-channel writers would also break the m+1 quorum bookkeeping in
- * ec_wib_persist_ctx (writes_remaining), which assumes one in-flight
- * persist at a time.
- *
- * Routing is the cleaner long-term answer, but the I/O-path callers
- * (ec_submit_full_write, ec_rmw_persist_and_dispatch) currently consume
- * the synchronous rc from ec_wib_persist to drive rollback / NOMEM
- * retry. Translating those sync failures into cb-delivered
- * SPDK_BDEV_IO_STATUS_NOMEM completions at every caller is the same
- * contract change deferred for the UNMAP-path bitmap persist; it is
- * tracked as a focused follow-up. Until then, asserts at the call
- * sites + this function enforce the home-thread invariant: under
- * multi-reactor they abort at the exact spot the follow-up needs to
- * land. Single-reactor is unaffected.
+ * Per-channel writers would be cleaner long-term, but the I/O-path callers
+ * (ec_submit_full_write, ec_rmw_persist_and_dispatch) still consume the
+ * synchronous rc for rollback / NOMEM retry. Converting that to a
+ * cb-delivered NOMEM is a deferred follow-up; until then the assert enforces
+ * the single writer.
  */
 int
 ec_wib_persist(struct ec_bdev *ec,

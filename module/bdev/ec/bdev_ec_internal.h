@@ -8,23 +8,45 @@
  *
  * Include only from the module's .c files. Anything that would be
  * appropriate for an external consumer belongs in bdev_ec.h instead.
+ * See the glossary at the top of bdev_ec.h for acronyms (WIB, RMW,
+ * UNMAP) and the home / submitter thread terminology used throughout
+ * this header.
  */
 
 /* =========================================================================
  * THREADING MODEL
  *
- * The EC module runs single-threaded on the SPDK app thread. All RPC
- * handlers, I/O submission, completion callbacks, pollers, and shared
- * ec_bdev state mutations occur on that thread. No locks are used.
+ * Two thread roles bracket every I/O path: home and submitter.
  *
- * spdk_for_each_channel walks per-thread ec_io_channel instances on
- * each reactor; those callbacks touch only per-channel state
- * (ec_io_channel.base_chans[]), not the shared ec_bdev.
+ *   - home is the SPDK thread on which the EC bdev was created. It owns
+ *     mutating access to shared ec_bdev state (rebuild/scrub/resize
+ *     contexts, persist orchestration, busy gates, the bitmap mutation
+ *     queues) and to the long-lived dedicated channels (wib_chans,
+ *     bitmap_chans, rebuild_chans, scrub_chans). RPC handlers, pollers,
+ *     and persist completion callbacks all run here.
  *
- * Any change that introduces concurrent access to ec_bdev fields
- * (worker thread, multi-reactor dispatch, etc.) MUST re-audit every
- * check-then-act pattern in this module -- especially the busy gates
- * around rebuild/resize/scrub and the WIB persist machinery.
+ *   - submitter is the SPDK thread on which a given bdev_io was issued
+ *     by the consumer (typically an NVMe-oF poll-group thread). It owns
+ *     the per-thread ec_io_channel.base_chans[] used to dispatch the
+ *     child reads / writes / unmaps to base bdevs. Completions for those
+ *     child I/Os land back on the submitter, since SPDK delivers bdev_io
+ *     completions on the channel's owning thread.
+ *
+ * When the caller is already on the target thread, the routing helper
+ * resolves inline; otherwise the data plane uses spdk_thread_send_msg
+ * to hop between submitter and home. Entry points
+ * (ec_submit_read / ec_submit_write / ec_submit_unmap) route to home
+ * before touching shared state; fan-out dispatchers route to the
+ * submitter so base I/O is issued on the channel-owning thread; final
+ * spdk_bdev_io_complete asserts the submitter thread and is reached
+ * via a shared owner-route helper (see ec_io_complete_status_on_submitter).
+ *
+ * Fields shared across the boundary are tagged with their access
+ * discipline at the point of declaration: relaxed atomic for counters
+ * that are only ever incremented, release/acquire CAS for bitmap-style
+ * words where a reader on the submitter must observe state set by the
+ * mutator on home. Any new shared field MUST follow one of those
+ * patterns -- never plain non-atomic access.
  *
  * =========================================================================
  * CHANNEL INVENTORY
@@ -767,13 +789,10 @@ struct ec_bdev_io {
 	bool     is_write_into_unmapped;
 
 	/*
-	 * Thread that submitted this I/O -- the channel's owner thread.
-	 * Captured at ec_bdev_io_init so the multi-reactor routing layer
-	 * can dispatch completion back to the bdev_io's owner thread for
-	 * spdk_bdev_io_complete, which SPDK requires to run on that thread.
-	 *
-	 * In single-reactor deployments this is always ec->home_thread, so
-	 * no routing is needed and the field is effectively unused.
+	 * SPDK thread on which the consumer submitted this bdev_io. Used by
+	 * routing helpers to deliver child completions back to the submitter
+	 * (the channel-owning thread) so base_chans[] writes happen there.
+	 * Asserted at every base-I/O dispatch site.
 	 */
 	struct spdk_thread *submitter_thread;
 };
@@ -880,9 +899,6 @@ struct ec_rmw_ctx {
 /* Global list type */
 TAILQ_HEAD(ec_all_tailq, ec_bdev);
 extern struct ec_all_tailq g_ec_bdev_list;
-
-/* Function table for EC bdev operations */
-extern const struct spdk_bdev_fn_table g_ec_fn_table;
 
 /* SPDK bdev module identity, referenced by quiesce/unquiesce and other helpers. */
 extern struct spdk_bdev_module ec_if;
@@ -1102,7 +1118,7 @@ ec_bitmap_word_clear(uint64_t *map, uint64_t idx)
  * reconstruction proceed against in-flight-modified parity and
  * surface silently wrong bytes, the mutator side must publish with
  * release-store and the reader side must observe with acquire-load
- * (same shape as stripe_unmapped_map's R2 discipline). Per-word
+ * (same shape as stripe_unmapped_map's release/acquire discipline). Per-word
  * ordering is sufficient because each region's bit lives in exactly
  * one word.
  */
@@ -1437,8 +1453,9 @@ struct ec_pending_bit_clear {
  * a negative errno on persist failure (caller should fail the bdev_io
  * and release stripe-busy).
  *
- * Single-reactor model: caller and callback run on the same thread; no
- * locking around the queues.
+ * Enqueues a deferred bit-clear. Callers may run on any thread; the
+ * helper routes the enqueue to the home thread via spdk_thread_send_msg
+ * so pending_bit_clears mutation stays single-threaded.
  */
 int ec_submit_bit_clear_async(struct ec_bdev *ec, uint64_t stripe_index,
 			      void (*cb_fn)(void *cb_arg, int rc),
@@ -1473,12 +1490,12 @@ int ec_reconstruct_multi_data(const struct ec_bdev *ec,
  *
  *   bdev_ec_rmw.c -> bdev_ec_wib.c
  *     ec_rmw_persist_and_dispatch calls ec_wib_persist to set a
- *     region's on-disk dirty bit BEFORE the reads go out (the B1
- *     restructure moved the persist from after-modify to right after
- *     setup, so the persist-completion -> reads edge is the single
- *     multi-reactor hop point). When a persist is already in flight,
- *     the RMW context is queued on wib_deferred_writes and (on the
- *     was_clean = true branch) wib_repersist_needed is set.
+ *     region's on-disk dirty bit BEFORE the reads go out (the
+ *     persist runs right after setup, so the persist-completion ->
+ *     reads edge is the single multi-reactor hop point). When a
+ *     persist is already in flight, the RMW context is queued on
+ *     wib_deferred_writes and (on the was_clean = true branch)
+ *     wib_repersist_needed is set.
  *
  *   bdev_ec_wib.c -> bdev_ec_rmw.c
  *     ec_wib_persist_write_cb, on the final write completion, drains
@@ -1517,10 +1534,10 @@ void     ec_wib_load_async(struct ec_bdev *ec,
 			   ec_bdev_create_cb_fn done_fn, void *done_arg);
 
 /* WIB->RMW bridges. ec_wib_deferred_drain resumes each queued RMW by
- * dispatching its reads -- after the B1 restructure the WIB persist
- * runs before reads, so a deferred RMW has not read yet and its DMA
- * bufs are still zeroed (resuming at writes would fan out zeros over
- * live stripe data). See the WIB <-> RMW protocol section above. */
+ * dispatching its reads -- the WIB persist runs before reads, so a
+ * deferred RMW has not read yet and its DMA bufs are still zeroed
+ * (resuming at writes would fan out zeros over live stripe data).
+ * See the WIB <-> RMW protocol section above. */
 void     ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx);
 
 /*

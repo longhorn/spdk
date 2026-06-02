@@ -1035,11 +1035,12 @@ ec_bit_clear_flush_if_pending(struct ec_bdev *ec)
 
 	if (ec->bitmap_persist_in_flight) {
 		/*
-		 * Another persist already in flight (race-free in the
-		 * single-reactor model -- this hook is called only from a
-		 * persist's own write_cb where pending was just set to false,
-		 * but a nested invocation pattern could in theory re-set it).
-		 * Bail; the next persist's drainout will retry.
+		 * Another persist already in flight (race-free because both
+		 * setter and reader run on the home thread -- this hook is
+		 * called only from a persist's own write_cb where pending
+		 * was just set to false, but a nested invocation pattern
+		 * could in theory re-set it). Bail; the next persist's
+		 * drainout will retry.
 		 */
 		return;
 	}
@@ -1110,9 +1111,8 @@ ec_submit_bit_clear_async(struct ec_bdev *ec, uint64_t stripe_index,
 	 * pending_bit_clears, bitmap_persist_in_flight, and bitmap_chans[] are
 	 * all home-thread state.
 	 *
-	 * Fast path: when the caller already is the home thread (single-reactor
-	 * or any home-thread caller), skip send_msg and run inline -- no added
-	 * latency.
+	 * Fast path: when the caller is already on the home thread, skip
+	 * send_msg and run inline -- no added latency.
 	 *
 	 * See "why route, not per-channel" above ec_bitmap_persist_async.
 	 */

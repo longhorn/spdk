@@ -308,9 +308,9 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 
 	if (len == 0) {
 		/* No home-thread state touched; complete inline on the
-		 * submitter (= owner) thread. Count the no-op completion so
-		 * the closed accounting identity in bdev_ec_internal.h's
-		 * field cluster holds. */
+		 * submitter (= owner) thread. Count here so the no-op path
+		 * still shows up in the accounting; see the field-cluster
+		 * comment in bdev_ec_internal.h for the closed identity. */
 		__atomic_fetch_add(&ec->unmaps_submitted, 1, __ATOMIC_RELAXED);
 		__atomic_fetch_add(&ec->unmaps_completed, 1, __ATOMIC_RELAXED);
 		spdk_bdev_io_complete(ec_io->bdev_io,
@@ -320,17 +320,15 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 
 	/*
 	 * Entry routing: the unmap path mutates home-only state
-	 * (stripe-busy claim range, bitmap shadow / persist orchestration,
-	 * unmap_fanout_misses) below. Route to home if we're not already
-	 * there. In single-reactor submitter == home and the inline path
-	 * runs.
+	 * (stripe-busy claim range, bitmap shadow / persist orchestration)
+	 * below. Route to home if we're not already there. When the caller
+	 * is already on the home thread the inline path runs.
 	 *
 	 * unmaps_submitted is bumped AFTER this check so the cross-thread
 	 * re-entry through ec_submit_unmap_on_home -> ec_submit_unmap
 	 * counts the request exactly once (on home). Counting before the
-	 * hop would double every cross-thread UNMAP and break the
-	 * "submitted = completed + via_zeros + deferred + rejected"
-	 * accounting that downstream observers rely on.
+	 * hop would double every cross-thread UNMAP and break the closed
+	 * accounting identity in the field-cluster comment.
 	 */
 	if (spdk_unlikely(spdk_get_thread() != ec->home_thread)) {
 		return spdk_thread_send_msg(ec->home_thread,
@@ -504,19 +502,11 @@ ec_unmap_inner_fanout(struct ec_bdev_io *ec_io,
 	int                  persist_rc;
 
 	/*
-	 * This function runs on the home thread because the bitmap persist
-	 * below uses ec->bitmap_chans[], which are owned by that thread.
-	 *
-	 * Routing the call to home when entered from a different thread is
-	 * deferred to the multi-reactor follow-up. It would mean replacing
-	 * the synchronous error returns here (-EAGAIN for SPDK's NOMEM
-	 * retry queue, -ENOMEM on allocation failure) with cb_fn-delivered
-	 * SPDK_BDEV_IO_STATUS_NOMEM completions; the RMW and full-stripe-
-	 * write paths need the same change.
-	 *
-	 * Only single-reactor SPDK targets are supported. The assert
-	 * catches accidental cross-thread use; without it the persist
-	 * would dispatch I/O on a channel it doesn't own.
+	 * Home-thread invariant: the bitmap persist below uses
+	 * ec->bitmap_chans[], which are owned by the home thread. The
+	 * routing layer (ec_submit_unmap's entry hop) ensures every call
+	 * chain reaching this function has already been dispatched to home;
+	 * the assert is the inner sanity check.
 	 */
 	assert(spdk_get_thread() == ec->home_thread);
 
@@ -526,12 +516,12 @@ ec_unmap_inner_fanout(struct ec_bdev_io *ec_io,
 	}
 
 	/*
-	 * Multi-stripe stripe-busy claim. Single-reactor model: check-all-
-	 * then-set-all has no concurrent-claimer race. If any stripe is
-	 * busy (RMW, full-stripe write, rebuild, prior UNMAP), defer the
-	 * whole request via NOMEM requeue. Under heavy small-write
-	 * pressure UNMAP can starve; that surfaces via the
-	 * unmaps_deferred_busy counter.
+	 * Multi-stripe stripe-busy claim. The claim path runs under the
+	 * home thread invariant, so check-all-then-set-all has no
+	 * concurrent-claimer race. If any stripe is busy (RMW, full-stripe
+	 * write, rebuild, prior UNMAP), defer the whole request via NOMEM
+	 * requeue. Under heavy small-write pressure UNMAP can starve; that
+	 * surfaces via the unmaps_deferred_busy counter.
 	 */
 	{
 		uint64_t stripe;
@@ -688,10 +678,10 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 
 	/*
 	 * Fan-out routing: base UNMAPs dispatch on
-	 * ec_io->ch->base_chans[] (submitter-owned). In single-reactor
-	 * submitter == home and the inline path runs; in multi-reactor we
-	 * hop to the submitter so spdk_bdev_unmap_blocks goes out on the
-	 * channel-owning thread.
+	 * ec_io->ch->base_chans[] (submitter-owned). When the caller is
+	 * already on the submitter thread the inline path runs; otherwise
+	 * we hop to the submitter so spdk_bdev_unmap_blocks goes out on
+	 * the channel-owning thread.
 	 */
 	if (spdk_likely(spdk_get_thread() == uctx->ec_io->submitter_thread)) {
 		int fanout_rc = ec_unmap_fanout(uctx);
@@ -735,10 +725,11 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 			 * claims, mark FAILED, and route the cb_fn invocation
 			 * back via a second send_msg (cb_fn ultimately calls
 			 * spdk_bdev_io_complete, which asserts owner thread).
-			 * Same shape as Site 2. The bitmap apply already
-			 * happened, so the read-as-zero contract is intact;
-			 * the FAILED return tells the caller no physical
-			 * reclamation occurred.
+			 * If even the second send_msg fails, the bdev_io stays
+			 * in flight rather than being completed on the wrong
+			 * thread. The bitmap apply already happened, so the
+			 * read-as-zero contract is intact; the FAILED return
+			 * tells the caller no physical reclamation occurred.
 			 */
 			int complete_rc;
 
@@ -832,9 +823,9 @@ ec_unmap_fanout(struct ec_unmap_ctx *uctx)
 	/*
 	 * Dispatch invariant: base UNMAPs use ec_io->ch->base_chans[],
 	 * owned by the submitter thread. The bitmap-persist-done ->
-	 * submitter hop (planned for a subsequent commit) ensures this
-	 * holds for multi-reactor; today single-reactor makes submitter
-	 * == home so it passes trivially.
+	 * submitter hop in ec_unmap_bitmap_persist_done ensures this
+	 * holds; when the caller is already on the submitter thread the
+	 * hop inlines.
 	 */
 	assert(spdk_get_thread() == ec_io->submitter_thread);
 
@@ -1126,7 +1117,7 @@ ec_unmap_split_complete(struct ec_unmap_split_ctx *sctx)
 	free(sctx);
 
 	/*
-	 * spdk_bdev_io_complete asserts the owner thread. After C7b,
+	 * spdk_bdev_io_complete asserts the owner thread.
 	 * ec_unmap_split_continue may run on home (routed in
 	 * ec_unmap_split_segment_done), so this function can be reached
 	 * with submitter != current. Route via send_msg in that case.

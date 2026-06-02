@@ -57,11 +57,24 @@ ec_free_io_buffers(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 		ec_io->bounce_buf = NULL;
 	}
 
-	for (i = 0; i < ec->m; i++) {
-		if (ec_io->parity_bufs[i]) {
-			spdk_dma_free(ec_io->parity_bufs[i]);
-			ec_io->parity_bufs[i] = NULL;
+	if (ec_io->parity_bufs) {
+		for (i = 0; i < ec->m; i++) {
+			if (ec_io->parity_bufs[i]) {
+				spdk_dma_free(ec_io->parity_bufs[i]);
+			}
 		}
+		free(ec_io->parity_bufs);
+		ec_io->parity_bufs = NULL;
+	}
+
+	if (ec_io->parity_iovs) {
+		free(ec_io->parity_iovs);
+		ec_io->parity_iovs = NULL;
+	}
+
+	if (ec_io->data_iovs) {
+		free(ec_io->data_iovs);
+		ec_io->data_iovs = NULL;
 	}
 }
 
@@ -87,9 +100,20 @@ ec_alloc_full_stripe(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 				      ec_io->iovs, ec_io->iovcnt);
 	}
 
+	ec_io->data_iovs = calloc(ec->k, sizeof(struct iovec));
+	if (!ec_io->data_iovs) {
+		return -ENOMEM;
+	}
+
 	for (i = 0; i < ec->k; i++) {
 		ec_io->data_iovs[i].iov_base = (uint8_t *)ec_io->bounce_buf + (i * chunk_bytes);
 		ec_io->data_iovs[i].iov_len  = chunk_bytes;
+	}
+
+	ec_io->parity_iovs = calloc(ec->m, sizeof(struct iovec));
+	ec_io->parity_bufs = calloc(ec->m, sizeof(void *));
+	if (!ec_io->parity_iovs || !ec_io->parity_bufs) {
+		return -ENOMEM;
 	}
 
 	for (i = 0; i < ec->m; i++) {
@@ -133,8 +157,10 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_io_channel *ch,
 	ec_io->base_io_remaining = 0;
 	ec_io->status            = SPDK_BDEV_IO_STATUS_SUCCESS;
 
+	ec_io->data_iovs   = NULL;
+	ec_io->parity_iovs = NULL;
+	ec_io->parity_bufs = NULL;
 	ec_io->bounce_buf  = NULL;
-	memset(ec_io->parity_bufs, 0, sizeof(ec_io->parity_bufs));
 
 	ec_io->stripe_claimed     = false;
 	ec_io->stripe_claim_index = 0;
@@ -350,7 +376,7 @@ ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 	uint8_t  avail_matrix[EC_MAX_BASE_BDEVS * EC_MAX_BASE_BDEVS];
 	uint8_t  invert_matrix[EC_MAX_BASE_BDEVS * EC_MAX_BASE_BDEVS];
 	uint8_t  decode_matrix[EC_MAX_BASE_BDEVS];
-	uint8_t  decode_tbls[EC_ISAL_GF_TABLE_BYTES * EC_MAX_BASE_BDEVS];
+	uint8_t  decode_tbls[32 * EC_MAX_BASE_BDEVS];
 	uint8_t *kptrs[EC_MAX_BASE_BDEVS];   /* k source pointers */
 	uint8_t *optr[1];                    /* 1 output */
 	uint32_t avail_row = 0;
@@ -424,12 +450,11 @@ ec_reconstruct_multi_data(const struct ec_bdev *ec,
 	uint8_t  invert_matrix[EC_MAX_BASE_BDEVS * EC_MAX_BASE_BDEVS];
 	uint8_t  decode_matrix[EC_MAX_BASE_BDEVS * EC_MAX_BASE_BDEVS]; /* fxk */
 	/*
-	 * ec_init_tables requires EC_ISAL_GF_TABLE_BYTES * k * f bytes.
-	 * Sized at EC_ISAL_GF_TABLE_BYTES * EC_MAX_BASE_BDEVS^2 (32 KB) to
-	 * cover all k, f <= EC_MAX_BASE_BDEVS. SPDK reactor threads have 8
-	 * MB stacks; 35 KB total frame is fine.
+	 * ec_init_tables requires 32*k*f bytes.
+	 * Sized at 32 * EC_MAX_BASE_BDEVS^2 (32 KB) to cover all k, f <= 32.
+	 * SPDK reactor threads have 8 MB stacks; 35 KB total frame is fine.
 	 */
-	uint8_t  decode_tbls[EC_ISAL_GF_TABLE_BYTES * EC_MAX_BASE_BDEVS * EC_MAX_BASE_BDEVS];
+	uint8_t  decode_tbls[32 * EC_MAX_BASE_BDEVS * EC_MAX_BASE_BDEVS];
 	uint8_t *kptrs[EC_MAX_BASE_BDEVS];   /* k source pointers */
 	uint32_t avail_row = 0;
 	uint32_t disk, j;
@@ -644,7 +669,7 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 		return ec_submit_direct_read(ec_io, chunk_idx, base_lba);
 	}
 
-	/* Case B: targeting a failed parity slot -- logic error */
+	/* Case C: targeting a failed parity slot -- logic error */
 	if (chunk_idx >= ec->k) {
 		SPDK_ERRLOG("EC bdev %s: read targeting failed parity slot %u\n",
 			    ec->bdev.name, chunk_idx);
@@ -652,7 +677,7 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 	}
 
 	/*
-	 * Case C: target data chunk is unavailable -> ISA-L reconstruction.
+	 * Case B: target data chunk is unavailable -> ISA-L reconstruction.
 	 *
 	 * This path handles up to m simultaneous disk failures
 	 * (any combination of data and parity). We only need to reconstruct
@@ -696,11 +721,11 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 		 * No per-I/O log -- a sustained read-storm in the brief
 		 * scrub window would flood the system log otherwise.
 		 */
-		ec->degraded_read_eio_dirty++;
+		__atomic_fetch_add(&ec->degraded_read_eio_dirty, 1, __ATOMIC_RELAXED);
 		return -EIO;
 	}
 
-	ec->degraded_reads_reconstructed++;
+	__atomic_fetch_add(&ec->degraded_reads_reconstructed, 1, __ATOMIC_RELAXED);
 
 	dctx = calloc(1, sizeof(*dctx));
 	if (!dctx) {
@@ -918,7 +943,8 @@ ec_full_write_dispatch_on_submitter(void *ctx)
  * base_chans[], so it must run on the submitter thread. Similarly, the
  * failure path's spdk_bdev_io_complete must run on the bdev_io owner
  * thread (= submitter). Both are routed via spdk_thread_send_msg; the
- * single-reactor inline path skips the hop when submitter == home.
+ * inline fast path skips the hop when the caller is already on the
+ * target thread.
  */
 static void
 ec_full_write_wib_set_cb(void *cb_arg, int rc)
@@ -930,7 +956,7 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 		SPDK_ERRLOG("EC bdev %s: full-stripe WIB persist failed (rc=%d) "
 			    "before write fan-out at stripe %" PRIu64 "\n",
 			    ec->bdev.name, rc, ec_io->stripe_claim_index);
-		ec_full_write_release(ec_io, ec);
+		ec_full_write_unwind(ec_io, ec);
 
 		if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
 			spdk_bdev_io_complete(ec_io->bdev_io,
@@ -964,7 +990,8 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 		 * data fan-out. The on-disk WIB bit is set, so a crash here is
 		 * scrub-recoverable; release in-memory EC-layer state and fail
 		 * the bdev_io via a second send_msg. If even that fails, log
-		 * and accept the hang (same as Site 2 pattern).
+		 * and accept the hang: the bdev_io stays in flight rather than
+		 * being completed on the wrong thread.
 		 */
 		SPDK_ERRLOG("EC bdev %s: cannot hand off fan-out to submitter "
 			    "thread '%s' (rc=%d %s) at stripe %" PRIu64 "; releasing "
@@ -972,7 +999,7 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 			    ec->bdev.name,
 			    spdk_thread_get_name(ec_io->submitter_thread),
 			    send_rc, spdk_strerror(-send_rc), ec_io->stripe_claim_index);
-		ec_full_write_release(ec_io, ec);
+		ec_full_write_unwind(ec_io, ec);
 
 		int complete_rc = spdk_thread_send_msg(ec_io->submitter_thread,
 			ec_full_write_complete_failed_on_submitter, ec_io);
@@ -994,20 +1021,11 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	int             rc = 0;
 
 	/*
-	 * This function runs on the home thread because the WIB persist
-	 * below (ec_wib_persist) uses ec->wib_chans[], which are owned by
-	 * that thread.
-	 *
-	 * Routing the call to home when entered from a different thread is
-	 * deferred to the multi-reactor follow-up. It would mean replacing
-	 * the synchronous error returns here (-EAGAIN for retry, or a hard
-	 * failure that rolls back the WIB dirty bit and completes the
-	 * bdev_io as FAILED) with cb-delivered SPDK_BDEV_IO_STATUS_NOMEM
-	 * completions; the UNMAP and RMW paths need the same change.
-	 *
-	 * Only single-reactor SPDK targets are supported. The assert
-	 * catches accidental cross-thread use; without it the persist
-	 * would dispatch I/O on a channel it doesn't own.
+	 * Home-thread invariant: the WIB persist below (ec_wib_persist)
+	 * uses ec->wib_chans[], which are owned by the home thread. The
+	 * routing layer (ec_submit_write's entry hop) ensures every call
+	 * chain reaching this function has already been dispatched to home;
+	 * the assert is the inner sanity check.
 	 */
 	assert(spdk_get_thread() == ec->home_thread);
 
@@ -1085,8 +1103,8 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	 */
 	if (ec_io->num_blocks != ec->stripe_blocks) {
 		SPDK_ERRLOG("EC bdev %s: ec_submit_full_write called with "
-			    "num_blocks=%" PRIu64 " but stripe_blocks=%" PRIu64
-			    "; splitter bypass detected\n",
+			    "num_blocks=%" PRIu64 " but stripe_blocks=%" PRIu64 "; "
+			    "multi-stripe writes not yet supported\n",
 			    ec->bdev.name,
 			    ec_io->num_blocks, ec->stripe_blocks);
 		rc = -EINVAL;
@@ -1181,9 +1199,9 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 
 	/*
 	 * Fan-out routing: dispatches base I/O on ec_io->ch->base_chans[]
-	 * (submitter-owned). In single-reactor submitter == home and the
-	 * inline path runs; in multi-reactor we hop to the submitter so the
-	 * base I/O dispatch happens on the channel-owning thread.
+	 * (submitter-owned). When the caller is already on the submitter
+	 * thread the inline path runs; otherwise we hop to the submitter
+	 * so the base I/O dispatch happens on the channel-owning thread.
 	 */
 	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
 		ec_full_write_fanout(ec_io);
@@ -1307,6 +1325,18 @@ ec_full_write_fanout(struct ec_bdev_io *ec_io)
 
 error:
 	ec_full_write_unwind(ec_io, ec);
+	/*
+	 * Symmetric observability: the write-into-unmapped path bumps
+	 * writes_into_unmapped_failed at the other failure sites (alloc
+	 * failure, send_msg hand-off failure, post-bit-clear failure in
+	 * ec_write_into_unmapped_bit_cleared). The fan-out-all-failed
+	 * path went here unobserved before; bump the counter so the
+	 * gauge reflects every write-into-unmapped that failed to land.
+	 */
+	if (ec_io->is_write_into_unmapped) {
+		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1,
+				   __ATOMIC_RELAXED);
+	}
 	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 }
 
@@ -1375,6 +1405,15 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	uint64_t        payload_bytes;
 	bool            saved_is_zero_fill;
 	int             rc;
+
+	/*
+	 * Home-thread invariant: this function mutates home-only state
+	 * (scrub_ctx inspection, stripe-busy claim, is_write_into_unmapped
+	 * flag). The routing layer at the top of ec_submit_write ensures we
+	 * are on home; the assert is the inner tripwire matching the
+	 * equivalent guard at ec_submit_full_write and ec_unmap_inner_fanout.
+	 */
+	assert(spdk_get_thread() == ec->home_thread);
 
 	/*
 	 * Active-scrub guard. Mirrors the guard in ec_submit_full_write:
@@ -1469,13 +1508,13 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	 * through the bit-clear path instead of immediate bdev_io
 	 * completion.
 	 *
-	 * Fan-out routing mirrors the C2 pattern in ec_submit_full_write:
-	 * dispatch on ec_io->ch->base_chans[] (submitter-owned). In
-	 * single-reactor submitter == home and the inline path runs; in
-	 * multi-reactor we hop to the submitter so base I/O dispatch
-	 * happens on the channel-owning thread.
+	 * Fan-out routing mirrors ec_submit_full_write: dispatch on
+	 * ec_io->ch->base_chans[] (submitter-owned). When the caller is
+	 * already on the submitter thread the inline path runs; otherwise
+	 * we hop to the submitter so base I/O dispatch happens on the
+	 * channel-owning thread.
 	 */
-	ec->writes_into_unmapped++;
+	__atomic_fetch_add(&ec->writes_into_unmapped, 1, __ATOMIC_RELAXED);
 
 	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
 		ec_full_write_fanout(ec_io);
@@ -1531,13 +1570,13 @@ ec_submit_write(struct ec_bdev_io *ec_io)
 	 * (stripe-busy claim, WIB region map, scrub_ctx counters, persist
 	 * orchestration) inside ec_submit_write_into_unmapped /
 	 * ec_submit_full_write / ec_submit_rmw_write. Route the entire
-	 * call to home if we're not already there. In single-reactor
-	 * submitter == home and the inline branch runs.
+	 * call to home if we're not already there. When the caller is
+	 * already on the home thread the inline branch runs.
 	 *
 	 * The bitmap consult below (ec_stripe_is_unmapped) uses
-	 * __ATOMIC_ACQUIRE per the C3 release/acquire discipline, so the
-	 * outcome of the unmapped check is reproducible on home after
-	 * the hop.
+	 * __ATOMIC_ACQUIRE per the release/acquire discipline that pairs
+	 * with the home-side mutators, so the outcome of the unmapped
+	 * check is reproducible on home after the hop.
 	 */
 	if (spdk_unlikely(spdk_get_thread() != ec->home_thread)) {
 		return spdk_thread_send_msg(ec->home_thread,
@@ -1595,7 +1634,8 @@ ec_submit_write(struct ec_bdev_io *ec_io)
  * submitter with the appropriate status (NOMEM for retryable errors,
  * FAILED for hard errors), mirroring ec_submit_request's status
  * mapping for the inline path. If even the completion hand-off fails,
- * log and accept the hang (Site 2 pattern).
+ * the bdev_io stays in flight rather than being completed on the wrong
+ * thread.
  */
 static void
 ec_submit_write_on_home(void *ctx)
