@@ -104,6 +104,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/bdev.h"
 #include "spdk/bdev_module.h"
+#include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/queue.h"
 
@@ -135,17 +136,85 @@ struct ec_io_channel {
 /* Alignment for DMA buffers used in SPDK allocations */
 #define EC_DMA_ALIGN 4096
 
-/* Rebuild/scrub poller period (us). One stripe per tick; capped to limit
- * foreground I/O impact. */
-#define EC_REBUILD_POLL_PERIOD_US 100
+/* Background-walk poller period (us); shared by rebuild and scrub. */
+#define EC_BG_POLL_PERIOD_US 100
 
-/* Rebuild/scrub progress heartbeat: emit a NOTICE every N seconds or
- * every M percent of total progress, whichever fires first. Bounds the
- * log to ~tens of lines for an entire operation while preserving a
- * wall-clock trajectory in post-mortem logs. Shared between rebuild and
- * scrub since they have the same operational shape. */
-#define EC_REBUILD_HEARTBEAT_SEC 30
-#define EC_REBUILD_HEARTBEAT_PERCENT_STEP 10
+/* Background-walk heartbeat: emit a NOTICE every N seconds or every M
+ * percent, whichever fires first. */
+#define EC_BG_HEARTBEAT_SEC 30
+#define EC_BG_HEARTBEAT_PERCENT_STEP 10
+
+/* Heartbeat state for a background walk; embedded in ec_rebuild_ctx and
+ * ec_scrub_ctx. Each caller owns its own NOTICE format. */
+struct ec_bg_heartbeat_state {
+	uint64_t  start_ticks;            /* ticks when the walk was registered  */
+	uint64_t  last_heartbeat_ticks;   /* ticks at the last heartbeat NOTICE  */
+	uint32_t  next_heartbeat_percent; /* next percent milestone (10, 20, ...) */
+};
+
+/* Heartbeat decision returned by ec_heartbeat_should_fire. */
+struct ec_bg_heartbeat_decision {
+	bool      fire;
+	uint32_t  percent;
+	uint64_t  elapsed_seconds;
+	uint64_t  remaining_seconds;
+};
+
+/*
+ * Decide whether the walk should emit a heartbeat NOTICE; advance state
+ * when it should. progress/total are walk counts (stripes for rebuild,
+ * regions for scrub).
+ *
+ * Returns fire == false when total == 0, the tick rate is unknown, or
+ * percent >= 100 (the matching "complete" NOTICE in *_finish owns that
+ * case).
+ */
+static inline struct ec_bg_heartbeat_decision
+ec_heartbeat_should_fire(struct ec_bg_heartbeat_state *state,
+			 uint64_t progress, uint64_t total)
+{
+	struct ec_bg_heartbeat_decision out = { 0 };
+	uint64_t ticks_per_second = spdk_get_ticks_hz();
+	uint64_t now;
+	bool     by_time;
+	bool     by_percent;
+
+	if (total == 0 || ticks_per_second == 0) {
+		return out;
+	}
+
+	out.percent = (uint32_t)((progress * 100) / total);
+
+	/* *_finish logs 100% on its own; skip the heartbeat at the boundary
+	 * so we don't log completion twice. */
+	if (out.percent >= 100) {
+		return out;
+	}
+
+	now = spdk_get_ticks();
+	by_time = (now - state->last_heartbeat_ticks) >=
+		  (uint64_t)EC_BG_HEARTBEAT_SEC * ticks_per_second;
+	by_percent = out.percent >= state->next_heartbeat_percent;
+
+	if (!by_time && !by_percent) {
+		return out;
+	}
+
+	out.elapsed_seconds = (now - state->start_ticks) / ticks_per_second;
+	/* percent is in [1, 99] here: >= 100 returned above, == 0 guarded by ?: */
+	out.remaining_seconds = (out.percent > 0) ?
+		(out.elapsed_seconds * (100 - out.percent) / out.percent) : 0;
+	out.fire = true;
+
+	state->last_heartbeat_ticks = now;
+	if (by_percent) {
+		state->next_heartbeat_percent =
+			(out.percent / EC_BG_HEARTBEAT_PERCENT_STEP + 1) *
+			EC_BG_HEARTBEAT_PERCENT_STEP;
+	}
+
+	return out;
+}
 
 /*
  * Number of uint64_t words needed to cover `bits` bitmap entries.
@@ -244,10 +313,7 @@ struct ec_rebuild_ctx {
 	/* REPLACING slot count at rebuild start; for percent_complete calc. */
 	uint32_t         slots_to_rebuild;
 
-	/* Heartbeat progress logging (see EC_REBUILD_HEARTBEAT_*). */
-	uint64_t  start_ticks;           /* ticks when rebuild was registered */
-	uint64_t  last_heartbeat_ticks;  /* ticks at last heartbeat NOTICE */
-	uint32_t  next_heartbeat_percent;    /* next percent milestone (10, 20, ...) */
+	struct ec_bg_heartbeat_state heartbeat;
 
 	/* SPDK poller driving the rebuild loop */
 	struct spdk_poller *poller;
@@ -402,10 +468,7 @@ struct ec_scrub_ctx {
 	uint64_t         regions_scrubbed;
 	uint32_t         total_dirty_regions; /* dirty count at scrub start */
 
-	/* Heartbeat progress logging (see EC_REBUILD_HEARTBEAT_*). */
-	uint64_t         start_ticks;          /* ticks when scrub was registered */
-	uint64_t         last_heartbeat_ticks; /* ticks at last heartbeat NOTICE  */
-	uint32_t         next_heartbeat_percent;   /* next percent milestone          */
+	struct ec_bg_heartbeat_state heartbeat;
 
 	struct spdk_poller *poller;
 };

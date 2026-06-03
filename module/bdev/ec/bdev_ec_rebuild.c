@@ -196,7 +196,7 @@ ec_rebuild_finish(struct ec_rebuild_ctx *ctx, int rc)
 		{
 			uint64_t ticks_per_second = spdk_get_ticks_hz();
 			uint64_t elapsed_seconds  = ticks_per_second != 0 ?
-				(spdk_get_ticks() - ctx->start_ticks) / ticks_per_second : 0;
+				(spdk_get_ticks() - ctx->heartbeat.start_ticks) / ticks_per_second : 0;
 			uint32_t wib_dirty        = ec_wib_count_dirty(ec);
 
 			SPDK_NOTICELOG("EC bdev %s: rebuild complete: "
@@ -282,58 +282,27 @@ ec_rebuild_move_to_next_slot(struct ec_rebuild_ctx *ctx)
 	ec_rebuild_finish(ctx, 0);
 }
 
-/*
- * Emit a NOTICE every EC_REBUILD_HEARTBEAT_SEC seconds or every
- * EC_REBUILD_HEARTBEAT_PERCENT_STEP percent of progress, whichever fires
- * first. Called once per completed stripe; the gates keep the actual
- * log rate bounded regardless of rebuild throughput.
- */
+/* Emit a rebuild-progress NOTICE per the EC_BG_HEARTBEAT_* policy;
+ * called once per completed stripe. */
 static void
 ec_rebuild_heartbeat(struct ec_rebuild_ctx *ctx)
 {
 	uint64_t total_stripe_writes = ctx->num_stripes * (uint64_t)ctx->slots_to_rebuild;
-	uint64_t now = spdk_get_ticks();
-	uint64_t ticks_per_second = spdk_get_ticks_hz();
-	uint32_t percent;
-	bool     by_time;
-	bool     by_percent;
+	struct ec_bg_heartbeat_decision decision;
 
-	if (total_stripe_writes == 0 || ticks_per_second == 0) {
+	decision = ec_heartbeat_should_fire(&ctx->heartbeat,
+					    ctx->stripes_rebuilt, total_stripe_writes);
+	if (!decision.fire) {
 		return;
 	}
-
-	percent = (uint32_t)((ctx->stripes_rebuilt * 100) / total_stripe_writes);
-
-	/* 100% is owned by the "rebuild complete" NOTICE in ec_rebuild_finish;
-	 * skip heartbeat at the boundary to avoid two back-to-back lines. */
-	if (percent >= 100) {
-		return;
-	}
-
-	by_time = (now - ctx->last_heartbeat_ticks) >= (uint64_t)EC_REBUILD_HEARTBEAT_SEC * ticks_per_second;
-	by_percent = percent >= ctx->next_heartbeat_percent;
-
-	if (!by_time && !by_percent) {
-		return;
-	}
-
-	uint64_t elapsed_seconds = (now - ctx->start_ticks) / ticks_per_second;
-	uint64_t remaining_seconds = (percent > 0) ?   /* percent in [1,99]: >=100 returned above, ==0 guarded by ?: */
-			     (elapsed_seconds * (100 - percent) / percent) : 0;
 
 	SPDK_NOTICELOG("EC bdev %s: rebuild progress %u%% "
 		       "(slot %u, %" PRIu64 "/%" PRIu64 " stripes total, "
 		       "%" PRIu64 "s elapsed, ~%" PRIu64 "s remaining)\n",
-		       ctx->ec->bdev.name, percent,
+		       ctx->ec->bdev.name, decision.percent,
 		       ctx->current_slot,
 		       ctx->stripes_rebuilt, total_stripe_writes,
-		       elapsed_seconds, remaining_seconds);
-
-	ctx->last_heartbeat_ticks = now;
-	if (by_percent) {
-		ctx->next_heartbeat_percent = (percent / EC_REBUILD_HEARTBEAT_PERCENT_STEP + 1)
-					  * EC_REBUILD_HEARTBEAT_PERCENT_STEP;
-	}
+		       decision.elapsed_seconds, decision.remaining_seconds);
 }
 
 /*
@@ -622,7 +591,7 @@ ec_rebuild_submit_stripe_reads(struct ec_rebuild_ctx *ctx)
 
 /*
  * SPDK poller that drives the rebuild loop. Registered with period
- * EC_REBUILD_POLL_PERIOD_US so the reactor can service other I/O between
+ * EC_BG_POLL_PERIOD_US so the reactor can service other I/O between
  * rebuild stripes.
  *
  * State machine per invocation:
@@ -816,9 +785,9 @@ ec_bdev_start_rebuild(const char *ec_name,
 	ctx->io_in_flight = false;
 	ctx->stripes_rebuilt = 0;
 	ctx->slots_to_rebuild = slots_to_rebuild;
-	ctx->start_ticks = spdk_get_ticks();
-	ctx->last_heartbeat_ticks = ctx->start_ticks;
-	ctx->next_heartbeat_percent = EC_REBUILD_HEARTBEAT_PERCENT_STEP;
+	ctx->heartbeat.start_ticks = spdk_get_ticks();
+	ctx->heartbeat.last_heartbeat_ticks = ctx->heartbeat.start_ticks;
+	ctx->heartbeat.next_heartbeat_percent = EC_BG_HEARTBEAT_PERCENT_STEP;
 	ctx->stripe_claimed = false;
 	ctx->draining_deferred_stripes = false;
 	TAILQ_INIT(&ctx->deferred_stripes);
@@ -862,7 +831,7 @@ ec_bdev_start_rebuild(const char *ec_name,
 	ec->rebuild_ctx = ctx;
 
 	ctx->poller = spdk_poller_register(ec_rebuild_poller_cb, ctx,
-					   EC_REBUILD_POLL_PERIOD_US);
+					   EC_BG_POLL_PERIOD_US);
 	if (!ctx->poller) {
 		SPDK_ERRLOG("EC bdev %s: rebuild -- failed to register poller\n",
 			    ec->bdev.name);
@@ -977,7 +946,7 @@ ec_scrub_finish(struct ec_scrub_ctx *sctx)
 	{
 		uint64_t ticks_per_second = spdk_get_ticks_hz();
 		uint64_t elapsed_seconds  = ticks_per_second != 0 ?
-			(spdk_get_ticks() - sctx->start_ticks) / ticks_per_second : 0;
+			(spdk_get_ticks() - sctx->heartbeat.start_ticks) / ticks_per_second : 0;
 
 		SPDK_NOTICELOG("EC bdev %s: startup scrub complete: "
 			       "%" PRIu64 "/%u dirty region(s), "
@@ -1006,59 +975,28 @@ ec_scrub_finish(struct ec_scrub_ctx *sctx)
 	free(sctx);
 }
 
-/*
- * Same heartbeat shape as ec_rebuild_heartbeat: NOTICE every
- * EC_REBUILD_HEARTBEAT_SEC seconds or every EC_REBUILD_HEARTBEAT_PERCENT_STEP
- * percent of regions, whichever fires first. Called once per region
- * completion; cadence is already low because regions span 1024 stripes.
- */
+/* Emit a scrub-progress NOTICE per the EC_BG_HEARTBEAT_* policy.
+ * Regions span EC_WIB_REGION_STRIPES stripes, so firings are naturally
+ * infrequent. */
 static void
 ec_scrub_heartbeat(struct ec_scrub_ctx *sctx)
 {
-	uint64_t now = spdk_get_ticks();
-	uint64_t ticks_per_second = spdk_get_ticks_hz();
-	uint32_t percent;
-	bool     by_time;
-	bool     by_percent;
+	struct ec_bg_heartbeat_decision decision;
 
-	if (sctx->total_dirty_regions == 0 || ticks_per_second == 0) {
+	decision = ec_heartbeat_should_fire(&sctx->heartbeat,
+					    sctx->regions_scrubbed,
+					    sctx->total_dirty_regions);
+	if (!decision.fire) {
 		return;
 	}
-
-	percent = (uint32_t)((sctx->regions_scrubbed * 100) /
-			     sctx->total_dirty_regions);
-
-	/* 100% is owned by the "scrub complete" NOTICE in ec_scrub_finish;
-	 * skip heartbeat at the boundary to avoid two back-to-back lines. */
-	if (percent >= 100) {
-		return;
-	}
-
-	by_time = (now - sctx->last_heartbeat_ticks) >=
-		  (uint64_t)EC_REBUILD_HEARTBEAT_SEC * ticks_per_second;
-	by_percent = percent >= sctx->next_heartbeat_percent;
-
-	if (!by_time && !by_percent) {
-		return;
-	}
-
-	uint64_t elapsed_seconds = (now - sctx->start_ticks) / ticks_per_second;
-	uint64_t remaining_seconds = (percent > 0) ?   /* percent in [1,99]: >=100 returned above, ==0 guarded by ?: */
-			     (elapsed_seconds * (100 - percent) / percent) : 0;
 
 	SPDK_NOTICELOG("EC bdev %s: scrub progress %u%% "
 		       "(%" PRIu64 "/%u regions, %" PRIu64 " stripes scrubbed, "
 		       "%" PRIu64 "s elapsed, ~%" PRIu64 "s remaining)\n",
-		       sctx->ec->bdev.name, percent,
+		       sctx->ec->bdev.name, decision.percent,
 		       sctx->regions_scrubbed, sctx->total_dirty_regions,
 		       sctx->stripes_scrubbed,
-		       elapsed_seconds, remaining_seconds);
-
-	sctx->last_heartbeat_ticks = now;
-	if (by_percent) {
-		sctx->next_heartbeat_percent = (percent / EC_REBUILD_HEARTBEAT_PERCENT_STEP + 1)
-					   * EC_REBUILD_HEARTBEAT_PERCENT_STEP;
-	}
+		       decision.elapsed_seconds, decision.remaining_seconds);
 }
 
 /*
@@ -1488,9 +1426,9 @@ ec_bdev_start_scrub(struct ec_bdev *ec)
 	sctx->chunk_bytes = ec->strip_size * ec->bdev.blocklen;
 	sctx->io_in_flight = false;
 	sctx->total_dirty_regions = dirty_count;
-	sctx->start_ticks = spdk_get_ticks();
-	sctx->last_heartbeat_ticks = sctx->start_ticks;
-	sctx->next_heartbeat_percent = EC_REBUILD_HEARTBEAT_PERCENT_STEP;
+	sctx->heartbeat.start_ticks = spdk_get_ticks();
+	sctx->heartbeat.last_heartbeat_ticks = sctx->heartbeat.start_ticks;
+	sctx->heartbeat.next_heartbeat_percent = EC_BG_HEARTBEAT_PERCENT_STEP;
 
 	/* Open dedicated I/O channels for all n disks */
 	for (i = 0; i < ec->n; i++) {
@@ -1526,7 +1464,7 @@ ec_bdev_start_scrub(struct ec_bdev *ec)
 	ec->scrub_ctx = sctx;
 
 	sctx->poller = spdk_poller_register(ec_scrub_poller_cb, sctx,
-					    EC_REBUILD_POLL_PERIOD_US);
+					    EC_BG_POLL_PERIOD_US);
 	if (!sctx->poller) {
 		ec_scrub_free_resources(sctx);
 		ec->scrub_ctx = NULL;
