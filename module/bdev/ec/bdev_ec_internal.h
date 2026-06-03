@@ -1363,6 +1363,25 @@ ec_rmw_in_flight_get(const struct ec_bdev *ec)
 /* Helpers for diagnostics; loop-based, not worth inlining. */
 uint32_t ec_wib_count_dirty(const struct ec_bdev *ec);
 
+/* Rebuild progress snapshot; percent is derived at the RPC marshaller. */
+struct ec_rebuild_progress {
+	uint32_t current_slot;
+	uint64_t current_stripe;
+	uint64_t num_stripes;
+	uint64_t stripes_rebuilt;
+	uint32_t slots_to_rebuild;
+};
+
+/* Scrub progress snapshot; percent is derived at the RPC marshaller. */
+struct ec_scrub_progress {
+	uint32_t current_region;
+	uint32_t num_regions;
+	uint32_t total_dirty_regions;
+	uint64_t current_stripe;
+	uint64_t stripes_scrubbed;
+	uint64_t regions_scrubbed;
+};
+
 /* =========================================================================
  * In-band unmapped bitmap (bdev_ec_bitmap.c)
  *

@@ -900,11 +900,7 @@ ec_bdev_set_rebuild_qos(const char *ec_name,
 
 int
 ec_bdev_get_rebuild_progress(const char *ec_name,
-			     uint32_t *current_slot,
-			     uint64_t *current_stripe,
-			     uint64_t *num_stripes,
-			     uint64_t *stripes_rebuilt,
-			     uint32_t *slots_to_rebuild)
+			     struct ec_rebuild_progress *out)
 {
 	struct ec_bdev *ec = ec_bdev_find(ec_name);
 
@@ -915,11 +911,11 @@ ec_bdev_get_rebuild_progress(const char *ec_name,
 		return -ENOENT;
 	}
 
-	*current_slot     = ec->rebuild_ctx->current_slot;
-	*current_stripe   = ec->rebuild_ctx->current_stripe;
-	*num_stripes      = ec->rebuild_ctx->num_stripes;
-	*stripes_rebuilt  = ec->rebuild_ctx->stripes_rebuilt;
-	*slots_to_rebuild = ec->rebuild_ctx->slots_to_rebuild;
+	out->current_slot     = ec->rebuild_ctx->current_slot;
+	out->current_stripe   = ec->rebuild_ctx->current_stripe;
+	out->num_stripes      = ec->rebuild_ctx->num_stripes;
+	out->stripes_rebuilt  = ec->rebuild_ctx->stripes_rebuilt;
+	out->slots_to_rebuild = ec->rebuild_ctx->slots_to_rebuild;
 
 	return 0;
 }
@@ -1450,16 +1446,11 @@ ec_bdev_start_scrub(struct ec_bdev *ec)
 /*
  * Returns -ENODEV if the named EC bdev does not exist.
  * Returns -ENOENT if no scrub is currently in progress.
- * Returns 0 and fills out-params on success.
+ * Returns 0 and fills *out on success.
  */
 int
 ec_bdev_get_scrub_progress(const char *ec_name,
-			   uint32_t   *current_region,
-			   uint32_t   *num_regions,
-			   uint32_t   *total_dirty_regions,
-			   uint64_t   *current_stripe,
-			   uint64_t   *stripes_scrubbed,
-			   uint64_t   *regions_scrubbed)
+			   struct ec_scrub_progress *out)
 {
 	struct ec_bdev *ec = ec_bdev_find(ec_name);
 
@@ -1470,12 +1461,12 @@ ec_bdev_get_scrub_progress(const char *ec_name,
 		return -ENOENT;
 	}
 
-	*current_region      = ec->scrub_ctx->current_region;
-	*num_regions         = ec->wib_num_regions;
-	*total_dirty_regions = ec->scrub_ctx->total_dirty_regions;
-	*current_stripe      = ec->scrub_ctx->current_stripe;
-	*stripes_scrubbed    = ec->scrub_ctx->stripes_scrubbed;
-	*regions_scrubbed    = ec->scrub_ctx->regions_scrubbed;
+	out->current_region      = ec->scrub_ctx->current_region;
+	out->num_regions         = ec->wib_num_regions;
+	out->total_dirty_regions = ec->scrub_ctx->total_dirty_regions;
+	out->current_stripe      = ec->scrub_ctx->current_stripe;
+	out->stripes_scrubbed    = ec->scrub_ctx->stripes_scrubbed;
+	out->regions_scrubbed    = ec->scrub_ctx->regions_scrubbed;
 
 	return 0;
 }

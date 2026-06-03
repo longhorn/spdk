@@ -498,9 +498,7 @@ rpc_bdev_ec_get_rebuild_progress(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_bdev_ec_get_rebuild_progress req = {};
 	struct spdk_json_write_ctx *w;
-	uint32_t current_slot;
-	uint64_t current_stripe, num_stripes, stripes_rebuilt;
-	uint32_t slots_to_rebuild;
+	struct ec_rebuild_progress  p;
 	uint32_t percent;
 	int      rc;
 
@@ -514,10 +512,7 @@ rpc_bdev_ec_get_rebuild_progress(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	rc = ec_bdev_get_rebuild_progress(req.ec_name,
-					  &current_slot, &current_stripe,
-					  &num_stripes, &stripes_rebuilt,
-					  &slots_to_rebuild);
+	rc = ec_bdev_get_rebuild_progress(req.ec_name, &p);
 	if (rc != 0) {
 		const char *errmsg;
 		switch (-rc) {
@@ -530,20 +525,20 @@ rpc_bdev_ec_get_rebuild_progress(struct spdk_jsonrpc_request *request,
 	}
 
 	{
-		uint64_t total_stripes = num_stripes * slots_to_rebuild;
+		uint64_t total_stripes = p.num_stripes * p.slots_to_rebuild;
 		percent = (total_stripes > 0)
-			? (uint32_t)((stripes_rebuilt * 100) / total_stripes)
+			? (uint32_t)((p.stripes_rebuilt * 100) / total_stripes)
 			: 100;
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w,  "ec_name",          req.ec_name);
-	spdk_json_write_named_uint32(w,  "current_slot",     current_slot);
-	spdk_json_write_named_uint64(w,  "current_stripe",   current_stripe);
-	spdk_json_write_named_uint64(w,  "num_stripes",      num_stripes);
-	spdk_json_write_named_uint64(w,  "stripes_rebuilt",  stripes_rebuilt);
-	spdk_json_write_named_uint32(w,  "slots_to_rebuild", slots_to_rebuild);
+	spdk_json_write_named_uint32(w,  "current_slot",     p.current_slot);
+	spdk_json_write_named_uint64(w,  "current_stripe",   p.current_stripe);
+	spdk_json_write_named_uint64(w,  "num_stripes",      p.num_stripes);
+	spdk_json_write_named_uint64(w,  "stripes_rebuilt",  p.stripes_rebuilt);
+	spdk_json_write_named_uint32(w,  "slots_to_rebuild", p.slots_to_rebuild);
 	spdk_json_write_named_uint32(w,  "percent_complete", percent);
 	spdk_json_write_object_end(w);
 	spdk_jsonrpc_end_result(request, w);
@@ -717,8 +712,7 @@ rpc_bdev_ec_get_scrub_progress(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_bdev_ec_get_scrub_progress req = {};
 	struct spdk_json_write_ctx *w;
-	uint32_t current_region, num_regions, total_dirty_regions;
-	uint64_t current_stripe, stripes_scrubbed, regions_scrubbed;
+	struct ec_scrub_progress    p;
 	uint32_t percent;
 	int      rc;
 
@@ -731,13 +725,7 @@ rpc_bdev_ec_get_scrub_progress(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	rc = ec_bdev_get_scrub_progress(req.ec_name,
-					&current_region,
-					&num_regions,
-					&total_dirty_regions,
-					&current_stripe,
-					&stripes_scrubbed,
-					&regions_scrubbed);
+	rc = ec_bdev_get_scrub_progress(req.ec_name, &p);
 	if (rc != 0) {
 		const char *errmsg;
 		switch (-rc) {
@@ -749,19 +737,19 @@ rpc_bdev_ec_get_scrub_progress(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	percent = (total_dirty_regions > 0)
-		? (uint32_t)((regions_scrubbed * 100) / total_dirty_regions)
+	percent = (p.total_dirty_regions > 0)
+		? (uint32_t)((p.regions_scrubbed * 100) / p.total_dirty_regions)
 		: 100;
 
 	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w,  "ec_name",              req.ec_name);
-	spdk_json_write_named_uint32(w,  "current_region",       current_region);
-	spdk_json_write_named_uint32(w,  "num_regions",          num_regions);
-	spdk_json_write_named_uint32(w,  "total_dirty_regions",  total_dirty_regions);
-	spdk_json_write_named_uint64(w,  "current_stripe",       current_stripe);
-	spdk_json_write_named_uint64(w,  "stripes_scrubbed",     stripes_scrubbed);
-	spdk_json_write_named_uint64(w,  "regions_scrubbed",     regions_scrubbed);
+	spdk_json_write_named_uint32(w,  "current_region",       p.current_region);
+	spdk_json_write_named_uint32(w,  "num_regions",          p.num_regions);
+	spdk_json_write_named_uint32(w,  "total_dirty_regions",  p.total_dirty_regions);
+	spdk_json_write_named_uint64(w,  "current_stripe",       p.current_stripe);
+	spdk_json_write_named_uint64(w,  "stripes_scrubbed",     p.stripes_scrubbed);
+	spdk_json_write_named_uint64(w,  "regions_scrubbed",     p.regions_scrubbed);
 	spdk_json_write_named_uint32(w,  "percent_complete",     percent);
 	spdk_json_write_object_end(w);
 	spdk_jsonrpc_end_result(request, w);
