@@ -50,6 +50,23 @@ ec_rmw_free_ctx(struct ec_rmw_ctx *mctx, const struct ec_bdev *ec)
 }
 
 /*
+ * Release the stripe-busy claim, decrement rmw_in_flight and the WIB
+ * region inflight count, then free mctx (DMA buffers via
+ * ec_rmw_free_ctx). mctx is invalid after return.
+ */
+static void
+ec_rmw_teardown(struct ec_rmw_ctx *mctx)
+{
+	struct ec_bdev *ec     = ec_from_bdev_io(mctx->ec_io->bdev_io);
+	uint32_t        region = ec_wib_stripe_to_region(mctx->stripe_index);
+
+	ec_stripe_clear_dirty(ec, mctx->stripe_index);
+	ec_rmw_in_flight_dec(ec);
+	ec_wib_region_inflight_dec(ec, region);
+	ec_rmw_free_ctx(mctx, ec);
+}
+
+/*
  * Terminal step of the RMW chain. Called once all write children have
  * completed (writes_remaining == 0).
  *
@@ -65,7 +82,6 @@ ec_rmw_complete(struct ec_rmw_ctx *mctx)
 	struct ec_bdev_io *ec_io = mctx->ec_io;
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
 	enum spdk_bdev_io_status status;
-	uint32_t region = ec_wib_stripe_to_region(mctx->stripe_index);
 	void (*cb_fn)(void *, enum spdk_bdev_io_status);
 	void *cb_arg;
 
@@ -103,23 +119,16 @@ ec_rmw_complete(struct ec_rmw_ctx *mctx)
 				    ec->bdev.name,
 				    spdk_thread_get_name(ec_io->submitter_thread),
 				    send_rc, spdk_strerror(-send_rc), mctx->stripe_index);
-			ec_stripe_clear_dirty(ec, mctx->stripe_index);
-			ec_rmw_in_flight_dec(ec);
-			ec_wib_region_inflight_dec(ec, region);
-			ec_rmw_free_ctx(mctx, ec);
+			ec_rmw_teardown(mctx);
 		}
 		return;
 	}
-
-	ec_stripe_clear_dirty(ec, mctx->stripe_index);
-	ec_rmw_in_flight_dec(ec);
-	ec_wib_region_inflight_dec(ec, region);
 
 	status = mctx->status;
 	cb_fn  = mctx->cb_fn;
 	cb_arg = mctx->cb_arg;
 
-	ec_rmw_free_ctx(mctx, ec);
+	ec_rmw_teardown(mctx);
 
 	/*
 	 * cb_fn == NULL means complete the parent bdev_io directly (ordinary
@@ -816,11 +825,7 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 				    ec->bdev.name,
 				    spdk_thread_get_name(ec_io->submitter_thread),
 				    send_rc, spdk_strerror(-send_rc), stripe_index);
-			ec_stripe_clear_dirty(ec, stripe_index);
-			ec_rmw_in_flight_dec(ec);
-			ec_wib_region_inflight_dec(ec,
-				ec_wib_stripe_to_region(stripe_index));
-			ec_rmw_free_ctx(mctx, ec);
+			ec_rmw_teardown(mctx);
 
 			int complete_rc = spdk_thread_send_msg(
 				ec_io->submitter_thread,
@@ -889,11 +894,7 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 			 * in-memory WIB bit is intentionally NOT cleared here
 			 * -- see the function preamble.
 			 */
-			ec_stripe_clear_dirty(ec, stripe_index);
-			ec_rmw_in_flight_dec(ec);
-			ec_wib_region_inflight_dec(ec,
-				ec_wib_stripe_to_region(stripe_index));
-			ec_rmw_free_ctx(mctx, ec);
+			ec_rmw_teardown(mctx);
 			spdk_bdev_io_complete(bdev_io,
 					      SPDK_BDEV_IO_STATUS_FAILED);
 			return;
