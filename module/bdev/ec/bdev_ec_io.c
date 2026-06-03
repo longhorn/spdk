@@ -47,6 +47,9 @@ struct ec_degraded_read_ctx {
  * I/O buffer helpers
  * ========================================================================= */
 
+/* Forward declaration; defined near the full-stripe write path. */
+static void ec_io_release_state(struct ec_bdev_io *ec_io, struct ec_bdev *ec);
+
 static void
 ec_free_io_buffers(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 {
@@ -190,11 +193,7 @@ ec_write_into_unmapped_finalize(void *ctx)
 	struct ec_bdev_io *ec_io = ctx;
 	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
 
-	if (ec_io->stripe_claimed) {
-		ec_stripe_clear_dirty(ec, ec_io->stripe_claim_index);
-		ec_io->stripe_claimed = false;
-	}
-	ec_free_io_buffers(ec_io, ec);
+	ec_io_release_state(ec_io, ec);
 	spdk_bdev_io_complete(ec_io->bdev_io, ec_io->status);
 }
 
@@ -257,11 +256,7 @@ ec_write_into_unmapped_bit_cleared(void *cb_arg, int rc)
 				    "until SPDK timeout fires\n",
 				    ec->bdev.name, spdk_thread_get_name(owner),
 				    send_rc, spdk_strerror(-send_rc), ec_io->stripe_claim_index);
-			if (ec_io->stripe_claimed) {
-				ec_stripe_clear_dirty(ec, ec_io->stripe_claim_index);
-				ec_io->stripe_claimed = false;
-			}
-			ec_free_io_buffers(ec_io, ec);
+			ec_io_release_state(ec_io, ec);
 			/* spdk_bdev_io_complete is owner-thread-only -- the
 			 * bdev_io cannot be completed from here. */
 		}
@@ -283,11 +278,6 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 	ec_io->base_io_remaining--;
 
 	if (ec_io->base_io_remaining == 0) {
-		if (ec_io->wib_inflight_held) {
-			ec_wib_region_inflight_dec(ec, ec_io->wib_region);
-			ec_io->wib_inflight_held = false;
-		}
-
 		/*
 		 * Write-into-unmapped routing: data has landed (success) or
 		 * partially failed. On success, defer bdev_io completion until
@@ -302,7 +292,17 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 		 * same as a fanout failure: leave the bitmap saying unmapped,
 		 * fail the bdev_io. The stripe-busy and buffers are torn down
 		 * in the fall-through.
+		 *
+		 * The bit-clear runs after we have released wib_inflight (the
+		 * WIB region is no longer load-bearing once all child writes
+		 * have completed), so we drop wib_inflight here regardless of
+		 * which branch runs next.
 		 */
+		if (ec_io->wib_inflight_held) {
+			ec_wib_region_inflight_dec(ec, ec_io->wib_region);
+			ec_io->wib_inflight_held = false;
+		}
+
 		if (ec_io->is_write_into_unmapped &&
 		    ec_io->status == SPDK_BDEV_IO_STATUS_SUCCESS) {
 			int rc;
@@ -323,11 +323,7 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 			__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
 		}
 
-		if (ec_io->stripe_claimed) {
-			ec_stripe_clear_dirty(ec, ec_io->stripe_claim_index);
-			ec_io->stripe_claimed = false;
-		}
-		ec_free_io_buffers(ec_io, ec);
+		ec_io_release_state(ec_io, ec);
 		spdk_bdev_io_complete(ec_io->bdev_io, ec_io->status);
 	}
 }
@@ -888,12 +884,12 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 static void ec_full_write_fanout(struct ec_bdev_io *ec_io);
 
 /*
- * Release the resources a full-stripe write holds on an error path: the
- * WIB-region inflight count, the stripe-busy claim, and the chunk buffers.
- * Each guard is idempotent, so callers just complete (or return) afterward.
+ * Drop the WIB region inflight count, release the stripe-busy claim,
+ * and free the chunk buffers held by ec_io. Each step is idempotent;
+ * safe from any error path. Caller completes the bdev_io afterward.
  */
 static void
-ec_full_write_unwind(struct ec_bdev_io *ec_io, struct ec_bdev *ec)
+ec_io_release_state(struct ec_bdev_io *ec_io, struct ec_bdev *ec)
 {
 	if (ec_io->wib_inflight_held) {
 		ec_wib_region_inflight_dec(ec, ec_io->wib_region);
@@ -956,7 +952,7 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 		SPDK_ERRLOG("EC bdev %s: full-stripe WIB persist failed (rc=%d) "
 			    "before write fan-out at stripe %" PRIu64 "\n",
 			    ec->bdev.name, rc, ec_io->stripe_claim_index);
-		ec_full_write_unwind(ec_io, ec);
+		ec_io_release_state(ec_io, ec);
 
 		if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
 			spdk_bdev_io_complete(ec_io->bdev_io,
@@ -999,7 +995,7 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 			    ec->bdev.name,
 			    spdk_thread_get_name(ec_io->submitter_thread),
 			    send_rc, spdk_strerror(-send_rc), ec_io->stripe_claim_index);
-		ec_full_write_unwind(ec_io, ec);
+		ec_io_release_state(ec_io, ec);
 
 		int complete_rc = spdk_thread_send_msg(ec_io->submitter_thread,
 			ec_full_write_complete_failed_on_submitter, ec_io);
@@ -1216,7 +1212,7 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	return 0;
 
 error:
-	ec_full_write_unwind(ec_io, ec);
+	ec_io_release_state(ec_io, ec);
 	return rc;
 }
 
@@ -1324,7 +1320,7 @@ ec_full_write_fanout(struct ec_bdev_io *ec_io)
 	return;
 
 error:
-	ec_full_write_unwind(ec_io, ec);
+	ec_io_release_state(ec_io, ec);
 	/*
 	 * Symmetric observability: the write-into-unmapped path bumps
 	 * writes_into_unmapped_failed at the other failure sites (alloc
@@ -1466,10 +1462,8 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	rc                   = ec_alloc_full_stripe(ec_io, ec);
 	ec_io->is_zero_fill  = saved_is_zero_fill;
 	if (rc != 0) {
-		ec_stripe_clear_dirty(ec, stripe_idx);
-		ec_io->stripe_claimed         = false;
 		ec_io->is_write_into_unmapped = false;
-		ec_free_io_buffers(ec_io, ec);
+		ec_io_release_state(ec_io, ec);
 		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
 		return rc;
 	}
@@ -1531,10 +1525,8 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 		 * stripe_unmapped_map stays in its pre-call state and a
 		 * caller retry replays the whole sequence cleanly.
 		 */
-		ec_stripe_clear_dirty(ec, stripe_idx);
-		ec_io->stripe_claimed         = false;
 		ec_io->is_write_into_unmapped = false;
-		ec_free_io_buffers(ec_io, ec);
+		ec_io_release_state(ec_io, ec);
 		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1,
 				   __ATOMIC_RELAXED);
 		return rc;
