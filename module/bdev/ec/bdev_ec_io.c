@@ -1044,21 +1044,9 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	 * has already processed (stripe_index < sctx->current_stripe) are safe
 	 * because the scrubber will not revisit them.
 	 */
-	if (ec->scrub_ctx != NULL) {
-		struct ec_scrub_ctx *sctx        = ec->scrub_ctx;
-		uint64_t             stripe_idx  = ec_io->offset_blocks / ec->stripe_blocks;
-		uint32_t             region      = ec_wib_stripe_to_region(stripe_idx);
-
-		if (region == sctx->current_region &&
-		    stripe_idx >= sctx->current_stripe) {
-			ec->full_stripe_writes_deferred++;
-			return -EAGAIN;
-		}
-		if (region > sctx->current_region &&
-		    ec_wib_region_is_dirty(ec, region)) {
-			ec->full_stripe_writes_deferred++;
-			return -EAGAIN;
-		}
+	if (ec_scrub_blocks_stripe(ec, ec_io->offset_blocks / ec->stripe_blocks)) {
+		ec->full_stripe_writes_deferred++;
+		return -EAGAIN;
 	}
 
 	/*
@@ -1426,18 +1414,8 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	 * (stripe_index < sctx->current_stripe) are safe -- the scrubber
 	 * will not revisit them.
 	 */
-	if (ec->scrub_ctx != NULL) {
-		struct ec_scrub_ctx *sctx   = ec->scrub_ctx;
-		uint32_t             region = ec_wib_stripe_to_region(stripe_idx);
-
-		if (region == sctx->current_region &&
-		    stripe_idx >= sctx->current_stripe) {
-			return -EAGAIN;
-		}
-		if (region > sctx->current_region &&
-		    ec_wib_region_is_dirty(ec, region)) {
-			return -EAGAIN;
-		}
+	if (ec_scrub_blocks_stripe(ec, stripe_idx)) {
+		return -EAGAIN;
 	}
 
 	/* 1. Claim stripe-busy. */

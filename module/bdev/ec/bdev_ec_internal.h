@@ -1167,6 +1167,39 @@ ec_wib_region_clear_dirty(struct ec_bdev *ec, uint32_t region)
 }
 
 /*
+ * Returns true if a parity-modifying write to stripe_idx must defer
+ * because the startup scrub still owns it:
+ *   - current region, at-or-after the scrubber, or
+ *   - a region ahead of the scrubber that is still on-disk dirty.
+ *
+ * Stripes the scrubber has already passed are safe. Returns false when
+ * no scrub is active. Pure predicate; each caller bumps its own
+ * deferred counter.
+ */
+static inline bool
+ec_scrub_blocks_stripe(const struct ec_bdev *ec, uint64_t stripe_idx)
+{
+	struct ec_scrub_ctx *sctx = ec->scrub_ctx;
+	uint32_t             region;
+
+	if (sctx == NULL) {
+		return false;
+	}
+
+	region = ec_wib_stripe_to_region(stripe_idx);
+
+	if (region == sctx->current_region &&
+	    stripe_idx >= sctx->current_stripe) {
+		return true;
+	}
+	if (region > sctx->current_region &&
+	    ec_wib_region_is_dirty(ec, region)) {
+		return true;
+	}
+	return false;
+}
+
+/*
  * Bracket the in-flight write counter for a single WIB region. Two
  * paths inc it: ec_submit_rmw_write (sub-stripe RMW) and
  * ec_submit_full_write (full-stripe write). Each inc must be

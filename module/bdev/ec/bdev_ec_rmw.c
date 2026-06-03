@@ -736,21 +736,10 @@ ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
 	 * correct parity with stale parity. Result: new data, old parity
 	 * -- exactly the write-hole the WIB exists to prevent.
 	 */
-	if (ec->scrub_ctx != NULL) {
-		struct ec_scrub_ctx *sctx = ec->scrub_ctx;
-
-		if (region == sctx->current_region &&
-		    stripe_index >= sctx->current_stripe) {
-			ec->rmw_deferred_scrub++;
-			ec_rmw_backpressure_begin(ec, "scrub active");
-			return -EAGAIN;
-		}
-		if (region > sctx->current_region &&
-		    ec_wib_region_is_dirty(ec, region)) {
-			ec->rmw_deferred_scrub++;
-			ec_rmw_backpressure_begin(ec, "scrub active");
-			return -EAGAIN;
-		}
+	if (ec_scrub_blocks_stripe(ec, stripe_index)) {
+		ec->rmw_deferred_scrub++;
+		ec_rmw_backpressure_begin(ec, "scrub active");
+		return -EAGAIN;
 	}
 
 	/*
