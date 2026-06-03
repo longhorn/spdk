@@ -89,6 +89,60 @@ ec_rebuild_free_resources(struct ec_rebuild_ctx *ctx)
 }
 
 /*
+ * Reconstruct any unreadable data chunks, then re-encode all m parity
+ * chunks into chunk_bufs[k..n-1].
+ *
+ * A data slot that is REPLACING (rebuild) or FAILED (scrub) was skipped
+ * on the read phase and still holds stale bytes; encoding from those
+ * would land wrong parity on disk. Reconstruct first.
+ *
+ * Returns 0 on success; negative rc from ec_reconstruct_multi_data on
+ * failure (chunk_bufs untouched). Caller logs and aborts the stripe.
+ */
+static int
+ec_reencode_parity_from_chunk_bufs(const struct ec_bdev *ec,
+				   uint8_t *chunk_bufs[EC_MAX_BASE_BDEVS],
+				   uint64_t chunk_bytes)
+{
+	uint8_t *data_ptrs[EC_MAX_BASE_BDEVS];
+	uint8_t *parity_ptrs[EC_MAX_BASE_BDEVS];
+	uint32_t failed_data_slots[EC_MAX_BASE_BDEVS];
+	uint8_t *failed_out_bufs[EC_MAX_BASE_BDEVS];
+	uint32_t num_failed = 0;
+	uint32_t i;
+	int      rc;
+
+	for (i = 0; i < ec->k; i++) {
+		if (!ec_slot_is_readable(ec, i)) {
+			failed_data_slots[num_failed] = i;
+			failed_out_bufs[num_failed]   = chunk_bufs[i];
+			num_failed++;
+		}
+	}
+
+	if (num_failed > 0) {
+		rc = ec_reconstruct_multi_data(ec, chunk_bufs, failed_out_bufs,
+					       failed_data_slots, num_failed,
+					       chunk_bytes);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	for (i = 0; i < ec->k; i++) {
+		data_ptrs[i] = chunk_bufs[i];
+	}
+	for (i = 0; i < ec->m; i++) {
+		parity_ptrs[i] = chunk_bufs[ec->k + i];
+	}
+
+	ec_encode_data((int)chunk_bytes, (int)ec->k, (int)ec->m,
+		       ec->g_tbls, data_ptrs, parity_ptrs);
+
+	return 0;
+}
+
+/*
  * ec_rebuild_finish  [terminal step for success and failure]
  *
  * Finalises the rebuild:
@@ -384,82 +438,33 @@ ec_rebuild_reconstruct_write(struct ec_rebuild_ctx *ctx)
 		}
 	} else {
 		/*
-		 * PARITY slot: re-encode from all k data chunks.
+		 * PARITY slot: re-encode from all k data chunks. We compute
+		 * all m parity chunks (cheap; ec_encode_data does both in one
+		 * pass) but only write the target slot; the extra m-1 land in
+		 * the other parity slots' scratch buffers.
 		 *
-		 * parity_col = slot - k  (which parity column to compute)
-		 *
-		 * We compute all m parity chunks but only write the target.
-		 * The extra m-1 chunks land in chunk_bufs of the other parity
-		 * slots (allocated anyway, used as scratch here).
-		 *
-		 * Multi-failure rebuild corner case.
-		 * When a DATA slot is also REPLACING (rebuilt in an earlier
-		 * pass of this session), it was not included in the read phase
-		 * (ec_slot_is_readable returns false for REPLACING). Its
-		 * chunk_bufs entry is therefore zero-initialised, which would
-		 * cause ec_encode_data to produce wrong parity.
-		 *
-		 * Detect this by checking all data slots: if any are not
-		 * readable, reconstruct their data first from the k NORMAL
-		 * survivors already in chunk_bufs, then re-encode.
-		 *
-		 * ec_rebuild_finish transitions ALL rebuilt slots to NORMAL
-		 * only once the entire rebuild is done, so a DATA slot that
-		 * finished earlier in this same session is still REPLACING
-		 * here -- making this guard necessary.
+		 * Multi-failure rebuild corner case: a DATA slot that is also
+		 * REPLACING (rebuilt in an earlier pass of this session) was
+		 * skipped on the read phase and its chunk_bufs entry is still
+		 * zeroed. ec_reencode_parity_from_chunk_bufs reconstructs any
+		 * such gap from the k NORMAL survivors before encoding so
+		 * the parity it computes matches the true stripe content.
+		 * ec_rebuild_finish only transitions rebuilt slots to NORMAL
+		 * once the whole rebuild is done, so a slot that finished
+		 * earlier in this same session is still REPLACING here --
+		 * which is what makes the guard necessary.
 		 */
-		uint8_t *data_ptrs[EC_MAX_BASE_BDEVS];
-		uint8_t *parity_ptrs[EC_MAX_BASE_BDEVS];
-		uint32_t failed_data_slots[EC_MAX_BASE_BDEVS];
-		uint8_t *failed_out_bufs[EC_MAX_BASE_BDEVS];
-		uint32_t num_failed = 0;
-		uint32_t j;
-
-		for (j = 0; j < ec->k; j++) {
-			if (!ec_slot_is_readable(ec, j)) {
-				failed_data_slots[num_failed] = j;
-				failed_out_bufs[num_failed]   = ctx->chunk_bufs[j];
-				num_failed++;
-			}
+		rc = ec_reencode_parity_from_chunk_bufs(ec, ctx->chunk_bufs,
+							ctx->chunk_bytes);
+		if (rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: rebuild parity slot %u "
+				    "-- multi-data reconstruction failed "
+				    "at stripe %" PRIu64 " (rc=%d)\n",
+				    ec->bdev.name, slot,
+				    ctx->current_stripe, rc);
+			ec_rebuild_finish(ctx, -EIO);
+			return;
 		}
-
-		if (num_failed > 0) {
-			/*
-			 * Reconstruct all unreadable data chunks in a single
-			 * matrix invert + ec_encode_data call -- strictly more
-			 * efficient than a per-chunk loop, and identical output
-			 * (RS decode is deterministic).
-			 */
-			rc = ec_reconstruct_multi_data(ec,
-						       ctx->chunk_bufs,
-						       failed_out_bufs,
-						       failed_data_slots,
-						       num_failed,
-						       ctx->chunk_bytes);
-			if (rc != 0) {
-				SPDK_ERRLOG("EC bdev %s: rebuild parity slot %u "
-					    "-- multi-data reconstruction (num_failed=%u) "
-					    "failed at stripe %" PRIu64 "\n",
-					    ec->bdev.name, slot, num_failed,
-					    ctx->current_stripe);
-				ec_rebuild_finish(ctx, -EIO);
-				return;
-			}
-		}
-
-		for (j = 0; j < ec->k; j++) {
-			data_ptrs[j] = ctx->chunk_bufs[j];
-		}
-		for (j = 0; j < ec->m; j++) {
-			parity_ptrs[j] = ctx->chunk_bufs[ec->k + j];
-		}
-
-		ec_encode_data((int)ctx->chunk_bytes,
-			       (int)ec->k,
-			       (int)ec->m,
-			       ec->g_tbls,
-			       data_ptrs,
-			       parity_ptrs);
 	}
 
 	/* Submit the write to the REPLACING disk */
@@ -1067,63 +1072,27 @@ ec_scrub_reads_done(struct ec_scrub_ctx *sctx)
 {
 	struct ec_bdev  *ec         = sctx->ec;
 	uint64_t         disk_lba   = ec_stripe_base_lba(ec, sctx->current_stripe);
-	uint8_t         *data_ptrs[EC_MAX_BASE_BDEVS];
-	uint8_t         *parity_ptrs[EC_MAX_BASE_BDEVS];
 	uint32_t         i;
 	uint32_t         writable_parity = 0;
-	uint32_t         failed_data_slots[EC_MAX_BASE_BDEVS];
-	uint8_t         *failed_out_bufs[EC_MAX_BASE_BDEVS];
-	uint32_t         num_failed = 0;
 	int              rc;
 
 	/*
-	 * If a data disk failed mid-scrub, its chunk_bufs entry was not read
-	 * this stripe (ec_scrub_submit_reads skips unreadable slots) and still
-	 * holds stale data from an earlier stripe. Encoding parity from it
-	 * would write corrupt parity, so reconstruct any unreadable data chunk
-	 * from the k survivors first -- same approach as
-	 * ec_rebuild_reconstruct_write.
+	 * Reconstruct any unreadable data chunks first, then re-encode all m
+	 * parity chunks into chunk_bufs[k..n-1]. Shared with the rebuild
+	 * parity branch -- both must guarantee every data slot holds the
+	 * correct payload before encoding parity, or the parity write below
+	 * lands corrupt bytes on disk.
 	 */
-	for (i = 0; i < ec->k; i++) {
-		if (!ec_slot_is_readable(ec, i)) {
-			failed_data_slots[num_failed] = i;
-			failed_out_bufs[num_failed]   = sctx->chunk_bufs[i];
-			num_failed++;
-		}
+	rc = ec_reencode_parity_from_chunk_bufs(ec, sctx->chunk_bufs,
+						sctx->chunk_bytes);
+	if (rc != 0) {
+		SPDK_WARNLOG("EC bdev %s: scrub -- multi-data reconstruction "
+			     "failed at stripe %" PRIu64 " (rc=%d); skipping\n",
+			     ec->bdev.name, sctx->current_stripe, rc);
+		sctx->current_stripe++;
+		sctx->io_in_flight = false;
+		return;
 	}
-	if (num_failed > 0) {
-		rc = ec_reconstruct_multi_data(ec,
-					       sctx->chunk_bufs,
-					       failed_out_bufs,
-					       failed_data_slots,
-					       num_failed,
-					       sctx->chunk_bytes);
-		if (rc != 0) {
-			SPDK_WARNLOG("EC bdev %s: scrub -- multi-data "
-				     "reconstruction (num_failed=%u) failed at "
-				     "stripe %" PRIu64 "; skipping\n",
-				     ec->bdev.name, num_failed,
-				     sctx->current_stripe);
-			sctx->current_stripe++;
-			sctx->io_in_flight = false;
-			return;
-		}
-	}
-
-	/* Re-encode parity from k data chunks */
-	for (i = 0; i < ec->k; i++) {
-		data_ptrs[i] = sctx->chunk_bufs[i];
-	}
-	for (i = 0; i < ec->m; i++) {
-		parity_ptrs[i] = sctx->chunk_bufs[ec->k + i];
-	}
-
-	ec_encode_data((int)sctx->chunk_bytes,
-		       (int)ec->k,
-		       (int)ec->m,
-		       ec->g_tbls,
-		       data_ptrs,
-		       parity_ptrs);
 
 	/* Count writable parity slots */
 	for (i = 0; i < ec->m; i++) {
