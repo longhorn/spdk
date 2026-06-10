@@ -212,6 +212,13 @@ ec_wib_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 	free(pctx);
 
 	/*
+	 * Release any deferred slot channels before kicking the follow-up
+	 * persist below -- otherwise sustained WIB churn would keep restarting
+	 * the persist and starve the cleanup. Never frees ec.
+	 */
+	ec_drain_deferred_slot_releases(ec);
+
+	/*
 	 * If a new dirty bit was set while this persist was in flight,
 	 * start a follow-up persist so the bit reaches disk.
 	 * Deferred writes are drained only once no repersist is needed.
@@ -231,6 +238,14 @@ ec_wib_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		 */
 		ec_wib_deferred_drain(ec, persist_status);
 	}
+
+	/*
+	 * Last statement: finish a deferred delete. In that case this frees ec,
+	 * so nothing may touch ec after this call. Only the async write
+	 * completion drains -- the sync-finish path runs nested inside
+	 * ec_wib_persist and never coincides with a pending deferral.
+	 */
+	ec_drain_deferred_unregister(ec);
 }
 
 /*

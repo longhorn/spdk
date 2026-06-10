@@ -365,6 +365,51 @@ ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 	spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
 }
 
+/* True while a WIB or bitmap persist still has writes outstanding. */
+static inline bool
+ec_persist_in_flight(const struct ec_bdev *ec)
+{
+	return ec->wib_persist_in_flight || ec->bitmap_persist_in_flight;
+}
+
+/*
+ * Release the home-thread channels a single slot holds: its WIB channel
+ * (parity slots only), its bitmap channel, and any live scrub / rebuild
+ * channel. Each is NULL-checked, so this is safe to call once per slot
+ * regardless of which channels that slot actually opened.
+ *
+ * Caller must ensure no persist write is outstanding on the WIB / bitmap
+ * channels (see ec_persist_in_flight and the deferral in
+ * ec_handle_base_bdev_failure) -- putting a channel with I/O still in
+ * flight trips the bdev-layer io_outstanding assert.
+ */
+static void
+ec_release_slot_dedicated_channels(struct ec_bdev *ec, uint32_t slot)
+{
+	if (slot >= ec->k) {
+		uint32_t parity_idx = slot - ec->k;
+		if (ec->wib_chans[parity_idx]) {
+			spdk_put_io_channel(ec->wib_chans[parity_idx]);
+			ec->wib_chans[parity_idx] = NULL;
+		}
+	}
+
+	if (ec->bitmap_chans[slot]) {
+		spdk_put_io_channel(ec->bitmap_chans[slot]);
+		ec->bitmap_chans[slot] = NULL;
+	}
+
+	if (ec->scrub_ctx != NULL && ec->scrub_ctx->scrub_chans[slot] != NULL) {
+		spdk_put_io_channel(ec->scrub_ctx->scrub_chans[slot]);
+		ec->scrub_ctx->scrub_chans[slot] = NULL;
+	}
+
+	if (ec->rebuild_ctx != NULL && ec->rebuild_ctx->rebuild_chans[slot] != NULL) {
+		spdk_put_io_channel(ec->rebuild_ctx->rebuild_chans[slot]);
+		ec->rebuild_ctx->rebuild_chans[slot] = NULL;
+	}
+}
+
 /* =========================================================================
  * Failure detection
  * ========================================================================= */
@@ -424,47 +469,27 @@ ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
 			}
 
 			/*
-			 * Release WIB channel so the base bdev refcount drains.
+			 * Release this slot's dedicated channels, then start the
+			 * async quiesce/reset/close. Defer both if a persist write
+			 * is still outstanding on the slot's WIB / bitmap channel --
+			 * releasing then would trip the bdev-layer io_outstanding
+			 * assert. The slot is already FAILED, so reads degrade
+			 * regardless of when the channels are freed.
+			 *
+			 * The deferral holds the base descriptor open only briefly:
+			 * the stuck write is aborted at ctrlr-loss, the same event
+			 * as this REMOVE, and its completion resumes the release.
 			 */
-			if (i >= ec->k) {
-				uint32_t parity_idx = i - ec->k;
-				if (ec->wib_chans[parity_idx]) {
-					spdk_put_io_channel(ec->wib_chans[parity_idx]);
-					ec->wib_chans[parity_idx] = NULL;
-				}
-			}
-
-			/*
-			 * Release bitmap channel for this slot so the base bdev
-			 * refcount drains. The bitmap touches every disk, so
-			 * every slot has a bitmap channel (not just parity).
-			 */
-			if (ec->bitmap_chans[i]) {
-				spdk_put_io_channel(ec->bitmap_chans[i]);
-				ec->bitmap_chans[i] = NULL;
-			}
-
-			/* Release scrub channel so the base bdev refcount drains. */
-			if (ec->scrub_ctx != NULL &&
-			    ec->scrub_ctx->scrub_chans[i] != NULL) {
-				SPDK_NOTICELOG("EC bdev %s: releasing scrub "
-					       "channel for failed slot %u\n",
+			if (ec_persist_in_flight(ec)) {
+				ec->dedicated_release_pending[i] = true;
+				SPDK_NOTICELOG("EC bdev %s: slot %u channel "
+					       "release deferred behind an "
+					       "in-flight persist\n",
 					       ec->bdev.name, i);
-				spdk_put_io_channel(ec->scrub_ctx->scrub_chans[i]);
-				ec->scrub_ctx->scrub_chans[i] = NULL;
+				return;
 			}
 
-			/* Release rebuild channel similarly. */
-			if (ec->rebuild_ctx != NULL &&
-			    ec->rebuild_ctx->rebuild_chans[i] != NULL) {
-				SPDK_NOTICELOG("EC bdev %s: releasing rebuild "
-					       "channel for failed slot %u\n",
-					       ec->bdev.name, i);
-				spdk_put_io_channel(
-					ec->rebuild_ctx->rebuild_chans[i]);
-				ec->rebuild_ctx->rebuild_chans[i] = NULL;
-			}
-
+			ec_release_slot_dedicated_channels(ec, i);
 			ec_start_base_bdev_cleanup(ec, i);
 			return;
 		}
@@ -1512,11 +1537,16 @@ ec_release_dedicated_channels(struct ec_bdev *ec)
 	}
 }
 
+/*
+ * Tail of device-unregister teardown: release dedicated channels, abort any
+ * startup scrub, close base descriptors, complete the destruct protocol, and
+ * free the ec_bdev. Split out so the deferred path (a persist was still in
+ * flight when the unregister callback fired) can re-enter here from the
+ * persist drain.
+ */
 static void
-ec_device_unregister_done(void *io_device)
+ec_finish_device_unregister(struct ec_bdev *ec)
 {
-	struct ec_bdev *ec = io_device;
-
 	ec_release_dedicated_channels(ec);
 
 	/* Abort any in-progress startup scrub. */
@@ -1543,6 +1573,79 @@ ec_device_unregister_done(void *io_device)
 		spdk_bdev_destruct_done(&ec->bdev, 0);
 	}
 	ec_bdev_free(ec);
+}
+
+static void
+ec_device_unregister_done(void *io_device)
+{
+	struct ec_bdev *ec = io_device;
+
+	/*
+	 * A persist may still have a write outstanding on a WIB / bitmap
+	 * channel; releasing those channels now would trip the bdev-layer
+	 * io_outstanding assert. Defer the rest of teardown until the persist
+	 * drains (ec_drain_deferred_unregister resumes it).
+	 */
+	if (ec_persist_in_flight(ec)) {
+		ec->unregister_release_pending = true;
+		return;
+	}
+
+	ec_finish_device_unregister(ec);
+}
+
+/*
+ * Release dedicated channels for slots whose failure cleanup was deferred
+ * behind an in-flight persist, and start their async cleanup. Never frees ec,
+ * so a completion may call this before kicking its follow-up persist -- which
+ * is what keeps sustained WIB churn on the surviving disks from starving the
+ * cleanup. A released slot is simply skipped by the next persist (the submit
+ * loops NULL-check channels).
+ *
+ * Skipped entirely while a delete is pending: ec_finish_device_unregister
+ * releases every channel itself, and starting a per-slot quiesce against a
+ * bdev whose unregister is about to free ec would fire the quiesce callback
+ * on freed memory.
+ */
+void
+ec_drain_deferred_slot_releases(struct ec_bdev *ec)
+{
+	uint32_t i;
+
+	if (ec_persist_in_flight(ec) || ec->unregister_release_pending) {
+		return;
+	}
+
+	for (i = 0; i < ec->n; i++) {
+		if (ec->dedicated_release_pending[i]) {
+			ec->dedicated_release_pending[i] = false;
+			ec_release_slot_dedicated_channels(ec, i);
+			ec_start_base_bdev_cleanup(ec, i);
+		}
+	}
+}
+
+/*
+ * Finish a device-unregister that was deferred behind an in-flight persist.
+ * Frees ec, so the caller MUST treat this as its last statement. The unregister
+ * tail releases every dedicated channel and closes every base descriptor, so
+ * any pending per-slot release is redundant -- clear those flags and skip the
+ * per-slot cleanup, which would otherwise quiesce a bdev that is being freed.
+ */
+void
+ec_drain_deferred_unregister(struct ec_bdev *ec)
+{
+	uint32_t i;
+
+	if (ec_persist_in_flight(ec) || !ec->unregister_release_pending) {
+		return;
+	}
+
+	ec->unregister_release_pending = false;
+	for (i = 0; i < ec->n; i++) {
+		ec->dedicated_release_pending[i] = false;
+	}
+	ec_finish_device_unregister(ec);
 }
 
 static int

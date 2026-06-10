@@ -620,6 +620,19 @@ struct ec_bdev {
 	bool                     bitmap_persist_in_flight;
 
 	/*
+	 * Deferred dedicated-channel teardown. A persist write to a failing
+	 * disk can sit outstanding on wib_chans[] / bitmap_chans[] for the full
+	 * NVMe-oF ctrlr-loss timeout, so a base-bdev REMOVE (or a delete) can
+	 * arrive while that write is still in flight. Putting the channel then
+	 * would trip the bdev-layer io_outstanding assert. These flags defer the
+	 * release until the persist drains. The failure handler, the destruct
+	 * callback, and both persist completions all run on home, so no locking
+	 * is needed.
+	 */
+	bool                     dedicated_release_pending[EC_MAX_BASE_BDEVS];
+	bool                     unregister_release_pending;
+
+	/*
 	 * Bit-clear waiter queue (write-into-unmapped path).
 	 *
 	 * Each entry represents one stripe whose unmapped bit needs to be
@@ -1583,6 +1596,16 @@ int ec_submit_bit_clear_async(struct ec_bdev *ec, uint64_t stripe_index,
  * caller use.
  */
 void ec_bit_clear_flush_if_pending(struct ec_bdev *ec);
+
+/*
+ * Defined in bdev_ec.c; called from the WIB and bitmap persist completions
+ * to resume dedicated-channel teardown deferred behind a persist. Two halves:
+ * slot releases run before the completion kicks its follow-up persist (never
+ * free ec); the unregister tail runs as the completion's last statement (frees
+ * ec in the delete case).
+ */
+void ec_drain_deferred_slot_releases(struct ec_bdev *ec);
+void ec_drain_deferred_unregister(struct ec_bdev *ec);
 
 /* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
 int ec_reconstruct_data_chunk(const struct ec_bdev *ec,

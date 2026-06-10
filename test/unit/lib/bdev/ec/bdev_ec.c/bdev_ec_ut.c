@@ -804,6 +804,113 @@ test_resize_wib_reset_on_grow(void)
 	ec_free_runtime_arrays(&ec);
 }
 
+/*
+ * Unit coverage: deferred dedicated-channel teardown.
+ *
+ * A persist write to a failing disk can sit outstanding on a WIB /
+ * bitmap channel for the full NVMe-oF ctrlr-loss timeout, so a slot
+ * failure can race an in-flight persist. Releasing the channel then
+ * trips the bdev-layer io_outstanding assert. These tests pin the
+ * release helper and the in-flight gate that defers it.
+ */
+
+static void
+test_dedicated_channel_release(void)
+{
+	struct ec_bdev          ec;
+	struct spdk_io_channel *fake = (struct spdk_io_channel *)0x1;
+	int                     rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	/* Parity slot 5 (>= k=4): owns WIB channel parity_idx 1 and a bitmap
+	 * channel. Both must be released. */
+	ec.wib_chans[5 - 4] = fake;
+	ec.bitmap_chans[5]  = fake;
+	ec_release_slot_dedicated_channels(&ec, 5);
+	CU_ASSERT(ec.wib_chans[1] == NULL);
+	CU_ASSERT(ec.bitmap_chans[5] == NULL);
+
+	/* Data slot 2 (< k): bitmap channel only; it must not touch any WIB
+	 * channel (those belong to parity slots). */
+	ec.bitmap_chans[2] = fake;
+	ec.wib_chans[0]    = fake;
+	ec_release_slot_dedicated_channels(&ec, 2);
+	CU_ASSERT(ec.bitmap_chans[2] == NULL);
+	CU_ASSERT(ec.wib_chans[0] == fake);
+}
+
+static void
+test_dedicated_release_deferred_gate(void)
+{
+	struct ec_bdev          ec;
+	struct spdk_io_channel *fake = (struct spdk_io_channel *)0x1;
+	int                     rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	ec.wib_chans[5 - 4] = fake;
+	ec.bitmap_chans[5]  = fake;
+	ec.dedicated_release_pending[5] = true;
+
+	/* Bitmap persist in flight: drain must not release the channels. */
+	ec.bitmap_persist_in_flight = true;
+	ec_drain_deferred_slot_releases(&ec);
+	CU_ASSERT(ec.bitmap_chans[5] == fake);
+	CU_ASSERT(ec.wib_chans[1] == fake);
+	CU_ASSERT(ec.dedicated_release_pending[5] == true);
+
+	/* WIB persist still in flight: still gated. */
+	ec.bitmap_persist_in_flight = false;
+	ec.wib_persist_in_flight    = true;
+	ec_drain_deferred_slot_releases(&ec);
+	CU_ASSERT(ec.bitmap_chans[5] == fake);
+	CU_ASSERT(ec.dedicated_release_pending[5] == true);
+
+	/* Both idle: the deferred release fires. */
+	ec.wib_persist_in_flight = false;
+	ec_drain_deferred_slot_releases(&ec);
+	CU_ASSERT(ec.bitmap_chans[5] == NULL);
+	CU_ASSERT(ec.wib_chans[1] == NULL);
+	CU_ASSERT(ec.dedicated_release_pending[5] == false);
+}
+
+/*
+ * When a slot release and a delete are both pending, the per-slot path must
+ * stand down -- the delete teardown releases every channel itself, and a
+ * per-slot quiesce against a bdev whose unregister is about to free ec would
+ * fire the quiesce callback on freed memory. Pin that the slot drain is a
+ * no-op while unregister is pending, even with persists idle.
+ */
+static void
+test_dedicated_release_unregister_precedence(void)
+{
+	struct ec_bdev          ec;
+	struct spdk_io_channel *fake = (struct spdk_io_channel *)0x1;
+	int                     rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	ec.bitmap_chans[5]  = fake;
+	ec.wib_chans[5 - 4] = fake;
+	ec.dedicated_release_pending[5] = true;
+	ec.unregister_release_pending   = true;
+
+	/* Persists idle, but a delete is pending: the slot path must not run
+	 * (otherwise it would quiesce a bdev the unregister tail is about to
+	 * free). The unregister tail will release these channels instead. */
+	ec_drain_deferred_slot_releases(&ec);
+	CU_ASSERT(ec.bitmap_chans[5] == fake);
+	CU_ASSERT(ec.wib_chans[1] == fake);
+	CU_ASSERT(ec.dedicated_release_pending[5] == true);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -831,6 +938,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_bitmap_validate_accepts_smaller);
 
 	CU_ADD_TEST(suite, test_resize_wib_reset_on_grow);
+
+	CU_ADD_TEST(suite, test_dedicated_channel_release);
+	CU_ADD_TEST(suite, test_dedicated_release_deferred_gate);
+	CU_ADD_TEST(suite, test_dedicated_release_unregister_precedence);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

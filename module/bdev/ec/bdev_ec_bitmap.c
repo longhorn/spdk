@@ -396,6 +396,13 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 	ec->bitmap_persist_in_flight = false;
 
 	/*
+	 * Release any deferred slot channels before the follow-up persist kick
+	 * below -- otherwise a steady stream of bit-clears would keep restarting
+	 * the persist and starve the cleanup. Never frees ec.
+	 */
+	ec_drain_deferred_slot_releases(ec);
+
+	/*
 	 * If write-into-unmapped completions queued bit-clears while this
 	 * persist was in flight (whether THIS persist was their kick or it
 	 * was somebody else's, e.g., UNMAP), fire a single follow-up
@@ -430,6 +437,12 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 
 	spdk_dma_free(ctx->dma_buf);
 	free(ctx);
+
+	/*
+	 * Last statement: finish a deferred delete. In that case this frees ec,
+	 * so nothing may touch ec after this call.
+	 */
+	ec_drain_deferred_unregister(ec);
 }
 
 /*
