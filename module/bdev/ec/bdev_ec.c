@@ -798,6 +798,12 @@ ec_compute_geometry(struct ec_bdev *ec)
 	 * This is guaranteed for any realistic strip size / disk size combination,
 	 * but we check explicitly to catch edge cases (very small strips on very
 	 * large disks) before silently producing a too-small buffer.
+	 *
+	 * This word-granular check and ec_max_num_stripes are the same ceiling
+	 * (both round the region bitmap up to whole words): passing it means
+	 * num_stripes <= ec_max_num_stripes, which also keeps the unmapped-bitmap
+	 * I/O within its reserved slot (see ec_bitmap_slot_io_blocks). Resize
+	 * checks ec_max_num_stripes directly, since it does not run this path.
 	 */
 	map_bytes_needed = ((uint64_t)EC_BITMAP_WORDS(ec->wib_num_regions))
 			    * sizeof(uint64_t);

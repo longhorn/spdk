@@ -487,6 +487,21 @@ ec_bdev_resize(const char *ec_name,
 		return -EALREADY;
 	}
 
+	/*
+	 * The front reservations are sized for ec_max_num_stripes; growing past
+	 * it would overrun the one-strip WIB buffer and the bitmap slots into
+	 * user data. ec_compute_geometry rejects this at create via the
+	 * WIB-fits-one-strip check, but resize computes geometry directly and
+	 * must enforce the same ceiling.
+	 */
+	if (new_num_stripes > ec_max_num_stripes(ec)) {
+		SPDK_ERRLOG("EC bdev %s: resize -- new stripe count %" PRIu64 " exceeds "
+			    "the max %" PRIu64 " the front metadata was reserved for; "
+			    "create with a larger strip_size_kb for volumes this large\n",
+			    ec_name, new_num_stripes, ec_max_num_stripes(ec));
+		return -ERANGE;
+	}
+
 	/* Step 5: Compute new geometry */
 	new_blockcnt = new_num_stripes * ec->stripe_blocks;
 

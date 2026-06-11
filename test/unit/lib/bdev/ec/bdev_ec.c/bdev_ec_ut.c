@@ -155,7 +155,9 @@ ut_expected_reservation(uint32_t strip_size_blocks)
 	uint64_t strip_bytes = (uint64_t)strip_size_blocks * UT_BLOCKLEN;
 	uint64_t wib_payload_bytes = strip_bytes - sizeof(struct ec_wib_header)
 				     - sizeof(uint32_t);
-	uint64_t max_num_stripes = wib_payload_bytes * 8 * EC_WIB_REGION_STRIPES;
+	/* Word-granular: the region bitmap is written in whole uint64_t words. */
+	uint64_t max_regions = (wib_payload_bytes / sizeof(uint64_t)) * 64;
+	uint64_t max_num_stripes = max_regions * EC_WIB_REGION_STRIPES;
 	uint64_t blob_bytes = sizeof(struct ec_bitmap_header)
 			      + EC_BITMAP_WORDS(max_num_stripes) * sizeof(uint64_t)
 			      + sizeof(uint32_t);
@@ -911,6 +913,70 @@ test_dedicated_release_unregister_precedence(void)
 	CU_ASSERT(ec.dedicated_release_pending[5] == true);
 }
 
+/*
+ * The bitmap slot I/O extent must never exceed one reserved slot, or a persist
+ * would write past it into the WIB strips and user data. At the ceiling
+ * (num_stripes == ec_max_num_stripes) the invariant must still hold -- this is
+ * what ec_compute_geometry / ec_bdev_resize keep true and the assert in
+ * ec_bitmap_slot_io_blocks backstops.
+ */
+static void
+test_bitmap_slot_io_within_reserved(void)
+{
+	struct ec_bdev ec;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	CU_ASSERT(ec_max_num_stripes(&ec) > 0);
+
+	/* At the live geometry. */
+	CU_ASSERT(ec_bitmap_slot_io_blocks(&ec) <=
+		  ec_bitmap_slot_reserved_blocks(&ec));
+
+	/* At the ceiling -- the boundary the reservation is sized for. */
+	ec.num_stripes = ec_max_num_stripes(&ec);
+	CU_ASSERT(ec_bitmap_slot_io_blocks(&ec) <=
+		  ec_bitmap_slot_reserved_blocks(&ec));
+}
+
+/*
+ * The serialized WIB (header + region words + CRC) must fit one strip at the
+ * ceiling, and one region past it must not. Pins that ec_max_num_stripes is
+ * the exact word-granular bound ec_wib_fill_buf relies on -- a bit-granular
+ * bound would admit a geometry whose extra word overruns wib_buf. (ut does
+ * not link bdev_ec_wib.c, so the check mirrors ec_wib_fill_buf's layout math.)
+ */
+static void
+test_wib_fits_strip_at_ceiling(void)
+{
+	struct ec_bdev ec;
+	uint64_t       strip_bytes, max_stripes, regions, wib_bytes;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	strip_bytes = (uint64_t)ec.strip_size * ec.bdev.blocklen;
+	max_stripes = ec_max_num_stripes(&ec);
+
+	regions   = (max_stripes + EC_WIB_REGION_STRIPES - 1) / EC_WIB_REGION_STRIPES;
+	wib_bytes = sizeof(struct ec_wib_header)
+		    + (uint64_t)EC_BITMAP_WORDS(regions) * sizeof(uint64_t)
+		    + sizeof(uint32_t);
+	CU_ASSERT(wib_bytes <= strip_bytes);
+
+	/* One region past the ceiling overflows -- the bound is tight. */
+	regions  += 1;
+	wib_bytes = sizeof(struct ec_wib_header)
+		    + (uint64_t)EC_BITMAP_WORDS(regions) * sizeof(uint64_t)
+		    + sizeof(uint32_t);
+	CU_ASSERT(wib_bytes > strip_bytes);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -942,6 +1008,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_dedicated_channel_release);
 	CU_ADD_TEST(suite, test_dedicated_release_deferred_gate);
 	CU_ADD_TEST(suite, test_dedicated_release_unregister_precedence);
+	CU_ADD_TEST(suite, test_bitmap_slot_io_within_reserved);
+	CU_ADD_TEST(suite, test_wib_fits_strip_at_ceiling);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

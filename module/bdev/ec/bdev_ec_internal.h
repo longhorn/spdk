@@ -1415,6 +1415,12 @@ uint64_t ec_bitmap_blob_bytes(uint64_t num_stripes);
 uint64_t ec_bitmap_reservation_stripes(const struct ec_bdev *ec);
 
 /*
+ * Largest user stripe count the WIB can track in one strip -- the ceiling
+ * the front reservations are sized for. num_stripes must never exceed it.
+ */
+uint64_t ec_max_num_stripes(const struct ec_bdev *ec);
+
+/*
  * ec_bitmap_fill_buf -- serialize source_map into buf as a complete
  * on-disk blob (header + span + CRC32C). source_map must hold at least
  * EC_BITMAP_WORDS(ec->num_stripes) uint64_t words; buf must hold at

@@ -36,6 +36,8 @@
 #include "spdk/string.h"
 #include "spdk/thread.h"
 
+#include <assert.h>
+
 /* =========================================================================
  * Write-Intent Bitmap (WIB) helpers
  * ========================================================================= */
@@ -80,7 +82,17 @@ ec_wib_fill_buf(struct ec_bdev *ec)
 	struct ec_wib_header *hdr = (struct ec_wib_header *)ec->wib_buf;
 	uint64_t             *bits;
 	uint32_t              map_words = EC_BITMAP_WORDS(ec->wib_num_regions);
+	uint64_t              strip_bytes = (uint64_t)ec->strip_size * ec->bdev.blocklen;
 	uint32_t             *crc_ptr;
+
+	/*
+	 * The serialized WIB (header + region words + CRC) must fit in the
+	 * one-strip wib_buf. ec_max_num_stripes bounds num_stripes -- and thus
+	 * wib_num_regions -- so this always holds; assert to catch a geometry
+	 * that slipped past the create / resize ceiling checks.
+	 */
+	assert(sizeof(struct ec_wib_header) + (uint64_t)map_words * sizeof(uint64_t)
+	       + sizeof(uint32_t) <= strip_bytes);
 
 	hdr->magic       = EC_WIB_MAGIC;
 	hdr->version     = EC_WIB_VERSION;

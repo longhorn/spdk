@@ -60,50 +60,60 @@ ec_bitmap_blob_bytes(uint64_t num_stripes)
 }
 
 /*
- * ec_bitmap_reservation_stripes -- size the in-band unmapped bitmap
- * region, in physical stripes per disk, from strip_size + blocklen alone.
- *
- * Layout under the raw-replicated blob model: every disk reserves two
- * slots (copy A / copy B), each large enough to hold the worst-case
- * bitmap blob. The returned value is the per-disk total in physical
- * stripes -- both slots, on every disk uniformly.
- *
- *   blob_bytes  = sizeof(ec_bitmap_header)
- *               + EC_BITMAP_WORDS(max_num_stripes) * sizeof(uint64_t)
- *               + sizeof(uint32_t)        // CRC32C
- *   slot_strips = ceil(blob_bytes / strip_bytes)
- *   return        slot_strips * 2
- *
- * The bitmap needs one bit per user stripe, sized for the maximum stripe
- * count the volume could ever reach. That ceiling is imposed by the WIB,
- * which must fit its header + region bitmap + CRC inside a single strip:
+ * The largest user stripe count the volume may ever hold. The ceiling is
+ * imposed by the WIB, whose header + region bitmap + CRC must fit in one
+ * strip. The region bitmap is written in whole uint64_t words, so the bound
+ * is the number of regions that fit in the payload as whole words, not as
+ * loose bits:
  *
  *   wib_payload_bytes = strip_bytes - sizeof(ec_wib_header) - 4
- *   max_num_stripes   = wib_payload_bytes * 8 * EC_WIB_REGION_STRIPES
+ *   max_regions       = (wib_payload_bytes / 8) * 64
+ *   max_num_stripes   = max_regions * EC_WIB_REGION_STRIPES
  *
- * max_num_stripes depends only on strip_size and blocklen -- never on the
- * disk size -- which is what makes the reservation "fixed-max": it does
- * not grow on resize and the reserved region never moves.
+ * Using loose bits would admit up to 32 regions that ec_wib_fill_buf then
+ * writes as one extra word, overrunning the one-strip wib_buf. The word
+ * bound matches ec_wib_fill_buf and the create-time WIB-fits check exactly.
  *
- * Per-disk cost is `2 * blob_bytes` (k * larger than an EC-encoded layout
- * would be, by design): every disk carries a full copy, so the metadata
+ * Depends only on strip_size and blocklen, never on disk size -- which is
+ * what lets the front reservations be fixed-max. num_stripes must never
+ * exceed it: ec_compute_geometry and ec_bdev_resize enforce it, and the
+ * assert in ec_wib_fill_buf backstops the WIB buffer.
+ */
+uint64_t
+ec_max_num_stripes(const struct ec_bdev *ec)
+{
+	uint64_t strip_bytes = ec->strip_size * ec->bdev.blocklen;
+	uint64_t wib_payload_bytes;
+	uint64_t max_regions;
+
+	assert(strip_bytes > sizeof(struct ec_wib_header) + sizeof(uint32_t));
+
+	wib_payload_bytes = strip_bytes - sizeof(struct ec_wib_header) - sizeof(uint32_t);
+	max_regions = (wib_payload_bytes / sizeof(uint64_t)) * 64;
+
+	return max_regions * EC_WIB_REGION_STRIPES;
+}
+
+/*
+ * ec_bitmap_reservation_stripes -- per-disk front reservation for the
+ * unmapped bitmap, in physical stripes. Every disk reserves two slots
+ * (copy A / copy B), each holding the worst-case blob at ec_max_num_stripes:
+ *
+ *   slot_strips = ceil((blob_bytes(max) + CRC) / strip_bytes)
+ *   return        slot_strips * 2
+ *
+ * Sized for the max, so it is fixed at create and never moves on resize.
+ * Every disk carries a full copy (raw replication), so the metadata
  * survives n-1 disk loss and load needs no encode/decode.
  */
 uint64_t
 ec_bitmap_reservation_stripes(const struct ec_bdev *ec)
 {
 	uint64_t strip_bytes = ec->strip_size * ec->bdev.blocklen;
-	uint64_t wib_payload_bytes;
-	uint64_t max_num_stripes;
 	uint64_t slot_extent_bytes;
 	uint64_t slot_strips;
 
-	wib_payload_bytes = strip_bytes - sizeof(struct ec_wib_header)
-			    - sizeof(uint32_t);
-	max_num_stripes   = wib_payload_bytes * 8 * EC_WIB_REGION_STRIPES;
-
-	/* Full on-disk extent of one slot: CRC-covered region + CRC trailer. */
-	slot_extent_bytes = ec_bitmap_blob_bytes(max_num_stripes)
+	slot_extent_bytes = ec_bitmap_blob_bytes(ec_max_num_stripes(ec))
 			    + sizeof(uint32_t);
 
 	slot_strips = (slot_extent_bytes + strip_bytes - 1) / strip_bytes;
@@ -295,8 +305,17 @@ ec_bitmap_slot_io_blocks(const struct ec_bdev *ec)
 	uint64_t slot_extent  = ec_bitmap_blob_bytes(ec->num_stripes) +
 				sizeof(uint32_t);
 	uint64_t slot_strips  = (slot_extent + strip_bytes - 1) / strip_bytes;
+	uint64_t io_blocks    = slot_strips * ec->strip_size;
 
-	return slot_strips * ec->strip_size;
+	/*
+	 * Backstop the placement invariant: the I/O extent must fit inside one
+	 * reserved slot, or a persist would write past it into the WIB strips
+	 * and user data. ec_compute_geometry / ec_bdev_resize keep num_stripes
+	 * <= ec_max_num_stripes, which guarantees this.
+	 */
+	assert(io_blocks <= ec_bitmap_slot_reserved_blocks(ec));
+
+	return io_blocks;
 }
 
 /* -------------------------------------------------------------------------
