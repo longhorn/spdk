@@ -690,6 +690,25 @@ ec_rebuild_poller_cb(void *arg)
 	}
 
 	/*
+	 * Skip unmapped stripes. An unmapped stripe is logically zero: every
+	 * read returns zeros without touching the disks, so the replacement
+	 * slot's chunk is never read and there is nothing to reconstruct. If
+	 * the stripe is written again it is repopulated through the
+	 * write-into-unmapped path.
+	 *
+	 * Count it as rebuilt so progress reaches 100%. Advance in the main
+	 * scan; in the deferred pass the entry was already dequeued.
+	 */
+	if (ec->stripe_unmapped_map != NULL &&
+	    ec_stripe_is_unmapped(ec, ctx->current_stripe)) {
+		ctx->stripes_rebuilt++;
+		if (!ctx->draining_deferred_stripes) {
+			ctx->current_stripe++;
+		}
+		return SPDK_POLLER_BUSY;
+	}
+
+	/*
 	 * Stripe-busy interlock.
 	 *
 	 * A foreground RMW, full-stripe write, or UNMAP may have claimed this
@@ -1273,6 +1292,19 @@ ec_scrub_poller_cb(void *arg)
 	}
 
 	/*
+	 * Skip unmapped stripes. An unmapped stripe reads as zeros without
+	 * consulting parity, so its on-disk parity is never used and there is
+	 * nothing to re-encode. The region bit is still cleared at
+	 * region_end_stripe (see the region-consistency note below).
+	 */
+	if (ec->stripe_unmapped_map != NULL &&
+	    ec_stripe_is_unmapped(ec, sctx->current_stripe)) {
+		sctx->current_stripe++;
+		sctx->stripes_scrubbed++;
+		return SPDK_POLLER_BUSY;
+	}
+
+	/*
 	 * Stripe-busy interlock.
 	 *
 	 * If another actor (rebuild, full-stripe write, RMW writeback after
@@ -1287,8 +1319,8 @@ ec_scrub_poller_cb(void *arg)
 	 * parity. The WIB dirty bit on this region only signals that some
 	 * stripe in the region was being modified at crash time; once the
 	 * region has been walked end-to-end (every stripe either re-encoded
-	 * by scrub or owned by an in-flight writer), the region is by
-	 * definition consistent.
+	 * by scrub, owned by an in-flight writer, or unmapped), the region is
+	 * by definition consistent.
 	 */
 	if (ec_stripe_is_dirty(ec, sctx->current_stripe)) {
 		sctx->current_stripe++;
