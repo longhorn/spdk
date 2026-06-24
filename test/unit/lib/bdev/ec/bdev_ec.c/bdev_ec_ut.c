@@ -12,6 +12,7 @@
 #include "bdev/ec/bdev_ec.c"
 #include "bdev/ec/bdev_ec_bitmap.c"
 #include "bdev/ec/bdev_ec_resize.c"
+#include "bdev/ec/bdev_ec_rebuild.c"
 
 /*
  * Unit coverage: the in-band unmapped bitmap front reservation.
@@ -64,6 +65,14 @@ DEFINE_STUB(spdk_bdev_unquiesce_range, int, (struct spdk_bdev *bdev,
 		struct spdk_bdev_module *module, uint64_t offset, uint64_t length,
 		spdk_bdev_quiesce_cb cb_fn, void *cb_arg), 0);
 DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint64_t size), 0);
+DEFINE_STUB(spdk_bdev_readv_blocks, int, (struct spdk_bdev_desc *desc,
+		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
+		uint64_t offset_blocks, uint64_t num_blocks,
+		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_writev_blocks, int, (struct spdk_bdev_desc *desc,
+		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
+		uint64_t offset_blocks, uint64_t num_blocks,
+		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *bdev_io));
 DEFINE_STUB_V(spdk_bdev_io_complete, (struct spdk_bdev_io *bdev_io,
 				      enum spdk_bdev_io_status status));
@@ -92,8 +101,6 @@ DEFINE_STUB(spdk_poller_register, struct spdk_poller *, (spdk_poller_fn fn, void
 DEFINE_STUB_V(spdk_poller_unregister, (struct spdk_poller **ppoller));
 
 /* Cross-file EC functions defined in other .c files of the module. */
-DEFINE_STUB(ec_bdev_start_scrub, int, (struct ec_bdev *ec), 0);
-DEFINE_STUB_V(ec_scrub_free_resources, (struct ec_scrub_ctx *sctx));
 DEFINE_STUB(ec_wib_idle_poller_cb, int, (void *arg), 0);
 DEFINE_STUB_V(ec_wib_load_async, (struct ec_bdev *ec, ec_bdev_create_cb_fn done_fn,
 				  void *done_arg));
@@ -103,6 +110,19 @@ DEFINE_STUB_V(ec_bdev_io_init, (struct ec_bdev_io *ec_io, struct ec_io_channel *
 DEFINE_STUB(ec_submit_read, int, (struct ec_bdev_io *ec_io), 0);
 DEFINE_STUB(ec_submit_write, int, (struct ec_bdev_io *ec_io), 0);
 DEFINE_STUB(ec_submit_unmap, int, (struct ec_bdev_io *ec_io), 0);
+
+/* Link-only stubs: bdev_ec_rebuild.c references these on paths the skip
+ * tests never run, so a no-op definition is enough to link. */
+DEFINE_STUB(ec_reconstruct_data_chunk, int, (const struct ec_bdev *ec,
+		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint8_t *out_buf,
+		uint32_t failed_slot, uint64_t chunk_len), 0);
+DEFINE_STUB(ec_reconstruct_multi_data, int, (const struct ec_bdev *ec,
+		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint8_t *out_bufs[],
+		const uint32_t failed_data_slots[], uint32_t f, uint64_t chunk_len), 0);
+DEFINE_STUB(ec_wib_persist, int, (struct ec_bdev *ec, void (*cb)(void *cb_arg, int rc),
+				  void *cb_arg), 0);
+DEFINE_STUB_V(ec_rmw_backpressure_end, (struct ec_bdev *ec, const char *reason));
+/* ec_encode_data is the real ISA-L symbol (libisal.a is linked into the UT). */
 
 /* ------------------------------------------------------------------ */
 /* Test fixtures.                                                     */
@@ -469,6 +489,27 @@ ut_free_unmapped_map(struct ec_bdev *ec)
 {
 	free(ec->stripe_unmapped_map);
 	ec->stripe_unmapped_map = NULL;
+}
+
+/*
+ * Dirty map used as a no-I/O sink: a mapped stripe marked dirty takes the
+ * stripe-busy path instead of submitting reads, so the negative case runs
+ * without driving the real rebuild/scrub I/O machinery.
+ */
+static void
+ut_alloc_dirty_map(struct ec_bdev *ec)
+{
+	uint64_t map_words = EC_BITMAP_WORDS(ec->num_stripes);
+
+	ec->stripe_dirty_map = calloc(map_words, sizeof(uint64_t));
+	SPDK_CU_ASSERT_FATAL(ec->stripe_dirty_map != NULL);
+}
+
+static void
+ut_free_dirty_map(struct ec_bdev *ec)
+{
+	free(ec->stripe_dirty_map);
+	ec->stripe_dirty_map = NULL;
 }
 
 /*
@@ -977,6 +1018,126 @@ test_wib_fits_strip_at_ceiling(void)
 	CU_ASSERT(wib_bytes > strip_bytes);
 }
 
+/*
+ * Unit coverage: scrub/rebuild skip of unmapped stripes.
+ *
+ * Each poller skips an unmapped stripe: counts it processed, advances the
+ * cursor, and submits no I/O. The mapped-but-dirty case checks the skip is
+ * conditional on the unmapped bit, not taken for every stripe.
+ */
+
+/*
+ * Rebuild poller. The unmapped stripe is counted as rebuilt and skipped
+ * with no I/O. The mapped, dirty stripe is NOT counted -- it falls into
+ * the stripe-busy interlock and is parked on the deferred queue.
+ */
+static void
+test_rebuild_skips_unmapped_stripe(void)
+{
+	struct ec_bdev        ec;
+	struct ec_rebuild_ctx ctx;
+	struct ec_rebuild_deferred_stripe *deferred;
+	const uint64_t        unmapped_stripe = 5;
+	const uint64_t        mapped_stripe   = 10;
+	int                   rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(ec.num_stripes > mapped_stripe);
+
+	ut_alloc_unmapped_map(&ec);
+	ut_alloc_dirty_map(&ec);
+	ec_stripe_set_unmapped(&ec, unmapped_stripe);
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.ec             = &ec;
+	ctx.num_stripes    = ec.num_stripes;
+	ctx.current_stripe = unmapped_stripe;
+	TAILQ_INIT(&ctx.deferred_stripes);
+
+	/* Unmapped stripe: counted as rebuilt, advanced, no I/O, not parked. */
+	rc = ec_rebuild_poller_cb(&ctx);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(ctx.stripes_rebuilt == 1);
+	CU_ASSERT(ctx.current_stripe == unmapped_stripe + 1);
+	CU_ASSERT(ctx.io_in_flight == false);
+	CU_ASSERT(TAILQ_EMPTY(&ctx.deferred_stripes));
+
+	/* Mapped, dirty stripe: skip NOT taken; parked by the busy interlock. */
+	ctx.current_stripe  = mapped_stripe;
+	ctx.stripes_rebuilt = 0;
+	ec_stripe_set_dirty(&ec, mapped_stripe);
+
+	rc = ec_rebuild_poller_cb(&ctx);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(ctx.stripes_rebuilt == 0);
+	CU_ASSERT(ctx.current_stripe == mapped_stripe + 1);
+	CU_ASSERT(ctx.io_in_flight == false);
+	CU_ASSERT(!TAILQ_EMPTY(&ctx.deferred_stripes));
+
+	/* Drain the parked entry so valgrind stays clean. */
+	deferred = TAILQ_FIRST(&ctx.deferred_stripes);
+	SPDK_CU_ASSERT_FATAL(deferred != NULL);
+	CU_ASSERT(deferred->stripe_index == mapped_stripe);
+	TAILQ_REMOVE(&ctx.deferred_stripes, deferred, link);
+	free(deferred);
+
+	ut_free_dirty_map(&ec);
+	ut_free_unmapped_map(&ec);
+}
+
+/*
+ * Scrub poller. The unmapped stripe is counted as scrubbed and skipped
+ * with no I/O. The mapped, dirty stripe is NOT counted -- it advances via
+ * the stripe-busy interlock. region_end_stripe is held above the cursor so
+ * the poller never takes the region-complete branch.
+ */
+static void
+test_scrub_skips_unmapped_stripe(void)
+{
+	struct ec_bdev      ec;
+	struct ec_scrub_ctx sctx;
+	const uint64_t      unmapped_stripe = 5;
+	const uint64_t      mapped_stripe   = 10;
+	int                 rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(ec.num_stripes > mapped_stripe);
+
+	ut_alloc_unmapped_map(&ec);
+	ut_alloc_dirty_map(&ec);
+	ec_stripe_set_unmapped(&ec, unmapped_stripe);
+
+	memset(&sctx, 0, sizeof(sctx));
+	sctx.ec                = &ec;
+	sctx.current_stripe    = unmapped_stripe;
+	sctx.region_end_stripe = ec.num_stripes;
+
+	/* Unmapped stripe: counted as scrubbed, advanced, no I/O. */
+	rc = ec_scrub_poller_cb(&sctx);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(sctx.stripes_scrubbed == 1);
+	CU_ASSERT(sctx.current_stripe == unmapped_stripe + 1);
+	CU_ASSERT(sctx.io_in_flight == false);
+
+	/* Mapped, dirty stripe: skip NOT taken; advanced by the busy interlock. */
+	sctx.current_stripe   = mapped_stripe;
+	sctx.stripes_scrubbed = 0;
+	ec_stripe_set_dirty(&ec, mapped_stripe);
+
+	rc = ec_scrub_poller_cb(&sctx);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(sctx.stripes_scrubbed == 0);
+	CU_ASSERT(sctx.current_stripe == mapped_stripe + 1);
+	CU_ASSERT(sctx.io_in_flight == false);
+
+	ut_free_dirty_map(&ec);
+	ut_free_unmapped_map(&ec);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1010,6 +1171,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_dedicated_release_unregister_precedence);
 	CU_ADD_TEST(suite, test_bitmap_slot_io_within_reserved);
 	CU_ADD_TEST(suite, test_wib_fits_strip_at_ceiling);
+
+	CU_ADD_TEST(suite, test_rebuild_skips_unmapped_stripe);
+	CU_ADD_TEST(suite, test_scrub_skips_unmapped_stripe);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
