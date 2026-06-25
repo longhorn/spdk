@@ -1357,6 +1357,32 @@ ec_bdev_create_wib_done(void *cb_arg, int rc)
 		return;
 	}
 
+	/*
+	 * Established volume came up with no valid WIB on any parity disk
+	 * (wib_generation is 0 only when no valid copy was found -- a written
+	 * copy is always generation >= 1). We don't know which regions were
+	 * mid-write at the crash, so mark every region dirty and let the startup
+	 * scrub re-encode all parity from the data disks.
+	 *
+	 * salvage_requested tells an established volume apart from a fresh create,
+	 * which has no WIB yet and correctly stays clean. We scrub rather than
+	 * fail the create because the WIB is only a scrub hint and a scrub fully
+	 * rebuilds it -- unlike the unmapped bitmap, which is authoritative and
+	 * must fail loud when lost.
+	 */
+	if (ec->wib_generation == 0 && ctx->salvage_requested) {
+		uint32_t region;
+
+		SPDK_WARNLOG("EC bdev %s: salvage requested but no valid WIB found "
+			     "on any parity disk; marking all %u regions dirty for "
+			     "a full-volume scrub\n",
+			     ec->bdev.name, ec->wib_num_regions);
+
+		for (region = 0; region < ec->wib_num_regions; region++) {
+			ec_wib_region_set_dirty(ec, region);
+		}
+	}
+
 	ec_bitmap_load_async(ec, ec_bdev_create_bitmap_load_done, ctx);
 }
 
