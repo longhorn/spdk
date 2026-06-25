@@ -98,7 +98,6 @@ ec_wib_fill_buf(struct ec_bdev *ec)
 	hdr->version     = EC_WIB_VERSION;
 	hdr->generation  = ec->wib_generation;
 	hdr->num_regions = ec->wib_num_regions;
-	hdr->_pad        = 0;
 
 	bits = (uint64_t *)(hdr + 1);
 	memcpy(bits, ec->wib_region_map, map_words * sizeof(uint64_t));
@@ -492,7 +491,7 @@ ec_wib_idle_poller_cb(void *arg)
  * Returns -EINVAL otherwise.
  */
 static int
-ec_wib_validate_buf(const struct ec_bdev *ec, const void *buf, uint32_t *gen_out)
+ec_wib_validate_buf(const struct ec_bdev *ec, const void *buf, uint64_t *gen_out)
 {
 	const struct ec_wib_header *hdr = (const struct ec_wib_header *)buf;
 	const uint64_t             *bits;
@@ -554,7 +553,7 @@ struct ec_wib_load_async_ctx {
 	void                *bufb;       /* copy 1 target (scratch+buf_bytes) */
 	uint32_t             parity_idx;
 	/* per-disk state, reset for each parity disk */
-	uint32_t             gen_a, gen_b;
+	uint64_t             gen_a, gen_b;
 	bool                 valid_a, valid_b;
 	/* overall */
 	bool                 any_valid;
@@ -628,7 +627,7 @@ ec_wib_load_async_merge_disk(struct ec_wib_load_async_ctx *ctx)
 		const void *best = pick_b ? ctx->bufb : ctx->bufa;
 		const struct ec_wib_header *hdr = (const struct ec_wib_header *)best;
 		const uint64_t             *bits = (const uint64_t *)(hdr + 1);
-		uint32_t                    best_gen = pick_b ? ctx->gen_b : ctx->gen_a;
+		uint64_t                    best_gen = pick_b ? ctx->gen_b : ctx->gen_a;
 		uint32_t                    w;
 
 		/*
@@ -804,7 +803,7 @@ int
 ec_bdev_get_wib_status(const char *ec_name,
 		       uint32_t   *num_regions,
 		       uint32_t   *dirty_regions,
-		       uint32_t   *generation,
+		       uint64_t   *generation,
 		       bool       *persist_pending)
 {
 	struct ec_bdev *ec = ec_bdev_find(ec_name);

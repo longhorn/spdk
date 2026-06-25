@@ -562,7 +562,7 @@ test_bitmap_fill_validate(void)
 {
 	struct ec_bdev ec;
 	uint8_t       *buf;
-	uint32_t       gen;
+	uint64_t       gen;
 	int            rc;
 
 	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
@@ -598,7 +598,7 @@ test_bitmap_validate_failures(void)
 {
 	struct ec_bdev ec;
 	uint8_t       *buf;
-	uint32_t       gen;
+	uint64_t       gen;
 	int            rc;
 
 	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
@@ -739,7 +739,7 @@ test_bitmap_validate_accepts_smaller(void)
 {
 	struct ec_bdev small, large;
 	uint8_t       *buf;
-	uint32_t       gen;
+	uint64_t       gen;
 	uint64_t       small_stripes;
 	int            rc;
 

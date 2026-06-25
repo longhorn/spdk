@@ -377,10 +377,9 @@ struct ec_rebuild_ctx {
 /* On-disk WIB copy header; region_bits[] follows immediately after. */
 struct ec_wib_header {
 	uint64_t magic;
+	uint64_t generation;   /* only ever increases across persist calls */
 	uint32_t version;
-	uint32_t generation;   /* only ever increases across persist calls */
 	uint32_t num_regions;
-	uint32_t _pad;
 	/* uint64_t region_bits[] follows in the DMA buffer */
 };
 
@@ -425,10 +424,11 @@ struct ec_wib_header {
  */
 struct ec_bitmap_header {
 	uint64_t magic;
-	uint32_t version;
-	uint32_t generation;    /* only ever increases across persists           */
+	uint64_t generation;    /* only ever increases across persists           */
 	uint64_t blob_bytes;    /* explicit length of header + span (CRC follows)*/
 	uint64_t num_stripes;   /* user-stripe count the span covers             */
+	uint32_t version;
+	uint32_t reserved;      /* zeroed; aligns span[] to an 8-byte (uint64_t) boundary */
 };
 
 /* =========================================================================
@@ -591,7 +591,7 @@ struct ec_bdev {
 	uint64_t                *wib_region_dirty_ticks;  /* tick when marked dirty*/
 	struct spdk_io_channel  *wib_chans[EC_MAX_BASE_BDEVS]; /* m entries */
 	void                    *wib_buf;              /* DMA buf, one strip   */
-	uint32_t                 wib_generation;
+	uint64_t                 wib_generation;
 	uint8_t                  wib_active_copy;      /* 0 or 1               */
 	bool                     wib_persist_in_flight;
 	/* New dirty bit arrived while persist in flight; triggers follow-up. */
@@ -615,7 +615,7 @@ struct ec_bdev {
 	 * re-syncs automatically on the next persist.
 	 */
 	struct spdk_io_channel  *bitmap_chans[EC_MAX_BASE_BDEVS]; /* n entries */
-	uint32_t                 bitmap_generation;
+	uint64_t                 bitmap_generation;
 	uint8_t                  bitmap_active_copy;    /* 0 or 1               */
 	bool                     bitmap_persist_in_flight;
 
@@ -1434,7 +1434,7 @@ uint64_t ec_max_num_stripes(const struct ec_bdev *ec);
  * bootstrap persist simply passes ec->stripe_unmapped_map.
  */
 void ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
-			uint32_t generation, void *buf);
+			uint64_t generation, void *buf);
 
 /*
  * ec_bitmap_validate_buf -- check a slot read back from disk: magic,
@@ -1446,7 +1446,7 @@ void ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
  * like.
  */
 int  ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
-			    uint32_t *gen_out);
+			    uint64_t *gen_out);
 
 /*
  * ec_bitmap_apply_buf -- copy the span out of a validated blob into

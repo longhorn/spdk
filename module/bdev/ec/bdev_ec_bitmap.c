@@ -138,7 +138,7 @@ ec_bitmap_reservation_stripes(const struct ec_bdev *ec)
  */
 void
 ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
-		   uint32_t generation, void *buf)
+		   uint64_t generation, void *buf)
 {
 	struct ec_bitmap_header *hdr        = buf;
 	uint64_t                 blob_bytes = ec_bitmap_blob_bytes(ec->num_stripes);
@@ -151,6 +151,7 @@ ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
 	hdr->generation  = generation;
 	hdr->blob_bytes  = blob_bytes;
 	hdr->num_stripes = ec->num_stripes;
+	hdr->reserved    = 0;
 
 	memcpy(span, source_map, map_words * sizeof(uint64_t));
 
@@ -185,7 +186,7 @@ ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
  */
 int
 ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
-		       uint32_t *gen_out)
+		       uint64_t *gen_out)
 {
 	const struct ec_bitmap_header *hdr        = buf;
 	uint64_t                       blob_bytes;
@@ -709,7 +710,7 @@ struct ec_bitmap_load_ctx {
 	uint8_t              cur_copy;       /* 0 or 1                          */
 
 	bool                 has_best;
-	uint32_t             best_gen;
+	uint64_t             best_gen;
 	uint8_t              best_copy;
 
 	ec_bdev_create_cb_fn done_fn;
@@ -729,7 +730,7 @@ ec_bitmap_load_finish(struct ec_bitmap_load_ctx *ctx)
 		ec_bitmap_apply_buf(ec, ctx->best_buf);
 		ec->bitmap_generation  = ctx->best_gen;
 		ec->bitmap_active_copy = ctx->best_copy;
-		SPDK_NOTICELOG("EC bdev %s: bitmap loaded (gen %u, slot %u)\n",
+		SPDK_NOTICELOG("EC bdev %s: bitmap loaded (gen %" PRIu64 ", slot %u)\n",
 			       ec->bdev.name, ctx->best_gen, ctx->best_copy);
 	} else {
 		SPDK_NOTICELOG("EC bdev %s: no valid bitmap copy found -- "
@@ -761,7 +762,7 @@ ec_bitmap_load_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct ec_bitmap_load_ctx *ctx = cb_arg;
 	struct ec_bdev            *ec  = ctx->ec;
-	uint32_t                   generation;
+	uint64_t                   generation;
 
 	spdk_bdev_free_io(bdev_io);
 
@@ -891,7 +892,7 @@ ec_bdev_get_unmap_status(const char *ec_name,
 			 uint64_t   *num_stripes,
 			 uint64_t   *unmapped_stripes,
 			 uint64_t   *blob_bytes,
-			 uint32_t   *generation,
+			 uint64_t   *generation,
 			 uint8_t    *active_copy,
 			 bool       *persist_pending)
 {

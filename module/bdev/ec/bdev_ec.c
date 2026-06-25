@@ -1243,7 +1243,7 @@ ec_bdev_create_bitmap_persist_done(void *cb_arg, int rc)
 	}
 
 	SPDK_NOTICELOG("EC bdev %s: fresh bitmap persisted to both slots "
-		       "(gen %u)\n", ec->bdev.name, ec->bitmap_generation);
+		       "(gen %" PRIu64 ")\n", ec->bdev.name, ec->bitmap_generation);
 
 	ec_bdev_create_finalize(ctx);
 }
@@ -1903,7 +1903,7 @@ ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	ec_write_base_bdevs_array_json(w, ec);
 
 	spdk_json_write_named_uint32(w, "wib_num_regions",     ec->wib_num_regions);
-	spdk_json_write_named_uint32(w, "wib_generation",      ec->wib_generation);
+	spdk_json_write_named_uint64(w, "wib_generation",      ec->wib_generation);
 	/* JSON key remains "wib_persist_pending" for wire compatibility;
 	 * the C field is wib_persist_in_flight (true until persist completes
 	 * end-to-end). */

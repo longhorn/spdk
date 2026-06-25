@@ -574,7 +574,8 @@ rpc_bdev_ec_get_wib_status(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_bdev_ec_get_wib_status req = {};
 	struct spdk_json_write_ctx *w;
-	uint32_t num_regions, dirty_regions, generation;
+	uint32_t num_regions, dirty_regions;
+	uint64_t generation;
 	bool     persist_pending;
 	int      rc;
 
@@ -604,7 +605,7 @@ rpc_bdev_ec_get_wib_status(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_string(w,  "ec_name",         req.ec_name);
 	spdk_json_write_named_uint32(w,  "num_regions",     num_regions);
 	spdk_json_write_named_uint32(w,  "dirty_regions",   dirty_regions);
-	spdk_json_write_named_uint32(w,  "generation",      generation);
+	spdk_json_write_named_uint64(w,  "generation",      generation);
 	spdk_json_write_named_bool(w,    "persist_pending",  persist_pending);
 	spdk_json_write_object_end(w);
 	spdk_jsonrpc_end_result(request, w);
@@ -641,7 +642,7 @@ rpc_bdev_ec_get_unmap_status(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_ec_get_unmap_status req = {};
 	struct spdk_json_write_ctx *w;
 	uint64_t num_stripes, unmapped_stripes, blob_bytes;
-	uint32_t generation;
+	uint64_t generation;
 	uint8_t  active_copy;
 	bool     persist_pending;
 	int      rc;
@@ -675,7 +676,7 @@ rpc_bdev_ec_get_unmap_status(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_uint64(w,  "num_stripes",      num_stripes);
 	spdk_json_write_named_uint64(w,  "unmapped_stripes", unmapped_stripes);
 	spdk_json_write_named_uint64(w,  "blob_bytes",       blob_bytes);
-	spdk_json_write_named_uint32(w,  "generation",       generation);
+	spdk_json_write_named_uint64(w,  "generation",       generation);
 	spdk_json_write_named_uint32(w,  "active_copy",      active_copy);
 	spdk_json_write_named_bool(w,    "persist_pending",  persist_pending);
 	spdk_json_write_object_end(w);
