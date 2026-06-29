@@ -660,7 +660,8 @@ struct ec_bdev {
 	 */
 	struct spdk_io_channel  *bitmap_chans[EC_MAX_BASE_BDEVS]; /* n entries */
 	uint64_t                 bitmap_generation;
-	uint8_t                  bitmap_active_copy;    /* 0 or 1               */
+	uint8_t                  bitmap_active_copy;        /* 0 or 1                       */
+	uint8_t                  bitmap_commit_active_copy; /* 0 or 1; latest stamp slot    */
 	bool                     bitmap_persist_in_flight;
 
 	/*
@@ -1561,19 +1562,18 @@ uint64_t ec_count_unmapped_stripes(const struct ec_bdev *ec);
  *
  * Two completion callbacks, each optional (pass NULL to skip):
  *
- *   cb_durable -- fires the moment durability is achieved: at least
- *     m+1 disks (or all online disks, if fewer than m+1 are online)
- *     have completed the write. At this point bitmap_active_copy is
- *     flipped to next_copy. The remaining in-flight writes continue
- *     to drain in the background; bitmap_persist_in_flight is NOT yet
- *     cleared. Used by the UNMAP path to release its caller before
- *     a slow disk has finished writing -- the staged bits are
- *     applied to the live bitmap from this callback.
+ *   cb_durable -- fires once durability is achieved: the blob and its
+ *     stamp have each reached m+1 disks (or all online disks, if fewer
+ *     than m+1 are online). Both bitmap_active_copy and
+ *     bitmap_commit_active_copy flip at this point, so the active slot
+ *     tracks the committed generation. The remaining writes drain in
+ *     the background; bitmap_persist_in_flight is not yet cleared. The
+ *     UNMAP path uses this to release its caller before a slow disk
+ *     finishes, applying the staged bits to the live bitmap here.
  *
- *     If the m+1 threshold is never reached, cb_durable is called
- *     with rc < 0 once all in-flight writes have completed (and
- *     bitmap_active_copy is not flipped -- the bitmap stays on the
- *     prior generation).
+ *     If either round misses its threshold, cb_durable is called with
+ *     rc < 0 after all writes complete, and neither index flips -- the
+ *     bitmap stays on the prior committed generation.
  *
  *   cb_drained -- fires when the last write has completed, after
  *     bitmap_persist_in_flight has been cleared. The rc argument

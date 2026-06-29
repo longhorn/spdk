@@ -433,8 +433,13 @@ ec_bitmap_slot_io_blocks(const struct ec_bdev *ec)
  */
 struct ec_bitmap_persist_ctx {
 	struct ec_bdev          *ec;
-	void                    *dma_buf;
-	uint8_t                  next_copy;
+	void                    *dma_buf;       /* round 1: the bitmap blob            */
+	void                    *commit_buf;    /* round 2: the commit record (stamp)  */
+	uint64_t                 committed_gen; /* generation this persist commits     */
+	uint32_t                 blob_crc;      /* CRC of the blob, recorded in the stamp */
+	uint8_t                  next_copy;     /* bitmap slot the blob is written to   */
+	uint8_t                  commit_copy;   /* commit slot the stamp is written to  */
+	bool                     commit_phase;  /* false: blob round; true: stamp round */
 	uint32_t                 writes_in_flight;
 	uint32_t                 successes;
 	uint32_t                 required;
@@ -484,6 +489,35 @@ ec_bitmap_persist_issue_round(struct ec_bitmap_persist_ctx *ctx, void *buf,
 	}
 }
 
+/*
+ * Round 1 put the blob on m+1 disks, so it is durable and safe to stamp. Write
+ * a commit record -- naming this generation, the blob's slot, and its CRC -- to
+ * the inactive commit slot on every writable disk. The stamp is written only
+ * here, after the blob is durable, so any surviving stamp proves its blob
+ * reached m+1.
+ *
+ * Reuses the round accounting (successes/required/writes_in_flight), reset for
+ * the stamp round. Its threshold is the blob round's, so a disk lost between
+ * rounds is reported as a persist failure.
+ */
+static void
+ec_bitmap_persist_begin_commit_phase(struct ec_bitmap_persist_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+	uint64_t        commit_lba_blocks;
+
+	ctx->commit_phase = true;
+	ctx->commit_copy  = 1 - ec->bitmap_commit_active_copy;
+	ctx->successes    = 0;
+	ctx->first_err    = 0;
+
+	ec_bitmap_commit_fill_buf(ctx->committed_gen, ctx->blob_crc, ctx->commit_buf);
+
+	commit_lba_blocks = ec_bitmap_commit_lba(ec, ctx->commit_copy);
+	ec_bitmap_persist_issue_round(ctx, ctx->commit_buf, commit_lba_blocks,
+				      ec->bdev.blocklen);
+}
+
 static void
 ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 			   void *cb_arg)
@@ -498,26 +532,26 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 		ctx->successes++;
 	} else if (ctx->first_err == 0) {
 		ctx->first_err = -EIO;
-		SPDK_WARNLOG("EC bdev %s: bitmap persist write failed\n",
-			     ec->bdev.name);
+		SPDK_WARNLOG("EC bdev %s: bitmap persist write failed (%s round)\n",
+			     ec->bdev.name, ctx->commit_phase ? "stamp" : "blob");
 	}
 
 	/*
-	 * Pre-completion durability ack: fire cb_durable as soon as the
-	 * threshold is met so the caller can release its dependents (UNMAP
-	 * applies staged->live and acks its bdev_io). bitmap_active_copy
-	 * is flipped here, but bitmap_persist_in_flight is NOT cleared --
-	 * it stays true until full drainout so a subsequent persist
-	 * cannot start while this persist's slow writes are still in
-	 * flight to the same slot LBA. Clearing pending too early lets
-	 * stragglers from this persist overwrite the next persist's
-	 * fresh writes after that next persist had already been acked,
-	 * silently regressing durability past an acknowledged
-	 * commit.
+	 * The ack fires only in the stamp round: an UNMAP is durable once its
+	 * blob and stamp both reach m+1 disks. Flip both slot indices here, at the
+	 * ack rather than at blob-round drainout, so bitmap_active_copy follows
+	 * the committed generation. After a partial stamp it stays on the last
+	 * committed slot, so the next persist writes the other slot
+	 * (next_copy = 1 - active) and cannot overwrite the committed blob.
+	 *
+	 * bitmap_persist_in_flight stays set until drainout, so the next persist
+	 * cannot reuse a slot while this one's writes are still in flight.
 	 */
-	if (!ctx->acked && ctx->successes >= ctx->required) {
-		ctx->acked             = true;
-		ec->bitmap_active_copy = ctx->next_copy;
+	if (ctx->commit_phase && !ctx->acked && ctx->successes >= ctx->required) {
+		assert(ctx->required >= 1 && ctx->required <= ec->m + 1);
+		ctx->acked                    = true;
+		ec->bitmap_active_copy        = ctx->next_copy;
+		ec->bitmap_commit_active_copy = ctx->commit_copy;
 		if (ctx->cb_durable) {
 			ctx->cb_durable(ctx->cb_durable_arg, 0);
 		}
@@ -529,9 +563,41 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 	}
 
 	/*
-	 * Last write done. Now safe to clear bitmap_persist_in_flight so the
-	 * next persist may begin -- all on-disk state from this persist is
-	 * either committed (success) or terminally failed.
+	 * Saving the bitmap is two write rounds: the blob round writes the
+	 * bitmap itself, then the stamp round writes a commit record marking it
+	 * saved (on reload, a bitmap without its stamp is ignored).
+	 *
+	 * We reach here when the blob round has finished. If enough copies
+	 * landed to survive the tolerated disk failures, the bitmap is durable,
+	 * so start the stamp round -- its writes re-enter this callback with
+	 * commit_phase set. Switch the active copy to the new bitmap only after
+	 * its stamp is durable too, so a bitmap whose stamp falls short never
+	 * goes live.
+	 *
+	 * If not enough copies landed to be safe, skip the stamp and fail the
+	 * save below -- with no stamp, reload ignores this version.
+	 *
+	 * The stamp waits for the whole blob round to finish, not just its m+1
+	 * ack, so only one round is in flight at a time. The cost is tail
+	 * latency: a slow blob write holds cb_durable -- and every UNMAP behind
+	 * it -- until it lands. A hung write is bounded by the ctrlr-loss abort,
+	 * a slow-but-alive one is not. Stamping at the blob's m+1 ack would
+	 * recover the latency (different slot, no conflict) by overlapping two
+	 * rounds; revisit if degraded-disk UNMAP tails matter.
+	 */
+	if (!ctx->commit_phase && ctx->successes >= ctx->required) {
+		ec_bitmap_persist_begin_commit_phase(ctx);
+		if (ctx->writes_in_flight != 0) {
+			return;  /* stamp round now in flight */
+		}
+		/* No stamp write got submitted; fall through to fail. */
+	}
+
+	/*
+	 * Last round done (the stamp round, or a failed blob round). Now safe to
+	 * clear bitmap_persist_in_flight so the next persist may begin -- all
+	 * on-disk state from this persist is either committed (blob + stamp) or
+	 * terminally failed.
 	 */
 	ec->bitmap_persist_in_flight = false;
 
@@ -555,14 +621,15 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 
 	if (!ctx->acked) {
 		/*
-		 * Threshold was never reached. Report the failure via
-		 * cb_durable now (the caller's "did the persist succeed?"
-		 * hook), leaving the active_copy / generation as they were
-		 * so the bitmap stays on its prior on-disk content.
+		 * A round fell short of its threshold; report the failure via
+		 * cb_durable. The on-disk state stays safe: an unstamped generation is
+		 * not adopted on load, and a generation exposed by a surviving partial
+		 * stamp has a durable blob behind it.
 		 */
 		SPDK_ERRLOG("EC bdev %s: bitmap persist did not reach durability "
-			    "threshold (succeeded=%u, required=%u)\n",
-			    ec->bdev.name, ctx->successes, ctx->required);
+			    "threshold (succeeded=%u, required=%u, %s round)\n",
+			    ec->bdev.name, ctx->successes, ctx->required,
+			    ctx->commit_phase ? "stamp" : "blob");
 		final_rc = ctx->first_err ? ctx->first_err : -EIO;
 		if (ctx->cb_durable) {
 			ctx->cb_durable(ctx->cb_durable_arg, final_rc);
@@ -576,6 +643,7 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 	}
 
 	spdk_dma_free(ctx->dma_buf);
+	spdk_dma_free(ctx->commit_buf);
 	free(ctx);
 
 	/*
@@ -656,6 +724,14 @@ ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 		return -ENOMEM;
 	}
 
+	/* One block holds the commit record (stamp) plus its CRC trailer. */
+	ctx->commit_buf = spdk_dma_zmalloc(ec->bdev.blocklen, EC_DMA_ALIGN, NULL);
+	if (!ctx->commit_buf) {
+		spdk_dma_free(ctx->dma_buf);
+		free(ctx);
+		return -ENOMEM;
+	}
+
 	/* Count writable, attached disks with channels available. */
 	for (i = 0; i < ec->n; i++) {
 		if (ec->descs[i] && ec->bitmap_chans[i] &&
@@ -665,6 +741,7 @@ ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 	}
 	if (n_writable == 0) {
 		spdk_dma_free(ctx->dma_buf);
+		spdk_dma_free(ctx->commit_buf);
 		free(ctx);
 		return -EIO;
 	}
@@ -673,6 +750,7 @@ ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 
 	ctx->ec              = ec;
 	ctx->next_copy       = 1 - ec->bitmap_active_copy;
+	ctx->committed_gen   = ec->bitmap_generation;
 	ctx->required        = spdk_min(n_writable, ec->m + 1);
 	ctx->cb_durable      = cb_durable;
 	ctx->cb_durable_arg  = cb_durable_arg;
@@ -684,6 +762,10 @@ ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 	 * every disk receives the same bytes.
 	 */
 	ec_bitmap_fill_buf(ec, source_map, ec->bitmap_generation, ctx->dma_buf);
+
+	/* The stamp records the CRC fill_buf wrote at the blob's trailer. */
+	ctx->blob_crc = *(const uint32_t *)((const uint8_t *)ctx->dma_buf +
+					    ec_bitmap_blob_bytes(ec->num_stripes));
 
 	slot_lba_blocks = ec_bitmap_slot_lba_blocks(ec, ctx->next_copy);
 
@@ -701,6 +783,7 @@ ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 		ec->bitmap_persist_in_flight = false;
 		rc = ctx->first_err ? ctx->first_err : -EIO;
 		spdk_dma_free(ctx->dma_buf);
+		spdk_dma_free(ctx->commit_buf);
 		free(ctx);
 		return rc;
 	}
