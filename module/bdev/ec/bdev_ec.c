@@ -656,6 +656,17 @@ ec_compute_geometry(struct ec_bdev *ec)
 			       max_blockcnt - min_blockcnt);
 	}
 
+	/*
+	 * The commit-record stamp occupies one block, so the block must hold the
+	 * struct plus its CRC trailer.
+	 */
+	if (ec->bdev.blocklen < sizeof(struct ec_bitmap_commit) + sizeof(uint32_t)) {
+		SPDK_ERRLOG("EC bdev %s: blocklen=%u too small for the commit record "
+			    "(need >= %zu bytes)\n", ec->bdev.name, ec->bdev.blocklen,
+			    sizeof(struct ec_bitmap_commit) + sizeof(uint32_t));
+		return -EINVAL;
+	}
+
 	ec->strip_size = ((uint64_t)ec->strip_size_kb * 1024) / ec->bdev.blocklen;
 	if (ec->strip_size == 0 ||
 	    ((uint64_t)ec->strip_size_kb * 1024) % ec->bdev.blocklen != 0) {
@@ -682,26 +693,27 @@ ec_compute_geometry(struct ec_bdev *ec)
 
 	/*
 	 * Front-placed metadata:
-	 *   [ bitmap_reservation_strips ][ 2 WIB strips ][ user data ]
+	 *   [ bitmap_reservation_strips ][ 2 commit strips ][ 2 WIB strips ][ user data ]
 	 *
-	 * Both regions are fixed-max and never move on resize. Only the
-	 * trailing user-data region grows. data_offset_stripes is the
-	 * combined reservation -- the LBA at which user stripe 0 lives on
-	 * every base disk. The same on all k+m disks; data disks reserve
-	 * the WIB strips even though they never write them, so the layout
-	 * computation uses one rule for every disk.
+	 * All three regions are fixed-max and never move on resize; only the
+	 * trailing user-data region grows. data_offset_stripes is their combined
+	 * size -- the LBA where user stripe 0 starts. It is identical on every
+	 * disk: data disks reserve the commit and WIB strips even though they
+	 * never write the WIB, so one layout rule covers all k+m disks.
 	 *
 	 * A disk that cannot even hold the combined reservation is rejected
 	 * here; the WIB-fits-in-one-strip check still runs at the bottom of
 	 * this function as an independent invariant.
 	 */
 	total_physical_stripes  = min_blockcnt / ec->strip_size;
-	ec->data_offset_stripes = ec_bitmap_reservation_stripes(ec) + 2;
+	ec->data_offset_stripes = ec_bitmap_reservation_stripes(ec)
+				  + EC_BITMAP_COMMIT_STRIPS  /* commit record */
+				  + 2;                       /* WIB copy 0 + copy 1 */
 
 	if (total_physical_stripes <= ec->data_offset_stripes) {
 		SPDK_ERRLOG("EC bdev %s: disk too small to reserve front "
 			    "metadata (physical stripes=%" PRIu64 ", "
-			    "data_offset_stripes=%" PRIu64 " = bitmap + 2 WIB strips)\n",
+			    "data_offset_stripes=%" PRIu64 " = bitmap + 2 commit + 2 WIB strips)\n",
 			    ec->bdev.name, total_physical_stripes,
 			    ec->data_offset_stripes);
 		return -EINVAL;

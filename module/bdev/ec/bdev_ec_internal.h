@@ -468,6 +468,13 @@ struct ec_bitmap_commit {
 SPDK_STATIC_ASSERT(sizeof(struct ec_bitmap_commit) == 32,
 		   "on-disk commit record size must stay 32 bytes");
 
+/*
+ * Strips reserved for the commit record at the front of every disk, between
+ * the unmapped-bitmap reservation and the WIB: one strip per double-buffer
+ * copy.
+ */
+#define EC_BITMAP_COMMIT_STRIPS 2u
+
 /* =========================================================================
  * Startup scrub context
  *
@@ -1705,21 +1712,29 @@ int ec_reconstruct_multi_data(const struct ec_bdev *ec,
  * ========================================================================= */
 
 /*
- * LBA of WIB copy 0 or 1 on a parity disk.
+ * Per-disk front-metadata layout, all fixed-max at create time:
+ *   [ bitmap region:  bitmap_reservation_stripes strips ]
+ *   [ commit record:  EC_BITMAP_COMMIT_STRIPS strips     ]
+ *   [ WIB copy 0:     1 strip                            ]
+ *   [ WIB copy 1:     1 strip                            ]
+ *   [ user data:      num_stripes strips                 ]
  *
- * Per-disk layout:
- *   [ bitmap region: bitmap_reservation_stripes strips ]
- *   [ WIB copy 0:    1 strip                           ]
- *   [ WIB copy 1:    1 strip                           ]
- *   [ user data:     num_stripes strips                ]
- *
- * Pure arithmetic over strip_size and the bitmap reservation, both
- * fixed-max at create time -- no I/O, no descriptor lookups.
+ * ec_bitmap_commit_lba and ec_wib_lba give the copy LBAs. The commit record
+ * is raw-replicated on every disk; the WIB is written only on parity disks
+ * but reserved on all. Both are pure arithmetic over strip_size and the
+ * bitmap reservation -- no I/O, no descriptor lookups.
  */
+static inline uint64_t
+ec_bitmap_commit_lba(const struct ec_bdev *ec, uint8_t copy)
+{
+	return (ec_bitmap_reservation_stripes(ec) + copy) *
+	       (uint64_t)ec->strip_size;
+}
+
 static inline uint64_t
 ec_wib_lba(const struct ec_bdev *ec, uint8_t copy)
 {
-	return (ec_bitmap_reservation_stripes(ec) + copy) *
+	return (ec_bitmap_reservation_stripes(ec) + EC_BITMAP_COMMIT_STRIPS + copy) *
 	       (uint64_t)ec->strip_size;
 }
 

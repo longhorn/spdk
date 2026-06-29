@@ -245,13 +245,14 @@ test_compute_geometry_basic(void)
 	CU_ASSERT(ec.stripe_blocks == stripe_blocks);
 
 	/*
-	 * Both bitmap and WIB are at the front. data_offset_stripes =
-	 * bitmap_reservation + 2 (WIB copy 0 + copy 1). No tail reservation.
+	 * Bitmap, commit record, and WIB are all at the front.
+	 * data_offset_stripes = bitmap_reservation + commit strips + 2 (WIB
+	 * copy 0 + copy 1). No tail reservation.
 	 */
 	total_physical = g_base_bdev.blockcnt / strip_size;
 
 	CU_ASSERT(ec.data_offset_stripes ==
-		  ut_expected_reservation(strip_size) + 2);
+		  ut_expected_reservation(strip_size) + EC_BITMAP_COMMIT_STRIPS + 2);
 	CU_ASSERT(ec.data_offset_stripes > 0);
 	CU_ASSERT(ec.num_stripes == total_physical - ec.data_offset_stripes);
 	CU_ASSERT(ec.bdev.blockcnt == ec.num_stripes * stripe_blocks);
@@ -361,12 +362,12 @@ test_compute_geometry_hard_floor(void)
 	reservation = ut_expected_reservation(strip_size);
 
 	/*
-	 * physical_stripes = blockcnt / strip_size and
-	 * data_offset_stripes = bitmap_reservation + 2 (WIB at front).
-	 * Pick blockcnt so physical_stripes equals data_offset_stripes
-	 * exactly -- one stripe short of a usable volume.
+	 * physical_stripes = blockcnt / strip_size and data_offset_stripes =
+	 * bitmap_reservation + commit strips + 2 (WIB) at the front. Pick
+	 * blockcnt so physical_stripes equals data_offset_stripes exactly --
+	 * one stripe short of a usable volume.
 	 */
-	just_under = (reservation + 2) * strip_size;
+	just_under = (reservation + EC_BITMAP_COMMIT_STRIPS + 2) * strip_size;
 
 	ut_init_ec(&ec, 4, 2, 64, just_under);
 	rc = ec_compute_geometry(&ec);
@@ -377,7 +378,7 @@ test_compute_geometry_hard_floor(void)
  * ec_wib_lba returns front-placed offsets that depend only on
  * strip_size and the bitmap reservation -- not on any disk's blockcnt.
  * Four properties matter:
- *   1. WIB copy 0 sits immediately after the bitmap reservation.
+ *   1. WIB copy 0 sits immediately after the bitmap and commit reservations.
  *   2. WIB copy 1 sits one strip after copy 0.
  *   3. Both LBAs are inside the [0, data_offset_stripes * strip_size)
  *      reserved region -- they must never overlap user data.
@@ -396,11 +397,11 @@ test_wib_lba_front_placement(void)
 	CU_ASSERT(rc == 0);
 
 	bitmap_strips = ec_bitmap_reservation_stripes(&small);
-	expected0     = bitmap_strips * small.strip_size;
-	expected1     = (bitmap_strips + 1) * small.strip_size;
+	expected0     = (bitmap_strips + EC_BITMAP_COMMIT_STRIPS) * small.strip_size;
+	expected1     = (bitmap_strips + EC_BITMAP_COMMIT_STRIPS + 1) * small.strip_size;
 	reserved_lba  = small.data_offset_stripes * small.strip_size;
 
-	/* Copy 0 sits immediately after the bitmap. */
+	/* Copy 0 sits immediately after the bitmap and commit record. */
 	CU_ASSERT(ec_wib_lba(&small, 0) == expected0);
 	/* Copy 1 sits one strip after copy 0. */
 	CU_ASSERT(ec_wib_lba(&small, 1) == expected1);
@@ -423,6 +424,45 @@ test_wib_lba_front_placement(void)
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(ec_wib_lba(&large, 0) == ec_wib_lba(&small, 0));
 	CU_ASSERT(ec_wib_lba(&large, 1) == ec_wib_lba(&small, 1));
+}
+
+/*
+ * ec_bitmap_commit_lba places the commit record's two copies in the strips
+ * between the bitmap reservation and the WIB, with the same disk-size-invariant
+ * arithmetic as ec_wib_lba.
+ */
+static void
+test_commit_lba_front_placement(void)
+{
+	struct ec_bdev small, large;
+	uint64_t bitmap_strips, reserved_lba;
+	int rc;
+
+	ut_init_ec(&small, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&small);
+	CU_ASSERT(rc == 0);
+
+	bitmap_strips = ec_bitmap_reservation_stripes(&small);
+	reserved_lba  = small.data_offset_stripes * small.strip_size;
+
+	/* Copy 0 sits immediately after the bitmap reservation. */
+	CU_ASSERT(ec_bitmap_commit_lba(&small, 0) == bitmap_strips * small.strip_size);
+	/* Copy 1 sits one strip after copy 0. */
+	CU_ASSERT(ec_bitmap_commit_lba(&small, 1) ==
+		  (bitmap_strips + 1) * small.strip_size);
+	/* The commit record ends exactly where the WIB begins. */
+	CU_ASSERT(ec_bitmap_commit_lba(&small, 1) + small.strip_size ==
+		  ec_wib_lba(&small, 0));
+	/* Both copies are inside the reserved front region. */
+	CU_ASSERT(ec_bitmap_commit_lba(&small, 0) < reserved_lba);
+	CU_ASSERT(ec_bitmap_commit_lba(&small, 1) < reserved_lba);
+
+	/* Disk-size invariant, like ec_wib_lba: a 64x larger disk, same LBAs. */
+	ut_init_ec(&large, 4, 2, 64, (64ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&large);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ec_bitmap_commit_lba(&large, 0) == ec_bitmap_commit_lba(&small, 0));
+	CU_ASSERT(ec_bitmap_commit_lba(&large, 1) == ec_bitmap_commit_lba(&small, 1));
 }
 
 /*
@@ -1228,6 +1268,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reservation_is_fixed_max);
 	CU_ADD_TEST(suite, test_compute_geometry_hard_floor);
 	CU_ADD_TEST(suite, test_wib_lba_front_placement);
+	CU_ADD_TEST(suite, test_commit_lba_front_placement);
 	CU_ADD_TEST(suite, test_stripe_base_lba_offset);
 
 	CU_ADD_TEST(suite, test_bitmap_blob_bytes);
