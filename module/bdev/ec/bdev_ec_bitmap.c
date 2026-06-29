@@ -21,8 +21,8 @@
  * This file holds the I/O-free core: geometry math (blob_bytes,
  * reservation) and the serialize / validate / apply of one whole blob.
  * The async persist (fan out to every online disk at the inactive slot)
- * and load (scan all 2n copies, max-generation over CRC-valid) chains
- * build on these.
+ * and load (scan the copies and commit records, adopt the highest committed)
+ * chains build on these.
  *
  * On-disk slot layout (one self-contained extent per slot, replicated
  * identically on every disk):
@@ -355,9 +355,9 @@ ec_bitmap_apply_buf(struct ec_bdev *ec, const void *buf)
  *
  * The bitmap region at the front of every disk is laid out as two slots
  * (copy A / copy B), each occupying the same number of strips. A persist
- * writes the inactive slot on every online writable disk; a load scans
- * all 2n {disk, slot} copies and picks the max-generation CRC-valid
- * winner.
+ * writes the inactive slot on every online writable disk; a load scans the
+ * bitmap and commit copies and picks the highest-generation copy that a commit
+ * record stamps.
  *
  * Slot LBA on disk d, copy c is c * slot_reserved_blocks. The same value
  * on every disk -- raw replication, no per-disk geometry.
@@ -623,6 +623,16 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 	 */
 	ec_bit_clear_flush_if_pending(ec);
 
+	/*
+	 * Fire the resync a hot-swap deferred behind this persist. Runs
+	 * before the ctx free below, so a launched persist re-defers teardown
+	 * behind itself instead of racing the free.
+	 */
+	if (ec->bitmap_resync_pending && !ec->bitmap_persist_in_flight) {
+		ec->bitmap_resync_pending = false;
+		ec_bitmap_resync_after_replace(ec);
+	}
+
 	if (!ctx->acked) {
 		/*
 		 * A round fell short of its threshold; report the failure via
@@ -672,7 +682,7 @@ ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
  *     and the loaded blob fails CRC.
  *   - bitmap_generation. Monotonic counter, incremented by exactly one
  *     writer per persist. Two writers both reading N and both writing
- *     N+1 with different content break the "highest valid generation
+ *     N+1 with different content break the "highest committed generation
  *     wins" rule that ec_bitmap_load_async relies on to pick the committed copy.
  *   - cb_drained. Fires when every write for THIS persist has acked,
  *     which gates the next bit-clear flush. Concurrent persists make
@@ -871,66 +881,152 @@ ec_bitmap_persist_both_copies(struct ec_bdev *ec,
 	return 0;
 }
 
+/* Re-arm the resync on persist failure so a later persist drainout retries. */
+static void
+ec_bitmap_resync_done(void *arg, int rc)
+{
+	struct ec_bdev *ec = arg;
+
+	if (rc != 0) {
+		SPDK_WARNLOG("EC bdev %s: replace bitmap resync failed "
+			     "(rc=%d); retrying on the next bitmap persist\n",
+			     ec->bdev.name, rc);
+		ec->bitmap_resync_pending = true;
+	}
+}
+
+/*
+ * Rejoin a hot-swapped slot to the bitmap quorum by overwriting both copies with
+ * the current map (same protection as fresh create). If a persist is already
+ * in flight, or the bdev is tearing down, defer via bitmap_resync_pending -- a
+ * later persist drainout retries it (or drops it if the bdev is being deleted).
+ * Best-effort; home-thread only.
+ *
+ * Under steady persist traffic this resync may never fire, which is harmless:
+ * ordinary persists alternate slots, so two of them already cover both copies
+ * on the reopened slot. It exists for the quiet-volume case.
+ */
+void
+ec_bitmap_resync_after_replace(struct ec_bdev *ec)
+{
+	int rc;
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	if (ec->bitmap_persist_in_flight || ec->unregister_release_pending) {
+		ec->bitmap_resync_pending = true;
+		return;
+	}
+
+	rc = ec_bitmap_persist_both_copies(ec, ec_bitmap_resync_done, ec);
+	if (rc != 0) {
+		SPDK_WARNLOG("EC bdev %s: replace bitmap resync submit "
+			     "failed (rc=%d); retrying on the next bitmap "
+			     "persist\n", ec->bdev.name, rc);
+		ec->bitmap_resync_pending = true;
+	}
+}
+
 /* -------------------------------------------------------------------------
  * Load
  *
- * Serial scan: for each {disk, slot} in turn, read into read_buf and
- * validate. If the new copy beats the running best (higher generation,
- * or no best yet), swap pointers so best_buf holds the winner. At the
- * end, apply best_buf if any winner exists.
+ * Two serial scans, then a re-read. First scan the commit region and collect
+ * every CRC-valid stamp; then scan the bitmap region and collect every
+ * CRC-valid copy as a {generation, blob_crc, disk, slot} candidate.
+ * ec_bitmap_select_committed picks the highest-generation copy that a stamp
+ * commits (matching generation AND blob_crc), and the selected copy is re-read from
+ * its slot and applied. A torn re-read drops that candidate and re-selects --
+ * another copy of the same committed generation, or the next committed
+ * generation, takes its place.
  *
- * Serial keeps memory bounded at 2 * slot_size_bytes regardless of disk
- * count or volume size; load is one-shot at startup and the latency cost
- * (2n disk reads serially, sub-millisecond each on NVMe) is acceptable.
+ * Only stamped generations are adopted: a sub-threshold partial persist (no
+ * stamp) is never picked, which is the durability gate. Memory stays bounded
+ * at one slot buffer plus the small scalar candidate arrays, regardless of
+ * disk count or volume size; load is one-shot at startup, so the extra reads
+ * (commit scan plus the selected-copy re-read) are acceptable.
  * ------------------------------------------------------------------------- */
+
+#define EC_BITMAP_LOAD_MAX_COPIES (2 * EC_MAX_BASE_BDEVS)
 
 struct ec_bitmap_load_ctx {
 	struct ec_bdev      *ec;
 
-	void                *read_buf;       /* current read target            */
-	void                *best_buf;       /* current best-generation winner */
+	void                *read_buf;        /* scan reads and the selected-copy re-read */
 	uint64_t             slot_size_bytes;
 
-	uint32_t             cur_disk;       /* base-bdev slot 0..n-1          */
-	uint8_t              cur_copy;       /* 0 or 1                          */
+	uint32_t             cur_disk;        /* base-bdev slot 0..n-1 */
+	uint8_t              cur_copy;        /* 0 or 1                */
+	bool                 scanning_commits; /* true: commit scan; false: bitmap scan */
 
-	bool                 has_best;
-	uint64_t             best_gen;
-	uint8_t              best_copy;
+	/*
+	 * Candidates collected by the two scans, one entry per CRC-valid
+	 * {disk, slot}. The parallel arrays map a chosen bitmap candidate back to
+	 * its on-disk location for the re-read, and a stamp back to its slot.
+	 */
+	struct ec_bitmap_gen_crc commit_gc[EC_BITMAP_LOAD_MAX_COPIES];
+	uint8_t                  commit_slot[EC_BITMAP_LOAD_MAX_COPIES];
+	uint32_t                 n_commits;
+
+	struct ec_bitmap_gen_crc bitmap_gc[EC_BITMAP_LOAD_MAX_COPIES];
+	uint32_t                 bitmap_disk[EC_BITMAP_LOAD_MAX_COPIES];
+	uint8_t                  bitmap_copy[EC_BITMAP_LOAD_MAX_COPIES];
+	uint32_t                 n_bitmaps;
+
+	uint32_t                 selected_idx; /* selected bitmap candidate, being re-read */
 
 	ec_bdev_create_cb_fn done_fn;
 	void                *done_arg;
 };
 
-static void ec_bitmap_load_continue(struct ec_bitmap_load_ctx *ctx);
+static void ec_bitmap_load_select(struct ec_bitmap_load_ctx *ctx);
+static void ec_bitmap_load_scan_continue(struct ec_bitmap_load_ctx *ctx);
 
 static void
 ec_bitmap_load_finish(struct ec_bitmap_load_ctx *ctx)
 {
-	struct ec_bdev *ec = ctx->ec;
 	ec_bdev_create_cb_fn done_fn = ctx->done_fn;
 	void *done_arg = ctx->done_arg;
 
-	if (ctx->has_best) {
-		ec_bitmap_apply_buf(ec, ctx->best_buf);
-		ec->bitmap_generation  = ctx->best_gen;
-		ec->bitmap_active_copy = ctx->best_copy;
-		SPDK_NOTICELOG("EC bdev %s: bitmap loaded (gen %" PRIu64 ", slot %u)\n",
-			       ec->bdev.name, ctx->best_gen, ctx->best_copy);
-	} else {
-		SPDK_NOTICELOG("EC bdev %s: no valid bitmap copy found -- "
-			       "stripe_unmapped_map left zero\n",
-			       ec->bdev.name);
-	}
-
 	spdk_dma_free(ctx->read_buf);
-	spdk_dma_free(ctx->best_buf);
 	free(ctx);
 
 	done_fn(done_arg, 0);
 }
 
-/* Advance the load cursor: copy 0 -> copy 1 on the same disk, then next disk. */
+/*
+ * The commit slot whose stamp commits (gen, blob_crc). select_committed only
+ * returns stamped copies, so a miss is a logic error -- asserted, and 0 in a
+ * release build.
+ */
+static uint8_t
+ec_bitmap_load_commit_slot(const struct ec_bitmap_load_ctx *ctx,
+			   uint64_t gen, uint32_t blob_crc)
+{
+	uint32_t i;
+
+	for (i = 0; i < ctx->n_commits; i++) {
+		if (ctx->commit_gc[i].generation == gen &&
+		    ctx->commit_gc[i].blob_crc == blob_crc) {
+			return ctx->commit_slot[i];
+		}
+	}
+
+	assert(false && "selected copy must have a matching stamp");
+	return 0;
+}
+
+/* Drop bitmap candidate idx by swapping in the last one; order does not matter. */
+static void
+ec_bitmap_load_drop_candidate(struct ec_bitmap_load_ctx *ctx, uint32_t idx)
+{
+	uint32_t last = --ctx->n_bitmaps;
+
+	ctx->bitmap_gc[idx]   = ctx->bitmap_gc[last];
+	ctx->bitmap_disk[idx] = ctx->bitmap_disk[last];
+	ctx->bitmap_copy[idx] = ctx->bitmap_copy[last];
+}
+
+/* Advance the scan cursor: copy 0 -> copy 1 on the same disk, then next disk. */
 static void
 ec_bitmap_load_next_copy(struct ec_bitmap_load_ctx *ctx)
 {
@@ -942,39 +1038,137 @@ ec_bitmap_load_next_copy(struct ec_bitmap_load_ctx *ctx)
 	}
 }
 
+/*
+ * Selected-copy re-read completion. The slot must re-validate and still match the
+ * candidate select_committed chose; a torn slot drops the candidate and
+ * re-selects, so another copy of the same committed generation (or the next
+ * committed generation) takes over.
+ */
 static void
-ec_bitmap_load_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+ec_bitmap_load_apply_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct ec_bitmap_load_ctx *ctx = cb_arg;
 	struct ec_bdev            *ec  = ctx->ec;
-	uint64_t                   generation;
+	uint32_t                   idx = ctx->selected_idx;
+	uint64_t                   gen;
+	uint32_t                   blob_crc;
 
 	spdk_bdev_free_io(bdev_io);
 
-	if (success && ec_bitmap_validate_buf(ec, ctx->read_buf, &generation, NULL) == 0) {
-		if (!ctx->has_best || generation > ctx->best_gen) {
-			void *tmp     = ctx->best_buf;
-			ctx->best_buf = ctx->read_buf;
-			ctx->read_buf = tmp;
-			ctx->best_gen  = generation;
-			ctx->best_copy = ctx->cur_copy;
-			ctx->has_best  = true;
+	if (success &&
+	    ec_bitmap_validate_buf(ec, ctx->read_buf, &gen, &blob_crc) == 0 &&
+	    gen == ctx->bitmap_gc[idx].generation &&
+	    blob_crc == ctx->bitmap_gc[idx].blob_crc) {
+		ec_bitmap_apply_buf(ec, ctx->read_buf);
+		ec->bitmap_generation         = gen;
+		ec->bitmap_active_copy        = ctx->bitmap_copy[idx];
+		ec->bitmap_commit_active_copy = ec_bitmap_load_commit_slot(ctx, gen, blob_crc);
+		SPDK_NOTICELOG("EC bdev %s: bitmap loaded (gen %" PRIu64 ", slot %u)\n",
+			       ec->bdev.name, gen, ctx->bitmap_copy[idx]);
+		ec_bitmap_load_finish(ctx);
+		return;
+	}
+
+	SPDK_WARNLOG("EC bdev %s: committed bitmap copy at disk %u slot %u failed "
+		     "re-read -- trying another\n", ec->bdev.name,
+		     ctx->bitmap_disk[idx], ctx->bitmap_copy[idx]);
+	ec_bitmap_load_drop_candidate(ctx, idx);
+	ec_bitmap_load_select(ctx);
+}
+
+/*
+ * Pick the highest committed bitmap candidate and re-read it to apply. A
+ * candidate whose re-read cannot even be submitted is dropped here; a torn
+ * re-read is handled by the completion. When nothing is committed the map is
+ * left zero -- a fresh or unrecoverable volume.
+ */
+static void
+ec_bitmap_load_select(struct ec_bitmap_load_ctx *ctx)
+{
+	struct ec_bdev *ec = ctx->ec;
+
+	while (true) {
+		int      idx = ec_bitmap_select_committed(ctx->bitmap_gc, ctx->n_bitmaps,
+							  ctx->commit_gc, ctx->n_commits);
+		uint32_t disk;
+		int      rc;
+
+		if (idx < 0) {
+			SPDK_NOTICELOG("EC bdev %s: no committed bitmap copy found -- "
+				       "stripe_unmapped_map left zero\n", ec->bdev.name);
+			ec_bitmap_load_finish(ctx);
+			return;
 		}
+
+		ctx->selected_idx = (uint32_t)idx;
+		disk            = ctx->bitmap_disk[idx];
+
+		rc = spdk_bdev_read(ec->descs[disk], ec->bitmap_chans[disk],
+				    ctx->read_buf,
+				    ec_bitmap_slot_lba_blocks(ec, ctx->bitmap_copy[idx])
+				    * ec->bdev.blocklen,
+				    ctx->slot_size_bytes,
+				    ec_bitmap_load_apply_read_cb, ctx);
+		if (rc == 0) {
+			return;  /* re-read submitted; completion applies or retries */
+		}
+
+		SPDK_WARNLOG("EC bdev %s: re-read submit failed for disk %u slot %u "
+			     "(rc=%d) -- trying another\n", ec->bdev.name, disk,
+			     ctx->bitmap_copy[idx], rc);
+		ec_bitmap_load_drop_candidate(ctx, (uint32_t)idx);
+	}
+}
+
+/* Collect a CRC-valid copy at the current scan position into the candidates. */
+static void
+ec_bitmap_load_scan_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_bitmap_load_ctx *ctx = cb_arg;
+	struct ec_bdev            *ec  = ctx->ec;
+	uint64_t                   gen;
+	uint32_t                   blob_crc;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success && ctx->scanning_commits) {
+		if (ec_bitmap_commit_validate_buf(ctx->read_buf, &gen, &blob_crc) == 0 &&
+		    ctx->n_commits < EC_BITMAP_LOAD_MAX_COPIES) {
+			ctx->commit_gc[ctx->n_commits].generation = gen;
+			ctx->commit_gc[ctx->n_commits].blob_crc   = blob_crc;
+			ctx->commit_slot[ctx->n_commits]          = ctx->cur_copy;
+			ctx->n_commits++;
+		}
+	} else if (success &&
+		   ec_bitmap_validate_buf(ec, ctx->read_buf, &gen, &blob_crc) == 0 &&
+		   ctx->n_bitmaps < EC_BITMAP_LOAD_MAX_COPIES) {
+		ctx->bitmap_gc[ctx->n_bitmaps].generation = gen;
+		ctx->bitmap_gc[ctx->n_bitmaps].blob_crc   = blob_crc;
+		ctx->bitmap_disk[ctx->n_bitmaps]          = ctx->cur_disk;
+		ctx->bitmap_copy[ctx->n_bitmaps]          = ctx->cur_copy;
+		ctx->n_bitmaps++;
 	}
 
 	ec_bitmap_load_next_copy(ctx);
-
-	ec_bitmap_load_continue(ctx);
+	ec_bitmap_load_scan_continue(ctx);
 }
 
+/*
+ * Serial scan driver. Reads each {disk, slot} of the current region into
+ * read_buf; the completion collects CRC-valid candidates. When the commit
+ * region is done it restarts the cursor over the bitmap region; when the
+ * bitmap region is done it hands off to ec_bitmap_load_select.
+ */
 static void
-ec_bitmap_load_continue(struct ec_bitmap_load_ctx *ctx)
+ec_bitmap_load_scan_continue(struct ec_bitmap_load_ctx *ctx)
 {
 	struct ec_bdev *ec = ctx->ec;
 	int             rc;
 
 	while (ctx->cur_disk < ec->n) {
 		uint32_t disk = ctx->cur_disk;
+		uint64_t lba_blocks;
+		uint64_t io_bytes;
 
 		if (!ec->descs[disk] || !ec->bitmap_chans[disk] ||
 		    !ec_slot_is_readable(ec, disk)) {
@@ -983,19 +1177,22 @@ ec_bitmap_load_continue(struct ec_bitmap_load_ctx *ctx)
 			continue;
 		}
 
-		rc = spdk_bdev_read(ec->descs[disk],
-				    ec->bitmap_chans[disk],
-				    ctx->read_buf,
-				    ec_bitmap_slot_lba_blocks(ec, ctx->cur_copy)
-				    * ec->bdev.blocklen,
-				    ctx->slot_size_bytes,
-				    ec_bitmap_load_read_cb,
-				    ctx);
+		if (ctx->scanning_commits) {
+			lba_blocks = ec_bitmap_commit_lba(ec, ctx->cur_copy);
+			io_bytes   = ec->bdev.blocklen;
+		} else {
+			lba_blocks = ec_bitmap_slot_lba_blocks(ec, ctx->cur_copy);
+			io_bytes   = ctx->slot_size_bytes;
+		}
+
+		rc = spdk_bdev_read(ec->descs[disk], ec->bitmap_chans[disk],
+				    ctx->read_buf, lba_blocks * ec->bdev.blocklen,
+				    io_bytes, ec_bitmap_load_scan_read_cb, ctx);
 		if (rc != 0) {
-			SPDK_WARNLOG("EC bdev %s: bitmap load read submit failed "
-				     "for slot %u copy %u (rc=%d) -- skipping\n",
-				     ec->bdev.name, disk, ctx->cur_copy, rc);
-			/* Skip this copy, try the next. */
+			SPDK_WARNLOG("EC bdev %s: bitmap load read submit failed for %s "
+				     "disk %u slot %u (rc=%d) -- skipping\n", ec->bdev.name,
+				     ctx->scanning_commits ? "commit" : "bitmap", disk,
+				     ctx->cur_copy, rc);
 			ec_bitmap_load_next_copy(ctx);
 			continue;
 		}
@@ -1003,7 +1200,16 @@ ec_bitmap_load_continue(struct ec_bitmap_load_ctx *ctx)
 		return;  /* I/O submitted; callback drives the next step. */
 	}
 
-	ec_bitmap_load_finish(ctx);
+	if (ctx->scanning_commits) {
+		/* Commit region scanned; restart the cursor over the bitmap region. */
+		ctx->scanning_commits = false;
+		ctx->cur_disk = 0;
+		ctx->cur_copy = 0;
+		ec_bitmap_load_scan_continue(ctx);
+		return;
+	}
+
+	ec_bitmap_load_select(ctx);
 }
 
 void
@@ -1011,7 +1217,6 @@ ec_bitmap_load_async(struct ec_bdev *ec,
 		     ec_bdev_create_cb_fn done_fn, void *done_arg)
 {
 	struct ec_bitmap_load_ctx *ctx;
-	uint64_t                   slot_size_bytes;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -1021,28 +1226,24 @@ ec_bitmap_load_async(struct ec_bdev *ec,
 		return;
 	}
 
-	slot_size_bytes = ec_bitmap_slot_io_blocks(ec) * ec->bdev.blocklen;
-
-	ctx->read_buf = spdk_dma_zmalloc(slot_size_bytes, EC_DMA_ALIGN, NULL);
-	ctx->best_buf = spdk_dma_zmalloc(slot_size_bytes, EC_DMA_ALIGN, NULL);
-	if (!ctx->read_buf || !ctx->best_buf) {
-		SPDK_ERRLOG("EC bdev %s: OOM for bitmap load buffers "
+	ctx->slot_size_bytes = ec_bitmap_slot_io_blocks(ec) * ec->bdev.blocklen;
+	ctx->read_buf = spdk_dma_zmalloc(ctx->slot_size_bytes, EC_DMA_ALIGN, NULL);
+	if (!ctx->read_buf) {
+		SPDK_ERRLOG("EC bdev %s: OOM for bitmap load buffer "
 			    "(slot_size=%" PRIu64 " bytes)\n",
-			    ec->bdev.name, slot_size_bytes);
-		spdk_dma_free(ctx->read_buf);
-		spdk_dma_free(ctx->best_buf);
+			    ec->bdev.name, ctx->slot_size_bytes);
 		free(ctx);
 		done_fn(done_arg, -ENOMEM);
 		return;
 	}
 
-	ctx->ec              = ec;
-	ctx->slot_size_bytes = slot_size_bytes;
-	ctx->done_fn         = done_fn;
-	ctx->done_arg        = done_arg;
-	/* cur_disk = cur_copy = 0; has_best = false; (calloc'd) */
+	ctx->ec               = ec;
+	ctx->scanning_commits = true;
+	ctx->done_fn          = done_fn;
+	ctx->done_arg         = done_arg;
+	/* cursor and candidate counts are zero (calloc'd); commit scan runs first */
 
-	ec_bitmap_load_continue(ctx);
+	ec_bitmap_load_scan_continue(ctx);
 }
 
 /* -------------------------------------------------------------------------

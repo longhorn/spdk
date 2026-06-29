@@ -663,6 +663,14 @@ struct ec_bdev {
 	uint8_t                  bitmap_active_copy;        /* 0 or 1                       */
 	uint8_t                  bitmap_commit_active_copy; /* 0 or 1; latest stamp slot    */
 	bool                     bitmap_persist_in_flight;
+	/*
+	 * A hot-swapped slot rejoined the persist quorum (bitmap_chans[]
+	 * reopened in ec_replace_finish) but a both-copy persist is still owed --
+	 * a persist was in flight when replace finished, or it failed.
+	 * Drained on a later persist completion (ec_bitmap_persist_write_cb).
+	 * Bitmap analog of wib_repersist_needed.
+	 */
+	bool                     bitmap_resync_pending;
 
 	/*
 	 * Deferred dedicated-channel teardown. A persist write to a failing
@@ -1608,6 +1616,13 @@ int ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
  */
 int ec_bitmap_persist_both_copies(struct ec_bdev *ec,
 			       ec_bitmap_persist_cb_fn done_fn, void *done_arg);
+
+/*
+ * ec_bitmap_resync_after_replace -- rejoin a hot-swapped slot to the bitmap
+ * quorum by overwriting both copies now, or deferring behind an in-flight persist
+ * (bitmap_resync_pending). Best-effort. Home-thread only.
+ */
+void ec_bitmap_resync_after_replace(struct ec_bdev *ec);
 
 /*
  * ec_bitmap_load_async -- read the bitmap blob from disk at startup

@@ -2161,6 +2161,36 @@ ec_replace_finish(struct ec_replace_ctx *rctx, int rc)
 	ec->replace_in_progress = false;
 
 	if (rc == 0) {
+		/*
+		 * Rejoin the hot-swapped slot to the bitmap quorum. Its bitmap
+		 * channel was released when the old disk failed
+		 * (ec_release_slot_dedicated_channels) and is reopened nowhere else,
+		 * so without this the slot is skipped by every bitmap persist for the
+		 * life of the bdev. Writing it while REPLACING is safe: the bitmap is
+		 * whole-volume metadata and the rebuilder never touches the front
+		 * reservation region.
+		 */
+		if (!ec->bitmap_chans[slot] && ec->descs[slot]) {
+			ec->bitmap_chans[slot] =
+				spdk_bdev_get_io_channel(ec->descs[slot]);
+			if (!ec->bitmap_chans[slot]) {
+				SPDK_WARNLOG("EC bdev %s: failed to reopen bitmap "
+					     "channel for replacement slot %u; slot "
+					     "will not receive bitmap persists until "
+					     "reload\n", ec->bdev.name, slot);
+			}
+		}
+
+		/*
+		 * Overwrite both bitmap copies on the new slot so a stale/foreign
+		 * blob it may carry cannot out-rank ours on a later load, and the
+		 * committed blob is back on the m+1 copies the stamp attests --
+		 * same protection as fresh create.
+		 */
+		if (ec->bitmap_chans[slot]) {
+			ec_bitmap_resync_after_replace(ec);
+		}
+
 		SPDK_NOTICELOG("EC bdev %s: slot %u hot-swap complete -- "
 			       "disk '%s' is REPLACING; needs_rebuild=true. "
 			       "Run bdev_ec_start_rebuild to restore NORMAL.\n",
