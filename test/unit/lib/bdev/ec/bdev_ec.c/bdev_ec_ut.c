@@ -644,6 +644,79 @@ test_bitmap_validate_failures(void)
 }
 
 /*
+ * Fill a commit record and validate it back: the committed generation and
+ * blob CRC survive the round-trip.
+ */
+static void
+test_commit_fill_validate(void)
+{
+	uint8_t *buf;
+	uint64_t gen;
+	uint32_t blob_crc;
+	int      rc;
+
+	buf = calloc(1, sizeof(struct ec_bitmap_commit) + sizeof(uint32_t));
+	SPDK_CU_ASSERT_FATAL(buf != NULL);
+
+	ec_bitmap_commit_fill_buf(99 /* gen */, 0xDEADBEEF /* blob_crc */, buf);
+
+	gen      = 0;
+	blob_crc = 0;
+	rc = ec_bitmap_commit_validate_buf(buf, &gen, &blob_crc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(gen == 99);
+	CU_ASSERT(blob_crc == 0xDEADBEEF);
+
+	free(buf);
+}
+
+/*
+ * commit_validate_buf must reject bad magic, a wrong version, and a flipped
+ * byte (CRC mismatch).
+ */
+static void
+test_commit_validate_failures(void)
+{
+	uint8_t *buf;
+	uint64_t gen;
+	uint32_t blob_crc;
+	int      rc;
+
+	buf = calloc(1, sizeof(struct ec_bitmap_commit) + sizeof(uint32_t));
+	SPDK_CU_ASSERT_FATAL(buf != NULL);
+
+	/* Bad magic: zero out the first field. */
+	ec_bitmap_commit_fill_buf(1, 0, buf);
+	memset(buf, 0, sizeof(uint64_t)); /* magic is the first field */
+	rc = ec_bitmap_commit_validate_buf(buf, &gen, &blob_crc);
+	CU_ASSERT(rc == -EINVAL);
+
+	/*
+	 * Wrong version: bump the version field and recompute the CRC so the
+	 * record is self-consistent. validate must still reject a version this
+	 * build does not understand.
+	 */
+	ec_bitmap_commit_fill_buf(1, 0, buf);
+	{
+		struct ec_bitmap_commit *rec     = (struct ec_bitmap_commit *)buf;
+		uint32_t                *crc_ptr = (uint32_t *)(rec + 1);
+
+		rec->version++;
+		*crc_ptr = spdk_crc32c_update(buf, sizeof(*rec), 0);
+	}
+	rc = ec_bitmap_commit_validate_buf(buf, &gen, &blob_crc);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* CRC mismatch: corrupt a field without recomputing the trailer. */
+	ec_bitmap_commit_fill_buf(1, 0, buf);
+	buf[sizeof(uint64_t)] ^= 0xFF; /* flip a byte in committed_gen */
+	rc = ec_bitmap_commit_validate_buf(buf, &gen, &blob_crc);
+	CU_ASSERT(rc == -EINVAL);
+
+	free(buf);
+}
+
+/*
  * Fill a blob, wipe stripe_unmapped_map, apply the blob, and verify
  * that the previously-set bits are restored and no spurious bits appear.
  */
@@ -1160,6 +1233,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_bitmap_blob_bytes);
 	CU_ADD_TEST(suite, test_bitmap_fill_validate);
 	CU_ADD_TEST(suite, test_bitmap_validate_failures);
+	CU_ADD_TEST(suite, test_commit_fill_validate);
+	CU_ADD_TEST(suite, test_commit_validate_failures);
 	CU_ADD_TEST(suite, test_bitmap_apply);
 	CU_ADD_TEST(suite, test_bitmap_slot_lba_invariance);
 	CU_ADD_TEST(suite, test_bitmap_validate_accepts_smaller);

@@ -218,6 +218,48 @@ ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
 	return 0;
 }
 
+/* Serialize a commit record (the "stamp") into buf with a CRC32C trailer. */
+void
+ec_bitmap_commit_fill_buf(uint64_t committed_gen, uint32_t blob_crc, void *buf)
+{
+	struct ec_bitmap_commit *rec     = buf;
+	uint32_t                *crc_ptr = (uint32_t *)(rec + 1);
+
+	rec->magic         = EC_BITMAP_COMMIT_MAGIC;
+	rec->version       = EC_BITMAP_COMMIT_VERSION;
+	rec->committed_gen = committed_gen;
+	rec->blob_crc      = blob_crc;
+	rec->reserved      = 0;
+
+	*crc_ptr = spdk_crc32c_update(buf, sizeof(*rec), 0);
+}
+
+/* Validate a commit record read from disk: magic, version, CRC32C trailer. */
+int
+ec_bitmap_commit_validate_buf(const void *buf, uint64_t *gen_out,
+			      uint32_t *blob_crc_out)
+{
+	const struct ec_bitmap_commit *rec     = buf;
+	const uint32_t                *crc_ptr = (const uint32_t *)(rec + 1);
+	uint32_t                       actual_crc;
+
+	if (rec->magic != EC_BITMAP_COMMIT_MAGIC) {
+		return -EINVAL;
+	}
+	if (rec->version != EC_BITMAP_COMMIT_VERSION) {
+		return -EINVAL;
+	}
+
+	actual_crc = spdk_crc32c_update(buf, sizeof(*rec), 0);
+	if (actual_crc != *crc_ptr) {
+		return -EINVAL;
+	}
+
+	*gen_out      = rec->committed_gen;
+	*blob_crc_out = rec->blob_crc;
+	return 0;
+}
+
 /*
  * ec_bitmap_apply_buf -- copy a validated blob's span into
  * ec->stripe_unmapped_map. Call only after ec_bitmap_validate_buf has

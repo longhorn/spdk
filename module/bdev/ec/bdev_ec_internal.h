@@ -102,6 +102,7 @@
 #include "bdev_ec.h"
 
 #include "spdk/stdinc.h"
+#include "spdk/assert.h"
 #include "spdk/bdev.h"
 #include "spdk/bdev_module.h"
 #include "spdk/env.h"
@@ -430,6 +431,42 @@ struct ec_bitmap_header {
 	uint32_t version;
 	uint32_t reserved;      /* zeroed; aligns span[] to an 8-byte (uint64_t) boundary */
 };
+
+/* Magic in the on-disk bitmap commit record. */
+#define EC_BITMAP_COMMIT_MAGIC   UINT64_C(0x4543434f4d4d4954)   /* "ECCOMMIT" */
+
+/*
+ * The commit record's own format version, separate from EC_BITMAP_VERSION. Load
+ * rejects a record whose version this build does not understand.
+ */
+#define EC_BITMAP_COMMIT_VERSION 1u
+
+/*
+ * On-disk commit record ("stamp") for the unmapped bitmap. It names the
+ * bitmap generation that has been durably committed, letting load tell a
+ * committed generation from a partially-written one. A uint32_t crc32c
+ * trailer follows the struct.
+ *
+ * blob_crc is the CRC of the committed blob, so a record can only be paired
+ * with the blob it commits.
+ *
+ * The CRC covers the whole struct, so every byte must belong to a field with
+ * a known value -- no compiler padding. reserved is a uint64_t for that
+ * reason: as a uint32_t the fields would total 28 bytes and the compiler
+ * would pad the struct out to 32 to keep it 8-byte aligned, and those 4 pad
+ * bytes (which no field sets) would still fall under the CRC. The wider
+ * reserved field fills that space itself, so all 32 bytes are named and
+ * zero-initialized. It also doubles as spare room for a future field.
+ */
+struct ec_bitmap_commit {
+	uint64_t magic;
+	uint64_t committed_gen;  /* the bitmap generation this record commits        */
+	uint32_t blob_crc;       /* CRC32C of the committed blob                      */
+	uint32_t version;
+	uint64_t reserved;       /* zeroed spare */
+};
+SPDK_STATIC_ASSERT(sizeof(struct ec_bitmap_commit) == 32,
+		   "on-disk commit record size must stay 32 bytes");
 
 /* =========================================================================
  * Startup scrub context
@@ -1447,6 +1484,23 @@ void ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
  */
 int  ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
 			    uint64_t *gen_out);
+
+/*
+ * ec_bitmap_commit_fill_buf -- serialize a commit record into buf, followed
+ * by a CRC32C trailer. buf must hold at least
+ * sizeof(struct ec_bitmap_commit) + sizeof(uint32_t) bytes.
+ */
+void ec_bitmap_commit_fill_buf(uint64_t committed_gen, uint32_t blob_crc,
+			       void *buf);
+
+/*
+ * ec_bitmap_commit_validate_buf -- check a commit record read back from
+ * disk: magic, version, and the CRC32C trailer over the struct. Returns 0
+ * and fills *gen_out / *blob_crc_out on success, -EINVAL on any mismatch --
+ * which is also what a never-written or torn record looks like.
+ */
+int  ec_bitmap_commit_validate_buf(const void *buf, uint64_t *gen_out,
+				   uint32_t *blob_crc_out);
 
 /*
  * ec_bitmap_apply_buf -- copy the span out of a validated blob into
