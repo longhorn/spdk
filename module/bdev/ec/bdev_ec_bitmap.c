@@ -446,6 +446,44 @@ struct ec_bitmap_persist_ctx {
 	void                    *cb_drained_arg;
 };
 
+static void ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
+				       void *cb_arg);
+
+/*
+ * Issue one persist round: write buf (size_bytes) to lba_blocks on every
+ * writable disk, accumulating writes_in_flight and first_err in ctx.
+ * ec_bitmap_persist_write_cb drives the round to completion.
+ */
+static void
+ec_bitmap_persist_issue_round(struct ec_bitmap_persist_ctx *ctx, void *buf,
+			      uint64_t lba_blocks, uint64_t size_bytes)
+{
+	struct ec_bdev *ec = ctx->ec;
+	uint32_t        i;
+	int             rc;
+
+	for (i = 0; i < ec->n; i++) {
+		if (!ec->descs[i] || !ec->bitmap_chans[i] ||
+		    !ec_slot_is_writable(ec, i)) {
+			continue;
+		}
+
+		ctx->writes_in_flight++;
+		rc = spdk_bdev_write(ec->descs[i], ec->bitmap_chans[i], buf,
+				     lba_blocks * ec->bdev.blocklen, size_bytes,
+				     ec_bitmap_persist_write_cb, ctx);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: bitmap persist submit failed "
+				     "for slot %u (rc=%d)\n",
+				     ec->bdev.name, i, rc);
+			ctx->writes_in_flight--;
+			if (ctx->first_err == 0) {
+				ctx->first_err = rc;
+			}
+		}
+	}
+}
+
 static void
 ec_bitmap_persist_write_cb(struct spdk_bdev_io *bdev_io, bool success,
 			   void *cb_arg)
@@ -651,30 +689,8 @@ ec_bitmap_persist_async(struct ec_bdev *ec, const uint64_t *source_map,
 
 	ec->bitmap_persist_in_flight = true;
 
-	for (i = 0; i < ec->n; i++) {
-		if (!ec->descs[i] || !ec->bitmap_chans[i] ||
-		    !ec_slot_is_writable(ec, i)) {
-			continue;
-		}
-
-		ctx->writes_in_flight++;
-		rc = spdk_bdev_write(ec->descs[i],
-				     ec->bitmap_chans[i],
-				     ctx->dma_buf,
-				     slot_lba_blocks * ec->bdev.blocklen,
-				     slot_size_bytes,
-				     ec_bitmap_persist_write_cb,
-				     ctx);
-		if (rc != 0) {
-			SPDK_WARNLOG("EC bdev %s: bitmap persist submit failed "
-				     "for slot %u (rc=%d)\n",
-				     ec->bdev.name, i, rc);
-			ctx->writes_in_flight--;
-			if (ctx->first_err == 0) {
-				ctx->first_err = rc;
-			}
-		}
-	}
+	ec_bitmap_persist_issue_round(ctx, ctx->dma_buf, slot_lba_blocks,
+				      slot_size_bytes);
 
 	if (ctx->writes_in_flight == 0) {
 		/*
