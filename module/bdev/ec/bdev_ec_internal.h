@@ -1486,12 +1486,12 @@ void ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
  * version, num_stripes match the current volume geometry, blob_bytes
  * is exactly the expected length for that geometry, and the CRC32C
  * over [start, start + blob_bytes) matches the trailer at offset
- * blob_bytes. Returns 0 and fills *gen_out on success, -EINVAL on any
- * mismatch -- which is also what a never-written or torn slot looks
- * like.
+ * blob_bytes. Returns 0 and fills *gen_out -- and *blob_crc_out, when
+ * non-NULL, with the validated CRC trailer -- on success, -EINVAL on any
+ * mismatch -- which is also what a never-written or torn slot looks like.
  */
 int  ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
-			    uint64_t *gen_out);
+			    uint64_t *gen_out, uint32_t *blob_crc_out);
 
 /*
  * ec_bitmap_commit_fill_buf -- serialize a commit record into buf, followed

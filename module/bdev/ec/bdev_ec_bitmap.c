@@ -180,13 +180,14 @@ ec_bitmap_fill_buf(struct ec_bdev *ec, const uint64_t *source_map,
  *   5. CRC32C over [start, start + blob_bytes) matches the trailer at
  *      offset blob_bytes.
  *
- * Returns 0 and fills *gen_out on success, -EINVAL otherwise. A torn
- * write looks the same as any other invalid slot from the caller's
- * point of view.
+ * Returns 0 and fills *gen_out -- and *blob_crc_out, when non-NULL, with the
+ * validated CRC trailer so the caller can match the copy against a commit
+ * record -- on success; -EINVAL otherwise. A torn write looks the same as any
+ * other invalid slot from the caller's point of view.
  */
 int
 ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
-		       uint64_t *gen_out)
+		       uint64_t *gen_out, uint32_t *blob_crc_out)
 {
 	const struct ec_bitmap_header *hdr        = buf;
 	uint64_t                       blob_bytes;
@@ -215,6 +216,9 @@ ec_bitmap_validate_buf(const struct ec_bdev *ec, const void *buf,
 	}
 
 	*gen_out = hdr->generation;
+	if (blob_crc_out) {
+		*blob_crc_out = expected_crc;
+	}
 	return 0;
 }
 
@@ -947,7 +951,7 @@ ec_bitmap_load_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	spdk_bdev_free_io(bdev_io);
 
-	if (success && ec_bitmap_validate_buf(ec, ctx->read_buf, &generation) == 0) {
+	if (success && ec_bitmap_validate_buf(ec, ctx->read_buf, &generation, NULL) == 0) {
 		if (!ctx->has_best || generation > ctx->best_gen) {
 			void *tmp     = ctx->best_buf;
 			ctx->best_buf = ctx->read_buf;

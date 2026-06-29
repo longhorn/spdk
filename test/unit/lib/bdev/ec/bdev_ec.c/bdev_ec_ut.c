@@ -603,6 +603,7 @@ test_bitmap_fill_validate(void)
 	struct ec_bdev ec;
 	uint8_t       *buf;
 	uint64_t       gen;
+	uint32_t       blob_crc;
 	int            rc;
 
 	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
@@ -619,10 +620,19 @@ test_bitmap_fill_validate(void)
 
 	ec_bitmap_fill_buf(&ec, ec.stripe_unmapped_map, 42 /* generation */, buf);
 
-	gen = 0;
-	rc  = ec_bitmap_validate_buf(&ec, buf, &gen);
+	gen      = 0;
+	blob_crc = 0;
+	rc  = ec_bitmap_validate_buf(&ec, buf, &gen, &blob_crc);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(gen == 42);
+	/* blob_crc is the CRC32C trailer fill_buf wrote at offset blob_bytes. */
+	{
+		struct ec_bitmap_header *hdr     = (struct ec_bitmap_header *)buf;
+		uint32_t                *crc_ptr = (uint32_t *)(buf + hdr->blob_bytes);
+
+		CU_ASSERT(blob_crc != 0);
+		CU_ASSERT(blob_crc == *crc_ptr);
+	}
 
 	free(buf);
 	ut_free_unmapped_map(&ec);
@@ -651,7 +661,7 @@ test_bitmap_validate_failures(void)
 	/* Bad magic: zero out the magic field. */
 	ec_bitmap_fill_buf(&ec, ec.stripe_unmapped_map, 1, buf);
 	memset(buf, 0, sizeof(uint64_t)); /* magic is the first field */
-	rc = ec_bitmap_validate_buf(&ec, buf, &gen);
+	rc = ec_bitmap_validate_buf(&ec, buf, &gen, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/*
@@ -670,13 +680,13 @@ test_bitmap_validate_failures(void)
 		hdr->num_stripes++;
 		*crc_ptr = spdk_crc32c_update(buf, (uint32_t)blob_bytes, 0);
 	}
-	rc = ec_bitmap_validate_buf(&ec, buf, &gen);
+	rc = ec_bitmap_validate_buf(&ec, buf, &gen, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* CRC mismatch: corrupt a byte in the span (past the header). */
 	ec_bitmap_fill_buf(&ec, ec.stripe_unmapped_map, 1, buf);
 	buf[sizeof(struct ec_bitmap_header)] ^= 0xFF;
-	rc = ec_bitmap_validate_buf(&ec, buf, &gen);
+	rc = ec_bitmap_validate_buf(&ec, buf, &gen, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	free(buf);
@@ -993,7 +1003,7 @@ test_bitmap_validate_accepts_smaller(void)
 
 	/* The small copy validates against the grown volume. */
 	gen = 0;
-	rc  = ec_bitmap_validate_buf(&large, buf, &gen);
+	rc  = ec_bitmap_validate_buf(&large, buf, &gen, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(gen == 7);
 
@@ -1009,7 +1019,7 @@ test_bitmap_validate_accepts_smaller(void)
 	/* The reverse must be rejected: a larger copy on a smaller volume. */
 	buf = ut_alloc_slot_buf(&large);
 	ec_bitmap_fill_buf(&large, large.stripe_unmapped_map, 1, buf);
-	rc = ec_bitmap_validate_buf(&small, buf, &gen);
+	rc = ec_bitmap_validate_buf(&small, buf, &gen, NULL);
 	CU_ASSERT(rc == -EINVAL);
 	free(buf);
 
