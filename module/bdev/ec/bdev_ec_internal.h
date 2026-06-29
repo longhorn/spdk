@@ -1510,6 +1510,34 @@ int  ec_bitmap_commit_validate_buf(const void *buf, uint64_t *gen_out,
 				   uint32_t *blob_crc_out);
 
 /*
+ * A (generation, blob CRC) pair pulled from one scanned copy -- a bitmap slot
+ * or a commit record. ec_bitmap_select_committed matches the bitmap set
+ * against the commit set.
+ */
+struct ec_bitmap_gen_crc {
+	uint64_t generation;
+	uint32_t blob_crc;
+};
+
+/*
+ * ec_bitmap_select_committed -- the pure load decision. Given every
+ * CRC-valid bitmap copy and every CRC-valid commit record scanned off disk,
+ * return the index into bitmaps[] of the highest-generation bitmap copy that
+ * a commit record stamps (same generation AND same blob_crc). Returns -1
+ * when no scanned bitmap copy is committed.
+ *
+ * This is the durability gate. Only a generation that reached the m+1 commit
+ * threshold gets a stamp, so a sub-threshold partial persist is never adopted
+ * on reload. The blob_crc match matters too: after a crash two blobs can share
+ * a generation -- on reload the in-memory counter resets to the committed value
+ * and climbs again -- so generation alone cannot distinguish them.
+ */
+int  ec_bitmap_select_committed(const struct ec_bitmap_gen_crc *bitmaps,
+				uint32_t n_bitmaps,
+				const struct ec_bitmap_gen_crc *commits,
+				uint32_t n_commits);
+
+/*
  * ec_bitmap_apply_buf -- copy the span out of a validated blob into
  * ec->stripe_unmapped_map. Call only after ec_bitmap_validate_buf has
  * returned 0 for this buffer.

@@ -261,6 +261,46 @@ ec_bitmap_commit_validate_buf(const void *buf, uint64_t *gen_out,
 }
 
 /*
+ * True when some scanned commit record recorded this copy's generation and
+ * blob_crc. A commit record is written only after the blob is safely on enough
+ * disks, so a match means the copy was fully written -- not a partial persist.
+ * ec_bitmap_select_committed adopts only these copies.
+ */
+static bool
+ec_bitmap_copy_is_committed(const struct ec_bitmap_gen_crc *commits, uint32_t n_commits,
+			    struct ec_bitmap_gen_crc copy)
+{
+	uint32_t i;
+
+	for (i = 0; i < n_commits; i++) {
+		if (commits[i].generation == copy.generation &&
+		    commits[i].blob_crc == copy.blob_crc) {
+			return true;
+		}
+	}
+	return false;
+}
+
+int
+ec_bitmap_select_committed(const struct ec_bitmap_gen_crc *bitmaps, uint32_t n_bitmaps,
+			   const struct ec_bitmap_gen_crc *commits, uint32_t n_commits)
+{
+	int      best = -1;
+	uint32_t i;
+
+	for (i = 0; i < n_bitmaps; i++) {
+		if (!ec_bitmap_copy_is_committed(commits, n_commits, bitmaps[i])) {
+			continue;
+		}
+		if (best < 0 || bitmaps[i].generation > bitmaps[best].generation) {
+			best = (int)i;
+		}
+	}
+
+	return best;
+}
+
+/*
  * ec_bitmap_apply_buf -- copy a validated blob's span into
  * ec->stripe_unmapped_map. Call only after ec_bitmap_validate_buf has
  * returned 0 for this buffer.

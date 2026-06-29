@@ -757,6 +757,120 @@ test_commit_validate_failures(void)
 }
 
 /*
+ * ec_bitmap_select_committed is the durability gate on load. Drive it through
+ * a table of scan outcomes: a bitmap copy is adopted only when a commit record
+ * stamps its exact (generation, blob_crc) pair, and among stamped copies the
+ * highest generation wins. -1 means nothing scanned is committed.
+ */
+static void
+test_select_committed(void)
+{
+	const uint32_t CRC_A = 0xA1A1A1A1u, CRC_B = 0xB2B2B2B2u,
+		       CRC_C = 0xC3C3C3C3u, CRC_X = 0x99999999u;
+	const uint64_t GEN_HI = (1ull << 33) | 5;  /* shares low 32 bits with GEN_LO */
+	const uint64_t GEN_LO = 5;
+
+	struct select_case {
+		const char              *name;
+		struct ec_bitmap_gen_crc bitmaps[4];
+		uint32_t                 n_bitmaps;
+		struct ec_bitmap_gen_crc commits[4];
+		uint32_t                 n_commits;
+		int                      expected;
+	} cases[] = {
+		{ "no copies at all",
+		  {{0, 0}}, 0, {{0, 0}}, 0, -1 },
+
+		{ "bitmaps present but nothing stamped",
+		  {{5, CRC_A}}, 1, {{0, 0}}, 0, -1 },
+
+		{ "single stamped copy is adopted",
+		  {{5, CRC_A}}, 1, {{5, CRC_A}}, 1, 0 },
+
+		{ "generation matches but blob_crc does not",
+		  {{5, CRC_A}}, 1, {{5, CRC_B}}, 1, -1 },
+
+		{ "blob_crc matches but generation does not",
+		  {{5, CRC_A}}, 1, {{4, CRC_A}}, 1, -1 },
+
+		{ "newer copy unstamped, older copy stamped -- pick committed",
+		  {{5, CRC_A}, {4, CRC_B}}, 2, {{4, CRC_B}}, 1, 1 },
+
+		{ "both copies stamped -- highest generation wins",
+		  {{5, CRC_A}, {4, CRC_B}}, 2, {{5, CRC_A}, {4, CRC_B}}, 2, 0 },
+
+		{ "top stamped generation has no bitmap -- fall back to prior",
+		  {{4, CRC_B}}, 1, {{5, CRC_A}, {4, CRC_B}}, 2, 0 },
+
+		{ "duplicate stamped copies -- lowest index wins",
+		  {{5, CRC_A}, {5, CRC_A}}, 2, {{5, CRC_A}}, 1, 0 },
+
+		{ "same generation -- only the crc-matching copy is stamped",
+		  {{5, CRC_X}, {5, CRC_A}}, 2, {{5, CRC_A}}, 1, 1 },
+
+		{ "stamp must match gen AND crc together, not each alone",
+		  {{5, CRC_A}, {4, CRC_A}}, 2, {{4, CRC_A}}, 1, 1 },
+
+		{ "only the middle of three copies is stamped",
+		  {{5, CRC_A}, {4, CRC_B}, {3, CRC_C}}, 3, {{4, CRC_B}}, 1, 1 },
+
+		{ "full 64-bit generation compare -- no truncation to 32 bits",
+		  {{GEN_HI, CRC_A}}, 1, {{GEN_LO, CRC_A}}, 1, -1 },
+
+		{ "high-half generation stamped correctly",
+		  {{GEN_HI, CRC_A}}, 1, {{GEN_HI, CRC_A}}, 1, 0 },
+
+		/*
+		 * The selected copy can sit past index 0: these force the running max to
+		 * advance, not just take the first committed copy.
+		 */
+		{ "highest stamped copy sits at a later index",
+		  {{4, CRC_B}, {5, CRC_A}}, 2, {{4, CRC_B}, {5, CRC_A}}, 2, 1 },
+
+		{ "three ascending stamped copies, selected at the tail",
+		  {{3, CRC_C}, {4, CRC_B}, {5, CRC_A}}, 3,
+		  {{3, CRC_C}, {4, CRC_B}, {5, CRC_A}}, 3, 2 },
+
+		/* Generation and blob_crc must come from the SAME stamp. */
+		{ "split stamps -- one matches gen, another matches crc, neither is the pair",
+		  {{5, CRC_A}}, 1, {{5, CRC_B}, {4, CRC_A}}, 2, -1 },
+
+		{ "duplicate generation in commits, the matching pair is the second",
+		  {{5, CRC_A}}, 1, {{5, CRC_B}, {5, CRC_A}}, 2, 0 },
+
+		{ "stale same-gen copy rejected while a stamped gen beats a lower stamp",
+		  {{5, CRC_X}, {5, CRC_A}, {4, CRC_A}}, 3, {{5, CRC_A}, {4, CRC_A}}, 2, 1 },
+
+		{ "no bitmap survived but commits did -- nothing to adopt",
+		  {{0, 0}}, 0, {{5, CRC_A}, {4, CRC_B}}, 2, -1 },
+
+		{ "generation 0 is a live value, adoptable when stamped",
+		  {{0, CRC_A}}, 1, {{0, CRC_A}}, 1, 0 },
+
+		{ "blob_crc 0 is data, not absent -- adoptable when stamped",
+		  {{5, 0}}, 1, {{5, 0}}, 1, 0 },
+
+		{ "newest stamped blobs lost, fall back across multiple stamps",
+		  {{4, CRC_B}}, 1, {{6, CRC_C}, {5, CRC_X}, {4, CRC_B}}, 3, 0 },
+
+		{ "stamp ahead of every bitmap, no roll-forward to an unstamped copy",
+		  {{9, CRC_A}}, 1, {{10, CRC_A}}, 1, -1 },
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		int got = ec_bitmap_select_committed(cases[i].bitmaps, cases[i].n_bitmaps,
+						     cases[i].commits, cases[i].n_commits);
+
+		if (got != cases[i].expected) {
+			printf("select_committed case '%s': got %d, expected %d\n",
+			       cases[i].name, got, cases[i].expected);
+		}
+		CU_ASSERT(got == cases[i].expected);
+	}
+}
+
+/*
  * Fill a blob, wipe stripe_unmapped_map, apply the blob, and verify
  * that the previously-set bits are restored and no spurious bits appear.
  */
@@ -1276,6 +1390,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_bitmap_validate_failures);
 	CU_ADD_TEST(suite, test_commit_fill_validate);
 	CU_ADD_TEST(suite, test_commit_validate_failures);
+	CU_ADD_TEST(suite, test_select_committed);
 	CU_ADD_TEST(suite, test_bitmap_apply);
 	CU_ADD_TEST(suite, test_bitmap_slot_lba_invariance);
 	CU_ADD_TEST(suite, test_bitmap_validate_accepts_smaller);
