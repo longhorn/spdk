@@ -2202,20 +2202,22 @@ ec_bdev_delete(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
 	int             rc;
 
 	/*
-	 * Refuse delete while rebuild or resize is active.
+	 * Refuse delete while a create, rebuild, or resize is in progress.
 	 *
-	 * Both contexts own pollers and per-disk channels that ec_destruct ->
-	 * ec_device_unregister_done does NOT abort (it only aborts scrub).
-	 * Without this gate, the unregister chain frees the ec_bdev while the
-	 * rebuild/resize poller is still scheduled, producing a use-after-free
-	 * on the next tick (rebuild) or in the next write-completion callback
-	 * (resize).
-	 *
-	 * Operators must stop rebuilds with bdev_ec_stop_rebuild and let
-	 * resize finish before deleting.
+	 * Rebuild and resize own pollers and channels that the unregister path does
+	 * not stop, so deleting under them frees the ec_bdev while a poller is still
+	 * scheduled -- a use-after-free. Create is already crash-safe (the create
+	 * chain aborts if a delete slips through); rejecting here just avoids
+	 * cancelling an in-flight create, so the caller can retry.
 	 */
 	ec = ec_bdev_find(name);
 	if (ec != NULL) {
+		if (ec->create_in_progress) {
+			SPDK_ERRLOG("EC bdev %s: delete rejected -- "
+				    "create still in progress\n", name);
+			cb_fn(cb_arg, -EBUSY);
+			return;
+		}
 		if (ec->rebuild_ctx != NULL) {
 			SPDK_ERRLOG("EC bdev %s: delete rejected -- "
 				    "rebuild in progress\n", name);
