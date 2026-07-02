@@ -596,6 +596,19 @@ struct ec_bdev {
 	                                        * create-failure teardown never
 	                                        * completes a destruct that never
 	                                        * started */
+	/*
+	 * True from register until the create RPC is answered (in
+	 * ec_bdev_create_examine_done). The create chain owns the dedicated
+	 * channels the whole time, so teardown defers and the delete RPC is
+	 * rejected while it is set -- otherwise a racing delete or shutdown could
+	 * release those channels or free ec mid-create.
+	 */
+	bool create_in_progress;
+	/*
+	 * Set first in ec_destruct. The create chain checks it at each step and
+	 * aborts, rather than finishing a create onto a bdev being torn down.
+	 */
+	bool destructing;
 
 	struct ec_rebuild_ctx *rebuild_ctx;    /* non-NULL while rebuilding */
 	struct ec_scrub_ctx *scrub_ctx;        /* non-NULL while scrubbing  */

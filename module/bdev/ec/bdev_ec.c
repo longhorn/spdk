@@ -366,15 +366,16 @@ ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 }
 
 /*
- * True while a WIB or bitmap persist is still writing to the dedicated
- * channels. Teardown waits for those writes to finish: closing a channel or
- * freeing the ec_bdev with a write in flight hits the bdev layer's
- * io_outstanding assert.
+ * True while teardown must wait: a WIB or bitmap persist is still writing to
+ * the dedicated channels, or the create chain still owns them
+ * (create_in_progress). Closing a channel or freeing the ec_bdev while this is
+ * true hits the bdev layer's io_outstanding assert.
  */
 static inline bool
 ec_teardown_must_defer(const struct ec_bdev *ec)
 {
-	return ec->wib_persist_in_flight || ec->bitmap_persist_in_flight;
+	return ec->wib_persist_in_flight || ec->bitmap_persist_in_flight ||
+	       ec->create_in_progress;
 }
 
 /*
@@ -1144,6 +1145,8 @@ struct ec_bdev_create_async_ctx {
 	bool                  salvage_requested;
 };
 
+static void ec_bdev_create_abort(struct ec_bdev_create_async_ctx *ctx);
+
 /*
  * ec_bdev_create_examine_done -- fires after bdev_examine on the newly
  * registered EC bdev has completed. Releases the create context and
@@ -1159,9 +1162,31 @@ static void
 ec_bdev_create_examine_done(void *cb_arg)
 {
 	struct ec_bdev_create_async_ctx *ctx = cb_arg;
-	ec_bdev_create_cb_fn done_fn = ctx->done_fn;
-	void *done_arg = ctx->done_arg;
+	struct ec_bdev                  *ec  = ctx->ec;
+	ec_bdev_create_cb_fn done_fn;
+	void *done_arg;
 
+	/*
+	 * Last step of the create. A delete or shutdown during the
+	 * wait-for-examine window aborts here instead; runs on the home thread, so
+	 * the drain is safe.
+	 */
+	if (ec->destructing) {
+		ec_bdev_create_abort(ctx);
+		ec_drain_deferred_slot_releases(ec);
+		ec_drain_deferred_unregister(ec);
+		return;
+	}
+
+	/*
+	 * Create done: drop the gate, then release any slot cleanup parked during
+	 * the window (the drain no-ops until the gate is down), then answer the RPC.
+	 */
+	ec->create_in_progress = false;
+	ec_drain_deferred_slot_releases(ec);
+
+	done_fn = ctx->done_fn;
+	done_arg = ctx->done_arg;
 	free(ctx);
 	done_fn(done_arg, 0);
 }
@@ -1176,6 +1201,13 @@ ec_bdev_create_finalize(struct ec_bdev_create_async_ctx *ctx)
 {
 	struct ec_bdev *ec = ctx->ec;
 	int             rc;
+
+	/*
+	 * Callers check destructing in the same frame just before calling this, so
+	 * it cannot be set here. If a future async hop breaks that, add a checked
+	 * abort at the hop instead of relaxing this assert.
+	 */
+	assert(!ec->destructing);
 
 	rc = ec_bdev_start_scrub(ec);
 	if (rc != 0) {
@@ -1211,6 +1243,13 @@ ec_bdev_create_finalize(struct ec_bdev_create_async_ctx *ctx)
 		SPDK_WARNLOG("EC bdev %s: spdk_bdev_wait_for_examine failed: %s; "
 			     "completing create without examine gate (caller may race)\n",
 			     ec->bdev.name, spdk_strerror(-rc));
+		/*
+		 * Last step of the create (without the examine gate). Drop the gate and
+		 * release parked slot cleanup before answering. destructing can't be set
+		 * here -- same frame as the entry assert.
+		 */
+		ec->create_in_progress = false;
+		ec_drain_deferred_slot_releases(ec);
 		free(ctx);
 		done_fn(done_arg, 0);
 	}
@@ -1236,6 +1275,22 @@ ec_bdev_create_unregister_done(void *cb_arg, int unregister_rc)
 	done_fn(done_arg, rc);
 }
 
+/*
+ * A delete or shutdown started mid-create (ec->destructing). Answer the create
+ * RPC with -ECANCELED and free the ctx. Does not unregister (the delete already
+ * did), free ec, or drain -- each caller decides whether to drain (see the call
+ * sites).
+ */
+static void
+ec_bdev_create_abort(struct ec_bdev_create_async_ctx *ctx)
+{
+	ec_bdev_create_cb_fn done_fn = ctx->done_fn;
+	void *done_arg = ctx->done_arg;
+
+	ctx->ec->create_in_progress = false;
+	free(ctx);
+	done_fn(done_arg, -ECANCELED);
+}
 
 /*
  * Fresh-create bitmap persist completion: both bitmap slots (and both commit slots) now
@@ -1248,11 +1303,22 @@ ec_bdev_create_bitmap_persist_done(void *cb_arg, int rc)
 	struct ec_bdev_create_async_ctx *ctx = cb_arg;
 	struct ec_bdev                  *ec  = ctx->ec;
 
+	/*
+	 * Do not drain here: this runs inside ec_bitmap_persist_write_cb, whose tail
+	 * already drains. Draining now would free ec out from under it -- just answer
+	 * the RPC and let that tail free ec.
+	 */
+	if (ec->destructing) {
+		ec_bdev_create_abort(ctx);
+		return;
+	}
+
 	if (rc != 0) {
 		SPDK_ERRLOG("EC bdev %s: fresh-create both-copy bitmap persist "
 			    "failed (rc=%d); refusing to expose -- a slot may "
 			    "still hold stale base-bdev bytes that could out-rank "
 			    "our fresh copy on a future load\n", ec->bdev.name, rc);
+		ec->create_in_progress = false;
 		ctx->deferred_rc = rc;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
 				     ctx);
@@ -1289,6 +1355,15 @@ ec_bdev_create_bitmap_load_done(void *cb_arg, int rc)
 	struct ec_bdev_create_async_ctx *ctx = cb_arg;
 	struct ec_bdev                  *ec  = ctx->ec;
 
+	/* Runs as the last statement of the bitmap-load completion, so draining
+	 * (which may free ec) is safe here. */
+	if (ec->destructing) {
+		ec_bdev_create_abort(ctx);
+		ec_drain_deferred_slot_releases(ec);
+		ec_drain_deferred_unregister(ec);
+		return;
+	}
+
 	if (rc != 0) {
 		/*
 		 * The load failed (OOM allocating the load context or DMA scratch
@@ -1304,6 +1379,7 @@ ec_bdev_create_bitmap_load_done(void *cb_arg, int rc)
 		SPDK_ERRLOG("EC bdev %s: bitmap load failed (rc=%d); aborting "
 			    "create to preserve on-disk bitmap for a retry\n",
 			    ec->bdev.name, rc);
+		ec->create_in_progress = false;
 		ctx->deferred_rc = rc;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
 				     ctx);
@@ -1320,6 +1396,7 @@ ec_bdev_create_bitmap_load_done(void *cb_arg, int rc)
 			    "copy found on disk; refusing to expose -- "
 			    "reconstructing as all-mapped would resurrect stale "
 			    "non-zero data on read\n", ec->bdev.name);
+		ec->create_in_progress = false;
 		ctx->deferred_rc = -ENODATA;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
 				     ctx);
@@ -1341,6 +1418,7 @@ ec_bdev_create_bitmap_load_done(void *cb_arg, int rc)
 	if (rc != 0) {
 		SPDK_ERRLOG("EC bdev %s: fresh-create bitmap persist submit "
 			    "failed (rc=%d)\n", ec->bdev.name, rc);
+		ec->create_in_progress = false;
 		ctx->deferred_rc = rc;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
 				     ctx);
@@ -1352,6 +1430,15 @@ ec_bdev_create_wib_done(void *cb_arg, int rc)
 {
 	struct ec_bdev_create_async_ctx *ctx = cb_arg;
 	struct ec_bdev                  *ec  = ctx->ec;
+
+	/* Runs as the last statement of the WIB-load completion, so draining
+	 * (which may free ec) is safe here. */
+	if (ec->destructing) {
+		ec_bdev_create_abort(ctx);
+		ec_drain_deferred_slot_releases(ec);
+		ec_drain_deferred_unregister(ec);
+		return;
+	}
 
 	if (rc != 0) {
 		/*
@@ -1368,6 +1455,7 @@ ec_bdev_create_wib_done(void *cb_arg, int rc)
 		SPDK_ERRLOG("EC bdev %s: WIB load failed (rc=%d); failing create "
 			    "to preserve on-disk write-intent for a retry\n",
 			    ec->bdev.name, rc);
+		ec->create_in_progress = false;
 		ctx->deferred_rc = rc;
 		spdk_bdev_unregister(&ec->bdev, ec_bdev_create_unregister_done,
 				     ctx);
@@ -1533,6 +1621,10 @@ ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, uint3
 		goto error_cleanup;
 	}
 	ec->bdev_registered = true;
+	/* The bdev is discoverable now, but the create chain still owns the
+	 * dedicated channels until examine-done; defer teardown and reject delete
+	 * until then. */
+	ec->create_in_progress = true;
 
 	ctx->ec                = ec;
 	ctx->done_fn           = done_fn;
@@ -1701,6 +1793,11 @@ static int
 ec_destruct(void *ctx)
 {
 	struct ec_bdev *ec = ctx;
+
+	/* Tell the create chain to abort before teardown proceeds. Home-thread
+	 * only, so the create chain (also home) sees it on its next step. */
+	assert(spdk_get_thread() == ec->home_thread);
+	ec->destructing = true;
 
 	TAILQ_REMOVE(&g_ec_bdev_list, ec, link);
 
