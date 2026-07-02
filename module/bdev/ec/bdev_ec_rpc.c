@@ -333,46 +333,91 @@ SPDK_RPC_REGISTER("bdev_ec_replace_base_bdev", rpc_bdev_ec_replace_base_bdev, SP
  * RPC: bdev_ec_get_bdevs
  * ========================================================================= */
 
+struct rpc_bdev_ec_get_bdevs {
+	char *name;
+};
+
+static void
+free_rpc_bdev_ec_get_bdevs(struct rpc_bdev_ec_get_bdevs *req)
+{
+	free(req->name);
+}
+
+/* name is optional: absent lists every EC bdev, present filters to that one. */
+static const struct spdk_json_object_decoder rpc_bdev_ec_get_bdevs_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_ec_get_bdevs, name), spdk_json_decode_string, true},
+};
+
+static void
+ec_write_bdev_info_json(struct spdk_json_write_ctx *w, struct ec_bdev *ec)
+{
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w,  "name",               ec->bdev.name);
+	spdk_json_write_named_uint32(w,  "k",                  ec->k);
+	spdk_json_write_named_uint32(w,  "m",                  ec->m);
+	spdk_json_write_named_uint32(w,  "n",                  ec->n);
+	spdk_json_write_named_uint32(w,  "strip_size_kb",      ec->strip_size_kb);
+	spdk_json_write_named_uint32(w,  "failed_count",       ec->failed_count);
+	spdk_json_write_named_bool(w,    "offline",            ec->offline);
+	spdk_json_write_named_bool(w,    "replace_in_progress",
+				   ec->replace_in_progress);
+
+	ec_write_io_stats_json(w, ec);
+	spdk_json_write_named_uint64(w, "degraded_read_eio_dirty",
+				     ec->degraded_read_eio_dirty);
+
+	spdk_json_write_named_bool(w, "rebuild_in_progress",
+				   ec->rebuild_ctx != NULL);
+	if (ec->rebuild_ctx) {
+		ec_write_rebuild_progress_json(w, ec);
+	}
+
+	ec_write_base_bdevs_array_json(w, ec);
+
+	spdk_json_write_object_end(w);
+}
+
 static void
 rpc_bdev_ec_get_bdevs(struct spdk_jsonrpc_request *request,
 		      const struct spdk_json_val *params)
 {
-	struct spdk_json_write_ctx *w;
-	struct ec_bdev             *ec;
+	struct rpc_bdev_ec_get_bdevs  req = {};
+	struct spdk_json_write_ctx   *w;
+	struct ec_bdev               *ec = NULL;
+
+	if (params && spdk_json_decode_object(params, rpc_bdev_ec_get_bdevs_decoders,
+					      SPDK_COUNTOF(rpc_bdev_ec_get_bdevs_decoders),
+					      &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed for bdev_ec_get_bdevs\n");
+		ec_rpc_send_decode_error(request);
+		goto cleanup;
+	}
+
+	if (req.name) {
+		ec = ec_bdev_find(req.name);
+		if (ec == NULL) {
+			spdk_jsonrpc_send_error_response(request, -ENODEV, "EC bdev not found");
+			goto cleanup;
+		}
+	}
 
 	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_array_begin(w);
 
-	TAILQ_FOREACH(ec, &g_ec_bdev_list, link) {
-		spdk_json_write_object_begin(w);
-
-		spdk_json_write_named_string(w,  "name",               ec->bdev.name);
-		spdk_json_write_named_uint32(w,  "k",                  ec->k);
-		spdk_json_write_named_uint32(w,  "m",                  ec->m);
-		spdk_json_write_named_uint32(w,  "n",                  ec->n);
-		spdk_json_write_named_uint32(w,  "strip_size_kb",      ec->strip_size_kb);
-		spdk_json_write_named_uint32(w,  "failed_count",       ec->failed_count);
-		spdk_json_write_named_bool(w,    "offline",            ec->offline);
-		spdk_json_write_named_bool(w,    "replace_in_progress",
-					   ec->replace_in_progress);
-
-		ec_write_io_stats_json(w, ec);
-		spdk_json_write_named_uint64(w, "degraded_read_eio_dirty",
-					     ec->degraded_read_eio_dirty);
-
-		spdk_json_write_named_bool(w, "rebuild_in_progress",
-					   ec->rebuild_ctx != NULL);
-		if (ec->rebuild_ctx) {
-			ec_write_rebuild_progress_json(w, ec);
+	if (req.name) {
+		ec_write_bdev_info_json(w, ec);
+	} else {
+		TAILQ_FOREACH(ec, &g_ec_bdev_list, link) {
+			ec_write_bdev_info_json(w, ec);
 		}
-
-		ec_write_base_bdevs_array_json(w, ec);
-
-		spdk_json_write_object_end(w);
 	}
 
 	spdk_json_write_array_end(w);
 	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_bdev_ec_get_bdevs(&req);
 }
 SPDK_RPC_REGISTER("bdev_ec_get_bdevs", rpc_bdev_ec_get_bdevs, SPDK_RPC_RUNTIME)
 

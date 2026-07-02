@@ -993,9 +993,10 @@ def add_parser(subparsers):
     p.set_defaults(func=bdev_ec_delete)
 
     def bdev_ec_get_bdevs(args):
-        print_dict(args.client.bdev_ec_get_bdevs())
+        print_dict(args.client.bdev_ec_get_bdevs(name=args.name))
 
     p = subparsers.add_parser('bdev_ec_get_bdevs', help='Get information about EC bdevs')
+    p.add_argument('--name', help='Name of the EC bdev (optional; lists all if omitted)')
     p.set_defaults(func=bdev_ec_get_bdevs)
 
     def bdev_ec_replace_base_bdev(args):

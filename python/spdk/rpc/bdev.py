@@ -1326,12 +1326,17 @@ def bdev_ec_delete(client, name):
     return client.call('bdev_ec_delete', params)
 
 
-def bdev_ec_get_bdevs(client):
-    """Get information about all EC bdevs.
+def bdev_ec_get_bdevs(client, name=None):
+    """Get information about EC bdevs.
+    Args:
+        name: EC bdev name to query (optional; if omitted, query all EC bdevs)
     Returns:
         Array of EC bdev information including per-slot state.
     """
-    return client.call('bdev_ec_get_bdevs')
+    params = dict()
+    if name is not None:
+        params['name'] = name
+    return client.call('bdev_ec_get_bdevs', params)
 
 
 def bdev_ec_replace_base_bdev(client, ec_name, slot, new_bdev_name):
