@@ -365,9 +365,14 @@ ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 	spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
 }
 
-/* True while a WIB or bitmap persist still has writes outstanding. */
+/*
+ * True while a WIB or bitmap persist is still writing to the dedicated
+ * channels. Teardown waits for those writes to finish: closing a channel or
+ * freeing the ec_bdev with a write in flight hits the bdev layer's
+ * io_outstanding assert.
+ */
 static inline bool
-ec_persist_in_flight(const struct ec_bdev *ec)
+ec_teardown_must_defer(const struct ec_bdev *ec)
 {
 	return ec->wib_persist_in_flight || ec->bitmap_persist_in_flight;
 }
@@ -379,7 +384,7 @@ ec_persist_in_flight(const struct ec_bdev *ec)
  * regardless of which channels that slot actually opened.
  *
  * Caller must ensure no persist write is outstanding on the WIB / bitmap
- * channels (see ec_persist_in_flight and the deferral in
+ * channels (see ec_teardown_must_defer and the deferral in
  * ec_handle_base_bdev_failure) -- putting a channel with I/O still in
  * flight trips the bdev-layer io_outstanding assert.
  */
@@ -480,7 +485,7 @@ ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
 			 * the stuck write is aborted at ctrlr-loss, the same event
 			 * as this REMOVE, and its completion resumes the release.
 			 */
-			if (ec_persist_in_flight(ec)) {
+			if (ec_teardown_must_defer(ec)) {
 				ec->dedicated_release_pending[i] = true;
 				SPDK_NOTICELOG("EC bdev %s: slot %u channel "
 					       "release deferred behind an "
@@ -1630,7 +1635,7 @@ ec_device_unregister_done(void *io_device)
 	 * io_outstanding assert. Defer the rest of teardown until the persist
 	 * drains (ec_drain_deferred_unregister resumes it).
 	 */
-	if (ec_persist_in_flight(ec)) {
+	if (ec_teardown_must_defer(ec)) {
 		ec->unregister_release_pending = true;
 		return;
 	}
@@ -1656,7 +1661,7 @@ ec_drain_deferred_slot_releases(struct ec_bdev *ec)
 {
 	uint32_t i;
 
-	if (ec_persist_in_flight(ec) || ec->unregister_release_pending) {
+	if (ec_teardown_must_defer(ec) || ec->unregister_release_pending) {
 		return;
 	}
 
@@ -1681,7 +1686,7 @@ ec_drain_deferred_unregister(struct ec_bdev *ec)
 {
 	uint32_t i;
 
-	if (ec_persist_in_flight(ec) || !ec->unregister_release_pending) {
+	if (ec_teardown_must_defer(ec) || !ec->unregister_release_pending) {
 		return;
 	}
 
