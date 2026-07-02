@@ -619,22 +619,42 @@ ec_rebuild_poller_cb(void *arg)
 	struct ec_rebuild_ctx *ctx = arg;
 	struct ec_bdev        *ec  = ctx->ec;
 
+	/*
+	 * Wait while a stripe's I/O is outstanding. Checked before the pause/QoS
+	 * gates below (which return IDLE) so a paused or rate-limited rebuild cannot
+	 * starve teardown: the gate term (ec_teardown_must_defer) holds device
+	 * teardown and base-failure channel release until this drains.
+	 */
+	if (ctx->io_in_flight) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	/* Release any base-bdev-failure slot cleanup parked behind the drained I/O. */
+	ec_drain_deferred_slot_releases(ec);
+
+	/*
+	 * A delete or shutdown started. ec_finish_device_unregister cleans up scrub
+	 * but never rebuild, so tear the rebuild down here before the deferred
+	 * teardown frees ec: ec_rebuild_finish unregisters this poller (safe from
+	 * within it, as the cancel gate below also does), releases the rebuild
+	 * channels and buffers, clears ec->rebuild_ctx, and reports -ECANCELED to
+	 * the caller. Then drive the deferred teardown; it may free ec, so nothing
+	 * touches it afterward.
+	 */
+	if (ec->destructing) {
+		ec_rebuild_finish(ctx, -ECANCELED);
+		ec_drain_deferred_unregister(ec);
+		return SPDK_POLLER_BUSY;
+	}
+
 	/* QoS: pause gate */
 	if (ctx->paused) {
 		return SPDK_POLLER_IDLE;
 	}
 
-	/* Cancel gate: wait for in-flight I/O to drain, then abort */
+	/* Cancel gate: in-flight I/O already drained above, so finish now. */
 	if (ctx->cancel_requested) {
-		if (ctx->io_in_flight) {
-			return SPDK_POLLER_BUSY;
-		}
 		ec_rebuild_finish(ctx, -ECANCELED);
-		return SPDK_POLLER_BUSY;
-	}
-
-	/* Guard: do not double-submit while I/O is outstanding */
-	if (ctx->io_in_flight) {
 		return SPDK_POLLER_BUSY;
 	}
 
@@ -1267,6 +1287,22 @@ ec_scrub_poller_cb(void *arg)
 	struct ec_bdev      *ec   = sctx->ec;
 
 	if (sctx->io_in_flight) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	/*
+	 * Before submitting the next stripe, run the deferrals that parked behind
+	 * the drained I/O: a failed slot's channel release, and -- if a delete or
+	 * shutdown started -- the device teardown itself. Teardown frees sctx, so
+	 * return immediately after.
+	 *
+	 * This sits above both the next-stripe submit and the region-transition WIB
+	 * persist below, so a destructing scrub launches no fresh I/O; keep it ahead
+	 * of both if the poller steps are ever reordered.
+	 */
+	ec_drain_deferred_slot_releases(ec);
+	if (ec->destructing) {
+		ec_drain_deferred_unregister(ec);
 		return SPDK_POLLER_BUSY;
 	}
 

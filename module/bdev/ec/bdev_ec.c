@@ -366,16 +366,21 @@ ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 }
 
 /*
- * True while teardown must wait: a WIB or bitmap persist is still writing to
- * the dedicated channels, or the create chain still owns them
- * (create_in_progress). Closing a channel or freeing the ec_bdev while this is
- * true hits the bdev layer's io_outstanding assert.
+ * True while teardown must wait -- something still needs the dedicated channels:
+ *   - a WIB or bitmap persist is writing to them,
+ *   - the create chain still holds them (create_in_progress), or
+ *   - a scrub or rebuild stripe's I/O is in flight on its channels.
+ * Closing a channel or freeing the ec_bdev while this is true hits the bdev
+ * layer's io_outstanding assert. If a disk hangs, the deferral is bounded by the
+ * NVMe-oF ctrlr-loss timeout, which aborts the I/O and clears the flag.
  */
 static inline bool
 ec_teardown_must_defer(const struct ec_bdev *ec)
 {
 	return ec->wib_persist_in_flight || ec->bitmap_persist_in_flight ||
-	       ec->create_in_progress;
+	       ec->create_in_progress ||
+	       (ec->scrub_ctx != NULL && ec->scrub_ctx->io_in_flight) ||
+	       (ec->rebuild_ctx != NULL && ec->rebuild_ctx->io_in_flight);
 }
 
 /*

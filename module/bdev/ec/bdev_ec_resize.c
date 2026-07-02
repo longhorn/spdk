@@ -523,7 +523,19 @@ ec_bdev_resize(const char *ec_name,
 	ctx->new_num_stripes = new_num_stripes;
 	ctx->old_blockcnt    = ec->bdev.blockcnt;
 
-	/* Step 7: Quiesce and proceed in callback */
+	/*
+	 * Step 7: quiesce, then finish in ec_resize_quiesce_cb.
+	 *
+	 * The quiesce keeps the resize chain safe against teardown without
+	 * destructing checks: the bdev layer parks any unregister (delete or
+	 * shutdown) behind our quiesced range and resumes it only once the range
+	 * unlocks, so ec_destruct cannot run while a resize callback still holds ec.
+	 *
+	 * This safety requires that every path after the quiesce reach
+	 * ec_resize_finish, which unquiesces. Skip it and a concurrent shutdown hangs
+	 * forever on the parked unregister -- a silent hang, not a crash. Every path
+	 * reaches it today; keep that true when adding new ones.
+	 */
 	ec->resize_ctx = ctx;
 
 	quiesce_rc = spdk_bdev_quiesce(&ec->bdev, &ec_if,
