@@ -366,6 +366,9 @@ ec_write_bdev_info_json(struct spdk_json_write_ctx *w, struct ec_bdev *ec)
 	ec_write_io_stats_json(w, ec);
 	spdk_json_write_named_uint64(w, "degraded_read_eio_dirty",
 				     ec->degraded_read_eio_dirty);
+	spdk_json_write_named_uint64(w, "crash_dirty_stripes_rebuilt",
+				     __atomic_load_n(&ec->crash_dirty_stripes_rebuilt,
+						     __ATOMIC_RELAXED));
 
 	spdk_json_write_named_bool(w, "rebuild_in_progress",
 				   ec->rebuild_ctx != NULL);
@@ -619,7 +622,7 @@ rpc_bdev_ec_get_wib_status(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_bdev_ec_get_wib_status req = {};
 	struct spdk_json_write_ctx *w;
-	uint32_t num_regions, dirty_regions;
+	uint32_t num_regions, dirty_regions, crash_regions;
 	uint64_t generation;
 	bool     persist_pending;
 	int      rc;
@@ -636,6 +639,7 @@ rpc_bdev_ec_get_wib_status(struct spdk_jsonrpc_request *request,
 	rc = ec_bdev_get_wib_status(req.ec_name,
 				    &num_regions,
 				    &dirty_regions,
+				    &crash_regions,
 				    &generation,
 				    &persist_pending);
 	if (rc != 0) {
@@ -650,6 +654,7 @@ rpc_bdev_ec_get_wib_status(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_string(w,  "ec_name",         req.ec_name);
 	spdk_json_write_named_uint32(w,  "num_regions",     num_regions);
 	spdk_json_write_named_uint32(w,  "dirty_regions",   dirty_regions);
+	spdk_json_write_named_uint32(w,  "crash_regions",   crash_regions);
 	spdk_json_write_named_uint64(w,  "generation",      generation);
 	spdk_json_write_named_bool(w,    "persist_pending",  persist_pending);
 	spdk_json_write_object_end(w);

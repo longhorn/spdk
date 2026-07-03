@@ -222,6 +222,7 @@ int ec_bdev_stop_rebuild(const char *ec_name);
 int ec_bdev_get_wib_status(const char *ec_name,
 			   uint32_t   *num_regions,
 			   uint32_t   *dirty_regions,
+			   uint32_t   *crash_regions,
 			   uint64_t   *generation,
 			   bool       *persist_pending);
 
