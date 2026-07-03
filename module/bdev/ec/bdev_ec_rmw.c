@@ -715,9 +715,8 @@ ec_rmw_backpressure_end(struct ec_bdev *ec, const char *reason)
  *      the write-hole. See the long comment inline for the race
  *      analysis.
  *
- *   2. Deferred-scrub guard: scrub was skipped at boot because a data
- *      disk was FAILED; the dirty region bits remain set. A degraded
- *      RMW would reconstruct from stale parity.
+ *   2. Deferred-scrub guard: no scrub is running and the region is
+ *      crash-dirty. A degraded RMW would reconstruct from stale parity.
  *
  *   3. Per-stripe dirty guard: a prior RMW to the same stripe is
  *      still in flight; serialise to prevent corrupting its in-memory
@@ -752,13 +751,14 @@ ec_rmw_check_guards(struct ec_bdev *ec, uint64_t stripe_index)
 	}
 
 	/*
-	 * Deferred-scrub guard: scrub was not started at boot because a
-	 * data disk was FAILED (scrub_ctx == NULL but dirty regions
-	 * remain). A degraded RMW would reconstruct the missing chunk
-	 * using stale parity, then compute and persist wrong new parity.
+	 * Deferred-scrub guard: no scrub is running (deferred behind a failed
+	 * disk, or not yet started) but the region is crash-dirty. A degraded
+	 * RMW would reconstruct the missing chunk from stale parity and persist
+	 * wrong parity, so defer until the scrub re-encodes it. Write-intent
+	 * alone does not block here -- its parity is already consistent.
 	 */
 	if (ec->scrub_ctx == NULL && ec->failed_count > 0 &&
-	    ec_wib_region_is_dirty(ec, region)) {
+	    ec_wib_crash_is_dirty(ec, region)) {
 		ec->rmw_deferred_dirty++;
 		ec_rmw_backpressure_begin(ec, "deferred scrub (degraded)");
 		return -EAGAIN;

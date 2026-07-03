@@ -13,6 +13,7 @@
 #include "bdev/ec/bdev_ec_bitmap.c"
 #include "bdev/ec/bdev_ec_resize.c"
 #include "bdev/ec/bdev_ec_rebuild.c"
+#include "bdev/ec/bdev_ec_rmw.c"
 
 /*
  * Unit coverage: the in-band unmapped bitmap front reservation.
@@ -121,7 +122,6 @@ DEFINE_STUB(ec_reconstruct_multi_data, int, (const struct ec_bdev *ec,
 		const uint32_t failed_data_slots[], uint32_t f, uint64_t chunk_len), 0);
 DEFINE_STUB(ec_wib_persist, int, (struct ec_bdev *ec, void (*cb)(void *cb_arg, int rc),
 				  void *cb_arg), 0);
-DEFINE_STUB_V(ec_rmw_backpressure_end, (struct ec_bdev *ec, const char *reason));
 /* ec_encode_data is the real ISA-L symbol (libisal.a is linked into the UT). */
 
 /* ------------------------------------------------------------------ */
@@ -1450,6 +1450,47 @@ test_scrub_uses_crash_map(void)
 	ec_free_runtime_arrays(&ec);
 }
 
+/*
+ * Guard 2 (degraded-RMW deferral) follows the crash map, not runtime
+ * write-intent. A region dirty only from a foreground write no longer
+ * defers a degraded RMW -- the starvation the crash-map split fixes --
+ * while a crash-dirty region still does.
+ */
+static void
+test_guard2_defers_crash_not_write_intent(void)
+{
+	struct ec_bdev ec;
+	uint64_t       deferred_before;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	/* Degraded, no scrub running -- the window guard 2 covers. */
+	ec.failed_count = 1;
+	ec.scrub_ctx    = NULL;
+
+	/*
+	 * Region 0 dirty from a foreground write only (write-intent): guard 2
+	 * must NOT defer. Stripe 0 is not stripe-busy, so the RMW proceeds.
+	 */
+	ec_wib_region_set_dirty(&ec, 0);
+	rc = ec_rmw_check_guards(&ec, 0);
+	CU_ASSERT(rc == 0);
+
+	/* Same region now crash-dirty: guard 2 defers. */
+	ec_wib_crash_set_dirty(&ec, 0);
+	deferred_before = ec.rmw_deferred_dirty;
+	rc = ec_rmw_check_guards(&ec, 0);
+	CU_ASSERT(rc == -EAGAIN);
+	CU_ASSERT(ec.rmw_deferred_dirty == deferred_before + 1);
+
+	ec_free_runtime_arrays(&ec);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1491,6 +1532,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_rebuild_skips_unmapped_stripe);
 	CU_ADD_TEST(suite, test_scrub_skips_unmapped_stripe);
 	CU_ADD_TEST(suite, test_scrub_uses_crash_map);
+	CU_ADD_TEST(suite, test_guard2_defers_crash_not_write_intent);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
