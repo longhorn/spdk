@@ -143,6 +143,52 @@ ec_reencode_parity_from_chunk_bufs(const struct ec_bdev *ec,
 }
 
 /*
+ * Format the crash-dirty region indices into buf as "[a, b, c]" (capped,
+ * with a trailing ", ..." if more remain), to point an operator at the
+ * suspect ranges in the rebuild-finish warning. Lists every crash-dirty
+ * region, including any that contributed no counted stripes (e.g. a fully
+ * unmapped one), so the list is a superset of the regions behind the count.
+ *
+ * off never advances past a truncated write, so buf + off / buflen - off
+ * stay in bounds without depending on the 16-entry cap fitting the buffer.
+ */
+static void
+ec_format_crash_regions(const struct ec_bdev *ec, char *buf, size_t buflen)
+{
+	uint32_t region;
+	uint32_t listed = 0;
+	int      off;
+	int      n;
+
+	n = snprintf(buf, buflen, "[");
+	if (n < 0 || (size_t)n >= buflen) {
+		return;
+	}
+	off = n;
+
+	for (region = 0; region < ec->wib_num_regions; region++) {
+		if (!ec_wib_crash_is_dirty(ec, region)) {
+			continue;
+		}
+		if (listed == 16) {
+			n = snprintf(buf + off, buflen - off, ", ...");
+			if (n >= 0 && (size_t)n < buflen - off) {
+				off += n;
+			}
+			break;
+		}
+		n = snprintf(buf + off, buflen - off, "%s%u",
+			     listed ? ", " : "", region);
+		if (n < 0 || (size_t)n >= buflen - off) {
+			break;   /* truncated -- stop appending */
+		}
+		off += n;
+		listed++;
+	}
+	snprintf(buf + off, buflen - off, "]");
+}
+
+/*
  * ec_rebuild_finish  [terminal step for success and failure]
  *
  * Finalises the rebuild:
@@ -261,6 +307,29 @@ ec_rebuild_finish(struct ec_rebuild_ctx *ctx, int rc)
 				       ctx->slots_to_rebuild, elapsed_seconds,
 				       ec->failed_count, wib_dirty,
 				       wib_dirty > 0 ? " (scrub will sweep them)" : "");
+		}
+
+		/*
+		 * Surface write-hole suspects: data-slot stripes rebuilt inside a
+		 * still-crash-dirty region. The scrub has not run yet, so the
+		 * crash map still names the regions; mirror the count into the
+		 * cumulative bdev counter before ctx is freed.
+		 */
+		if (ctx->crash_dirty_stripes > 0) {
+			char regions[256];
+
+			ec_format_crash_regions(ec, regions, sizeof(regions));
+			__atomic_fetch_add(&ec->crash_dirty_stripes_rebuilt,
+					   ctx->crash_dirty_stripes,
+					   __ATOMIC_RELAXED);
+			SPDK_WARNLOG("EC bdev %s: rebuild reconstructed %" PRIu64
+				     " data-slot stripe(s) inside crash-dirty WIB "
+				     "region(s) %s. If a write was torn and this "
+				     "slot's data was lost, those stripes may read "
+				     "as silently-wrong data -- verify the affected "
+				     "range (fsck, application checksums, or backup "
+				     "compare).\n",
+				     ec->bdev.name, ctx->crash_dirty_stripes, regions);
 		}
 
 		/*
@@ -390,6 +459,12 @@ ec_rebuild_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 
 	ctx->stripes_rebuilt++;
+	/* Suspect: data-slot reconstruction in a still-crash-dirty region. */
+	if (ctx->current_slot < ctx->ec->k &&
+	    ec_wib_crash_is_dirty(ctx->ec,
+				  ec_wib_stripe_to_region(ctx->current_stripe))) {
+		ctx->crash_dirty_stripes++;
+	}
 	if (!ctx->draining_deferred_stripes) {
 		ctx->current_stripe++;
 	}

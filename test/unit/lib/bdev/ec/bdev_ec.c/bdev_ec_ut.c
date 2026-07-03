@@ -1491,6 +1491,56 @@ test_guard2_defers_crash_not_write_intent(void)
 	ec_free_runtime_arrays(&ec);
 }
 
+/*
+ * The rebuild counts write-hole suspects -- data-slot stripes reconstructed
+ * in a crash-dirty region -- and skips clean regions and parity-slot
+ * reconstruction (which re-encodes parity from data, a repair).
+ */
+static void
+test_rebuild_counts_crash_dirty_stripes(void)
+{
+	struct ec_bdev        ec;
+	struct ec_rebuild_ctx ctx;
+	int                   rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(ec.wib_num_regions >= 3);
+
+	ec_wib_crash_set_dirty(&ec, 0);   /* region 0 crash-dirty */
+	ec_wib_crash_set_dirty(&ec, 1);   /* region 1 crash-dirty */
+	/* region 2 left clean */
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.ec = &ec;
+
+	/* Data slot, crash region 0 -> counted. */
+	ctx.current_slot   = 0;
+	ctx.current_stripe = 0;
+	ctx.stripe_claimed = true;
+	ec_rebuild_write_cb(NULL, true, &ctx);
+	CU_ASSERT(ctx.crash_dirty_stripes == 1);
+
+	/* Data slot, clean region 2 -> not counted. */
+	ctx.current_slot   = 0;
+	ctx.current_stripe = (uint64_t)EC_WIB_REGION_STRIPES * 2;
+	ctx.stripe_claimed = true;
+	ec_rebuild_write_cb(NULL, true, &ctx);
+	CU_ASSERT(ctx.crash_dirty_stripes == 1);   /* unchanged */
+
+	/* Parity slot, crash region 1 -> not counted (parity is a repair). */
+	ctx.current_slot   = ec.k;
+	ctx.current_stripe = (uint64_t)EC_WIB_REGION_STRIPES * 1;
+	ctx.stripe_claimed = true;
+	ec_rebuild_write_cb(NULL, true, &ctx);
+	CU_ASSERT(ctx.crash_dirty_stripes == 1);   /* unchanged */
+
+	ec_free_runtime_arrays(&ec);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1533,6 +1583,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_scrub_skips_unmapped_stripe);
 	CU_ADD_TEST(suite, test_scrub_uses_crash_map);
 	CU_ADD_TEST(suite, test_guard2_defers_crash_not_write_intent);
+	CU_ADD_TEST(suite, test_rebuild_counts_crash_dirty_stripes);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

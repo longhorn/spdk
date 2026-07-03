@@ -311,6 +311,10 @@ struct ec_rebuild_ctx {
 	/* total stripes written successfully (across all rebuilt slots) */
 	uint64_t         stripes_rebuilt;
 
+	/* of those, data-slot stripes rebuilt in a crash-dirty region --
+	 * write-hole suspects; see ec->crash_dirty_stripes_rebuilt. */
+	uint64_t         crash_dirty_stripes;
+
 	/* REPLACING slot count at rebuild start; for percent_complete calc. */
 	uint32_t         slots_to_rebuild;
 
@@ -759,6 +763,18 @@ struct ec_bdev {
 	 */
 	uint64_t degraded_read_eio_dirty;        /* reads rejected: dirty WIB region */
 	uint64_t degraded_reads_reconstructed;   /* reads served via reconstruction  */
+	/*
+	 * Data-slot stripes the rebuild reconstructed while their region was
+	 * crash-dirty -- write-hole suspects. If a write was torn at the crash
+	 * and this slot's data chunk was among the lost ones, the rebuild
+	 * decoded from divergent survivors, so the stripe may hold silently-
+	 * wrong data. A conservative superset -- most stripes in a crash region
+	 * were never torn. Parity-slot rebuild re-encodes parity from data (a
+	 * repair) and is not counted. In-memory cumulative: it resets to zero on
+	 * restart, so the WARNLOG in the journal is the durable record. Cross-
+	 * thread read via get_bdevs, so atomic per the counter rule above.
+	 */
+	uint64_t crash_dirty_stripes_rebuilt;
 	/*
 	 * RMW / full-stripe write accounting. Unlike the UNMAP cluster
 	 * below, these counters do NOT form a closed-bucket identity:
