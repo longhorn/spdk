@@ -261,8 +261,10 @@ ec_resize_realloc_wib_arrays(struct ec_resize_ctx *ctx)
 	uint64_t *new_region_map      = calloc(new_wib_words, sizeof(uint64_t));
 	uint32_t *new_region_inflight = calloc(new_wib_regions, sizeof(uint32_t));
 	uint64_t *new_region_dirty_ts = calloc(new_wib_regions, sizeof(uint64_t));
+	uint64_t *new_crash_map       = calloc(new_wib_words, sizeof(uint64_t));
 
-	if (new_region_map && new_region_inflight && new_region_dirty_ts) {
+	if (new_region_map && new_region_inflight && new_region_dirty_ts &&
+	    new_crash_map) {
 		/*
 		 * Reset the in-memory WIB to clean on grow -- do NOT carry the old
 		 * dirty bits forward (new_region_map is calloc'd, already zero).
@@ -285,10 +287,16 @@ ec_resize_realloc_wib_arrays(struct ec_resize_ctx *ctx)
 		free(ec->wib_region_map);
 		free(ec->wib_region_inflight);
 		free(ec->wib_region_dirty_ticks);
+		free(ec->wib_crash_dirty_map);
 
 		ec->wib_region_map      = new_region_map;
 		ec->wib_region_inflight = new_region_inflight;
 		ec->wib_region_dirty_ticks = new_region_dirty_ts;
+		/*
+		 * Empty by the resize precondition (rejected while any region is
+		 * crash-dirty), so a fresh zero map at the new size is correct.
+		 */
+		ec->wib_crash_dirty_map = new_crash_map;
 		ec->wib_num_regions     = new_wib_regions;
 	} else {
 		/*
@@ -301,6 +309,7 @@ ec_resize_realloc_wib_arrays(struct ec_resize_ctx *ctx)
 		free(new_region_map);
 		free(new_region_inflight);
 		free(new_region_dirty_ts);
+		free(new_crash_map);
 
 		SPDK_WARNLOG("EC bdev %s: resize -- OOM for WIB "
 			     "arrays; clamping capacity to existing "
@@ -422,6 +431,13 @@ ec_bdev_resize(const char *ec_name,
 	if (ec->failed_count != 0) {
 		SPDK_ERRLOG("EC bdev %s: resize rejected -- "
 			    "%u failed disks\n", ec_name, ec->failed_count);
+		return -EBUSY;
+	}
+	if (ec_wib_crash_count(ec) > 0) {
+		SPDK_ERRLOG("EC bdev %s: resize rejected -- volume has "
+			    "unscrubbed crash-dirty WIB regions; restart the "
+			    "volume to retry the startup scrub, then resize\n",
+			    ec_name);
 		return -EBUSY;
 	}
 	if (ec->offline) {

@@ -1081,6 +1081,13 @@ test_resize_wib_reset_on_grow(void)
 	CU_ASSERT(ec.wib_num_regions == new_regions);
 	CU_ASSERT(!ec_wib_region_is_dirty(&ec, 0));
 
+	/*
+	 * Crash map grew with the other WIB arrays and stays clean. Reading the
+	 * highest new region would be out of bounds if it had not been resized.
+	 */
+	CU_ASSERT(ec_wib_crash_count(&ec) == 0);
+	CU_ASSERT(!ec_wib_crash_is_dirty(&ec, new_regions - 1));
+
 	ec_free_runtime_arrays(&ec);
 }
 
@@ -1375,6 +1382,74 @@ test_scrub_skips_unmapped_stripe(void)
 	ut_free_unmapped_map(&ec);
 }
 
+/*
+ * The scrub follows the crash map, not runtime write-intent: it skips a
+ * write-intent-only region, and on region completion clears the crash bit
+ * (always) plus the live bit -- but only when no write is in flight,
+ * otherwise the on-disk dirty record must protect the in-flight write and
+ * the idle poller clears the live bit later.
+ */
+static void
+test_scrub_uses_crash_map(void)
+{
+	struct ec_bdev      ec;
+	struct ec_scrub_ctx sctx;
+	int                 rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (2ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(ec.wib_num_regions >= 4);
+
+	/*
+	 * Region 0: crash-dirty, no write in flight.
+	 * Region 1: write-intent-dirty only -- the scrub must skip it.
+	 * Region 2: crash-dirty with a write in flight.
+	 * Region 3: crash-dirty -- keeps the walk from finishing.
+	 */
+	ec_wib_crash_set_dirty(&ec, 0);
+	ec_wib_region_set_dirty(&ec, 0);
+	ec_wib_region_set_dirty(&ec, 1);
+	ec_wib_crash_set_dirty(&ec, 2);
+	ec_wib_region_set_dirty(&ec, 2);
+	ec.wib_region_inflight[2] = 1;
+	ec_wib_crash_set_dirty(&ec, 3);
+	ec_wib_region_set_dirty(&ec, 3);
+
+	memset(&sctx, 0, sizeof(sctx));
+	sctx.ec                = &ec;
+	sctx.current_region    = 0;
+	sctx.current_stripe    = EC_WIB_REGION_STRIPES;
+	sctx.region_end_stripe = EC_WIB_REGION_STRIPES;
+
+	/*
+	 * Region 0 (no write in flight): both bits cleared. The work list
+	 * skips the write-intent-only region 1 and advances to region 2.
+	 */
+	rc = ec_scrub_poller_cb(&sctx);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(!ec_wib_crash_is_dirty(&ec, 0));
+	CU_ASSERT(!ec_wib_region_is_dirty(&ec, 0));
+	CU_ASSERT(sctx.current_region == 2);
+	CU_ASSERT(ec_wib_region_is_dirty(&ec, 1));
+
+	/*
+	 * Region 2 (write in flight): crash bit cleared, but the live bit is
+	 * preserved so the on-disk dirty record still protects the in-flight
+	 * write. The walk advances to region 3.
+	 */
+	sctx.current_stripe = sctx.region_end_stripe;
+	rc = ec_scrub_poller_cb(&sctx);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(!ec_wib_crash_is_dirty(&ec, 2));
+	CU_ASSERT(ec_wib_region_is_dirty(&ec, 2));
+	CU_ASSERT(sctx.current_region == 3);
+
+	ec_free_runtime_arrays(&ec);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1415,6 +1490,7 @@ main(int argc, char **argv)
 
 	CU_ADD_TEST(suite, test_rebuild_skips_unmapped_stripe);
 	CU_ADD_TEST(suite, test_scrub_skips_unmapped_stripe);
+	CU_ADD_TEST(suite, test_scrub_uses_crash_map);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

@@ -1049,7 +1049,7 @@ ec_scrub_move_to_next_region(struct ec_scrub_ctx *sctx)
 	uint32_t        region;
 
 	for (region = sctx->current_region + 1; region < ec->wib_num_regions; region++) {
-		if (ec_wib_region_is_dirty(ec, region)) {
+		if (ec_wib_crash_is_dirty(ec, region)) {
 			sctx->current_region   = region;
 			sctx->current_stripe   = (uint64_t)region * EC_WIB_REGION_STRIPES;
 			sctx->region_end_stripe = spdk_min(
@@ -1309,11 +1309,18 @@ ec_scrub_poller_cb(void *arg)
 	/* Current region complete */
 	if (sctx->current_stripe >= sctx->region_end_stripe) {
 		/*
-		 * Clear the region bit now that all its stripes have been
-		 * scrubbed. The next persist (from idle poller or finish)
-		 * will write the cleared state to disk.
+		 * Region scrubbed: always clear the crash bit. Clear the live
+		 * bit only when no write is in flight -- an RMW to a stripe the
+		 * scrubber already passed still relies on the on-disk dirty
+		 * record until its parity write lands (same rule as the idle
+		 * poller). If a write is in flight, leave the live bit for the
+		 * poller: it no longer skips the region, since its skip condition
+		 * is the crash bit and that is now gone.
 		 */
-		ec_wib_region_clear_dirty(ec, sctx->current_region);
+		ec_wib_crash_clear_dirty(ec, sctx->current_region);
+		if (ec_wib_region_inflight_get(ec, sctx->current_region) == 0) {
+			ec_wib_region_clear_dirty(ec, sctx->current_region);
+		}
 		sctx->regions_scrubbed++;
 
 		ec_scrub_heartbeat(sctx);
@@ -1431,10 +1438,11 @@ ec_bdev_start_scrub(struct ec_bdev *ec)
 		}
 	}
 
-	/* Find first dirty region and count total dirty regions */
+	/* First crash-dirty region and total count -- the scrub works the
+	 * crash map, not runtime write-intent. */
 	uint32_t dirty_count = 0;
 	for (region = 0; region < ec->wib_num_regions; region++) {
-		if (ec_wib_region_is_dirty(ec, region)) {
+		if (ec_wib_crash_is_dirty(ec, region)) {
 			if (first_dirty == ec->wib_num_regions) {
 				first_dirty = region;
 			}

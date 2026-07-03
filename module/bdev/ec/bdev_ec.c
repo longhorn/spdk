@@ -103,6 +103,9 @@ ec_free_runtime_arrays(struct ec_bdev *ec)
 	free(ec->wib_region_dirty_ticks);
 	ec->wib_region_dirty_ticks = NULL;
 
+	free(ec->wib_crash_dirty_map);
+	ec->wib_crash_dirty_map = NULL;
+
 	/*
 	 * Bit-clear waiter queues. By the time the bdev is being torn down
 	 * the I/O path is quiesced, so any still-queued waiters had their
@@ -899,6 +902,14 @@ ec_alloc_runtime_arrays(struct ec_bdev *ec)
 		goto err;
 	}
 
+	ec->wib_crash_dirty_map = calloc(wib_region_words, sizeof(uint64_t));
+	if (!ec->wib_crash_dirty_map) {
+		SPDK_ERRLOG("EC bdev %s: OOM for wib_crash_dirty_map "
+			    "(%u regions, %" PRIu64 " words)\n",
+			    ec->bdev.name, ec->wib_num_regions, wib_region_words);
+		goto err;
+	}
+
 	{
 		uint64_t wib_buf_bytes = (uint64_t)ec->strip_size * ec->bdev.blocklen;
 
@@ -1490,6 +1501,7 @@ ec_bdev_create_wib_done(void *cb_arg, int rc)
 
 		for (region = 0; region < ec->wib_num_regions; region++) {
 			ec_wib_region_set_dirty(ec, region);
+			ec_wib_crash_set_dirty(ec, region);
 		}
 	}
 

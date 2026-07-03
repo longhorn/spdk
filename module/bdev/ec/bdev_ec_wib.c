@@ -433,6 +433,14 @@ ec_wib_idle_poller_cb(void *arg)
 		if (!ec_wib_region_is_dirty(ec, region)) {
 			continue;
 		}
+		/*
+		 * Never clear a crash region here -- only the scrub may, once it
+		 * re-encodes the parity. Clearing it would drop the crash record
+		 * and let degraded reads trust stale parity.
+		 */
+		if (ec_wib_crash_is_dirty(ec, region)) {
+			continue;
+		}
 		if (ec_wib_region_inflight_get(ec, region) > 0) {
 			continue;
 		}
@@ -647,8 +655,13 @@ ec_wib_load_async_merge_disk(struct ec_wib_load_async_ctx *ctx)
 		 * by the post-create release barriers SPDK inserts when the
 		 * bdev becomes visible to consumers.
 		 */
+		/*
+		 * Loaded bits are regions that were mid-write at the crash, so
+		 * they seed both the live map and the crash map.
+		 */
 		for (w = 0; w < map_words; w++) {
-			ec->wib_region_map[w] |= bits[w];
+			ec->wib_region_map[w]      |= bits[w];
+			ec->wib_crash_dirty_map[w] |= bits[w];
 		}
 
 		if (best_gen > ec->wib_generation) {

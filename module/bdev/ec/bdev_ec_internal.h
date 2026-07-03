@@ -646,6 +646,22 @@ struct ec_bdev {
 	uint64_t                *wib_region_map;      /* in-memory dirty bits  */
 	uint32_t                *wib_region_inflight;  /* per-region RMW count  */
 	uint64_t                *wib_region_dirty_ticks;  /* tick when marked dirty*/
+	/*
+	 * Regions loaded dirty at startup whose parity the scrub has not yet
+	 * re-encoded. wib_region_map above also tracks runtime write-intent
+	 * and is idle-cleared by the poller; this map is set only at
+	 * load/salvage and cleared only by the scrub, so a crash region
+	 * survives the poller until it is actually repaired.
+	 *
+	 * wib_region_map stays a superset of this map: the poller skips crash
+	 * regions, the scrub clears both, and write rollbacks clear only the
+	 * bit that write set. That lets the degraded-read guard read
+	 * wib_region_map and ignore this map -- so never clear a live bit
+	 * without checking the crash bit.
+	 *
+	 * Home-thread only, so plain access -- no atomics.
+	 */
+	uint64_t                *wib_crash_dirty_map;
 	struct spdk_io_channel  *wib_chans[EC_MAX_BASE_BDEVS]; /* m entries */
 	void                    *wib_buf;              /* DMA buf, one strip   */
 	uint64_t                 wib_generation;
@@ -1308,11 +1324,45 @@ ec_wib_region_clear_dirty(struct ec_bdev *ec, uint32_t region)
 	}
 }
 
+/* Crash-dirty map accessors. Home-thread only, so plain access. */
+static inline bool
+ec_wib_crash_is_dirty(const struct ec_bdev *ec, uint32_t region)
+{
+	return !!(ec->wib_crash_dirty_map[region / 64] &
+		  (UINT64_C(1) << (region % 64)));
+}
+
+static inline void
+ec_wib_crash_set_dirty(struct ec_bdev *ec, uint32_t region)
+{
+	ec->wib_crash_dirty_map[region / 64] |= UINT64_C(1) << (region % 64);
+}
+
+static inline void
+ec_wib_crash_clear_dirty(struct ec_bdev *ec, uint32_t region)
+{
+	ec->wib_crash_dirty_map[region / 64] &= ~(UINT64_C(1) << (region % 64));
+}
+
+static inline uint32_t
+ec_wib_crash_count(const struct ec_bdev *ec)
+{
+	uint32_t region, count = 0;
+
+	for (region = 0; region < ec->wib_num_regions; region++) {
+		if (ec_wib_crash_is_dirty(ec, region)) {
+			count++;
+		}
+	}
+	return count;
+}
+
 /*
  * Returns true if a parity-modifying write to stripe_idx must defer
  * because the startup scrub still owns it:
  *   - current region, at-or-after the scrubber, or
- *   - a region ahead of the scrubber that is still on-disk dirty.
+ *   - a region ahead of the scrubber that is still crash-dirty
+ *     (parity not yet re-encoded).
  *
  * Stripes the scrubber has already passed are safe. Returns false when
  * no scrub is active. Pure predicate; each caller bumps its own
@@ -1335,7 +1385,7 @@ ec_scrub_blocks_stripe(const struct ec_bdev *ec, uint64_t stripe_idx)
 		return true;
 	}
 	if (region > sctx->current_region &&
-	    ec_wib_region_is_dirty(ec, region)) {
+	    ec_wib_crash_is_dirty(ec, region)) {
 		return true;
 	}
 	return false;

@@ -287,7 +287,7 @@ ec_unmap_must_defer_for_scrub(struct ec_bdev *ec,
 				return true;
 			}
 		} else if (region > scrub_ctx->current_region &&
-			   ec_wib_region_is_dirty(ec, region)) {
+			   ec_wib_crash_is_dirty(ec, region)) {
 			return true;
 		}
 	}
