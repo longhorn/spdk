@@ -691,6 +691,7 @@ ec_compute_geometry(struct ec_bdev *ec)
 	uint64_t          map_bytes_needed;
 	uint64_t          wib_total_needed;
 	uint64_t          buf_available;
+	uint64_t          strip_size_bytes;
 
 	/*
 	 * Size the EC bdev to the smallest open base disk's blockcnt so no
@@ -723,25 +724,26 @@ ec_compute_geometry(struct ec_bdev *ec)
 		return -EINVAL;
 	}
 
-	ec->strip_size = ((uint64_t)ec->strip_size_kb * 1024) / ec->bdev.blocklen;
-	if (ec->strip_size == 0 ||
-	    ((uint64_t)ec->strip_size_kb * 1024) % ec->bdev.blocklen != 0) {
+	strip_size_bytes = (uint64_t)ec->strip_size_kb * 1024;
+	if (strip_size_bytes == 0 ||
+	    strip_size_bytes % ec->bdev.blocklen != 0) {
 		SPDK_ERRLOG("Invalid strip size: strip_size_kb=%u not a multiple "
 			    "of blocklen=%u\n", ec->strip_size_kb, ec->bdev.blocklen);
 		return -EINVAL;
 	}
+	ec->strip_size = strip_size_bytes / ec->bdev.blocklen;
 
 	/*
 	 * ec_encode_data() takes the chunk byte length as an int. Reject strips
 	 * larger than INT_MAX bytes, or the cast at the encode call sites
 	 * truncates the length and corrupts parity.
 	 */
-	if (ec->strip_size * ec->bdev.blocklen > (uint64_t)INT_MAX) {
+	if (strip_size_bytes > (uint64_t)INT_MAX) {
 		SPDK_ERRLOG("EC bdev %s: strip size too large: strip_size_kb=%u "
 			    "(%" PRIu64 " bytes) exceeds the ISA-L per-chunk limit "
 			    "of %d bytes\n",
 			    ec->bdev.name, ec->strip_size_kb,
-			    (uint64_t)ec->strip_size * ec->bdev.blocklen, INT_MAX);
+			    strip_size_bytes, INT_MAX);
 		return -EINVAL;
 	}
 
@@ -811,7 +813,7 @@ ec_compute_geometry(struct ec_bdev *ec)
 			    * sizeof(uint64_t);
 	wib_total_needed = sizeof(struct ec_wib_header) + map_bytes_needed
 			    + sizeof(uint32_t);  /* CRC */
-	buf_available    = (uint64_t)ec->strip_size * ec->bdev.blocklen;
+	buf_available    = strip_size_bytes;
 	if (wib_total_needed > buf_available) {
 		SPDK_ERRLOG("EC bdev %s: WIB on-disk layout (%" PRIu64 " bytes) "
 			    "exceeds one strip (%" PRIu64 " bytes). "
