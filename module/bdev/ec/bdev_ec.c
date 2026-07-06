@@ -688,7 +688,6 @@ ec_compute_geometry(struct ec_bdev *ec)
 	uint64_t          min_blockcnt = UINT64_MAX;
 	uint64_t          max_blockcnt = 0;
 	uint64_t          total_physical_stripes;
-	uint64_t          map_bytes_needed;
 	uint64_t          wib_total_needed;
 	uint64_t          buf_available;
 	uint64_t          strip_size_bytes;
@@ -809,10 +808,7 @@ ec_compute_geometry(struct ec_bdev *ec)
 	 * I/O within its reserved slot (see ec_bitmap_slot_io_blocks). Resize
 	 * checks ec_max_num_stripes directly, since it does not run this path.
 	 */
-	map_bytes_needed = ((uint64_t)EC_BITMAP_WORDS(ec->wib_num_regions))
-			    * sizeof(uint64_t);
-	wib_total_needed = sizeof(struct ec_wib_header) + map_bytes_needed
-			    + sizeof(uint32_t);  /* CRC */
+	wib_total_needed = ec_wib_total_size(ec);
 	buf_available    = strip_size_bytes;
 	if (wib_total_needed > buf_available) {
 		SPDK_ERRLOG("EC bdev %s: WIB on-disk layout (%" PRIu64 " bytes) "

@@ -91,8 +91,7 @@ ec_wib_fill_buf(struct ec_bdev *ec)
 	 * wib_num_regions -- so this always holds; assert to catch a geometry
 	 * that slipped past the create / resize ceiling checks.
 	 */
-	assert(sizeof(struct ec_wib_header) + (uint64_t)map_words * sizeof(uint64_t)
-	       + sizeof(uint32_t) <= strip_bytes);
+	assert(ec_wib_total_size(ec) <= strip_bytes);
 
 	hdr->magic       = EC_WIB_MAGIC;
 	hdr->version     = EC_WIB_VERSION;

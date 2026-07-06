@@ -1150,6 +1150,23 @@ ec_base_blockcnt_range(const struct ec_bdev *ec, uint64_t *min_out, uint64_t *ma
 }
 
 /*
+ * WIB on-disk blob size: header + region bitmap (one bit per region, rounded
+ * up to whole uint64_t words) + a CRC trailer. Single source of truth for the
+ * layout, shared by the geometry fit check and the WIB fill/persist path.
+ */
+static inline uint64_t
+ec_wib_map_bytes(const struct ec_bdev *ec)
+{
+	return (uint64_t)EC_BITMAP_WORDS(ec->wib_num_regions) * sizeof(uint64_t);
+}
+
+static inline uint64_t
+ec_wib_total_size(const struct ec_bdev *ec)
+{
+	return sizeof(struct ec_wib_header) + ec_wib_map_bytes(ec) + sizeof(uint32_t); /* CRC */
+}
+
+/*
  * True only for NORMAL slots. REPLACING slots have a live descriptor but
  * their data is incomplete until rebuild finishes; reading them during
  * reconstruction would silently corrupt the result.
