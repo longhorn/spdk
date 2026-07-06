@@ -618,6 +618,64 @@ ec_open_base_bdevs(struct ec_bdev *ec, const char **base_bdev_names)
 }
 
 /*
+ * Set max_unmap / max_unmap_segments from the base bdevs. SPDK uses these to
+ * split UNMAPs before they reach the EC layer. An EC UNMAP fans out to one
+ * UNMAP per base at num_blocks / k, so the EC limit is k * the smallest base
+ * max_unmap; segments pass through 1:1. A base reporting zero means "no limit"
+ * and is skipped; if every base is zero, EC reports zero too.
+ */
+static void
+ec_set_unmap_limits(struct ec_bdev *ec)
+{
+	uint32_t min_max_unmap          = UINT32_MAX;
+	uint32_t min_max_unmap_segments = UINT32_MAX;
+	uint32_t i;
+	uint64_t max_unmap_blocks;
+	uint64_t wib_region_blocks;
+
+	for (i = 0; i < ec->n; i++) {
+		struct spdk_bdev *base;
+
+		if (!ec->descs[i]) {
+			continue;
+		}
+		base = spdk_bdev_desc_get_bdev(ec->descs[i]);
+		if (base->max_unmap > 0) {
+			min_max_unmap = spdk_min(min_max_unmap,
+						 base->max_unmap);
+		}
+		if (base->max_unmap_segments > 0) {
+			min_max_unmap_segments =
+				spdk_min(min_max_unmap_segments,
+					 base->max_unmap_segments);
+		}
+	}
+	max_unmap_blocks = (uint64_t)min_max_unmap * ec->k;
+	ec->bdev.max_unmap = (min_max_unmap == UINT32_MAX) ? 0 :
+			     (uint32_t)spdk_min(max_unmap_blocks, (uint64_t)UINT32_MAX);
+	ec->bdev.max_unmap_segments =
+		(min_max_unmap_segments == UINT32_MAX) ?
+		0 : min_max_unmap_segments;
+
+	/*
+	 * Cap the largest UNMAP we accept at one WIB region's worth of blocks
+	 * (EC_WIB_REGION_STRIPES * stripe_blocks). This is not needed for
+	 * correctness -- ec_submit_unmap handles an UNMAP that covers many
+	 * regions just fine. It only avoids a delay: the startup scrub clears
+	 * regions one at a time, so an UNMAP that spans several regions can end
+	 * up waiting for the scrub to reach them. Keeping each UNMAP within a
+	 * single region avoids that wait.
+	 */
+	wib_region_blocks = EC_WIB_REGION_STRIPES * ec->stripe_blocks;
+	if (ec->bdev.max_unmap == 0 ||
+	    ec->bdev.max_unmap > wib_region_blocks) {
+		ec->bdev.max_unmap =
+			(wib_region_blocks > UINT32_MAX) ?
+			UINT32_MAX : (uint32_t)wib_region_blocks;
+	}
+}
+
+/*
  * ec_compute_geometry -- pure derivation of EC bdev geometry from k, m,
  * strip_size_kb, and the first open base bdev's blockcnt. No allocation,
  * no side effects beyond filling in fields on ec. Returns -EINVAL on
@@ -750,73 +808,7 @@ ec_compute_geometry(struct ec_bdev *ec)
 	ec->bdev.split_on_write_unit          = false;
 	ec->bdev.split_on_optimal_io_boundary = true;
 
-	/*
-	 * Publish max_unmap and max_unmap_segments derived from base bdevs.
-	 * SPDK splits an UNMAP request whose num_blocks exceeds max_unmap or
-	 * whose segment count exceeds max_unmap_segments. An EC-level UNMAP
-	 * fans out as one UNMAP per base bdev at num_blocks / k per slot, so
-	 * the EC-level limit is k * min(base->max_unmap). Segments pass
-	 * through 1:1. Zero on any base means "no limit" and is excluded from
-	 * the min; if every base reports zero, EC reports zero too (no
-	 * splitting). This sets the layer-above splitting boundary so a large
-	 * fstrim does not arrive at ec_submit_unmap larger than the smallest
-	 * base bdev can absorb in one operation.
-	 */
-	{
-		uint32_t min_max_unmap          = UINT32_MAX;
-		uint32_t min_max_unmap_segments = UINT32_MAX;
-		uint32_t i;
-		uint64_t max_unmap_blocks;
-
-		for (i = 0; i < ec->n; i++) {
-			struct spdk_bdev *base;
-
-			if (!ec->descs[i]) {
-				continue;
-			}
-			base = spdk_bdev_desc_get_bdev(ec->descs[i]);
-			if (base->max_unmap > 0) {
-				min_max_unmap = spdk_min(min_max_unmap,
-							 base->max_unmap);
-			}
-			if (base->max_unmap_segments > 0) {
-				min_max_unmap_segments =
-					spdk_min(min_max_unmap_segments,
-						 base->max_unmap_segments);
-			}
-		}
-		max_unmap_blocks = (uint64_t)min_max_unmap * ec->k;
-		ec->bdev.max_unmap = (min_max_unmap == UINT32_MAX) ? 0 :
-				     (uint32_t)spdk_min(max_unmap_blocks, (uint64_t)UINT32_MAX);
-		ec->bdev.max_unmap_segments =
-			(min_max_unmap_segments == UINT32_MAX) ?
-			0 : min_max_unmap_segments;
-
-		/*
-		 * Soft-cap max_unmap to one WIB region's worth of EC-level
-		 * blocks (EC_WIB_REGION_STRIPES * stripe_blocks). This is a
-		 * work bound, not a correctness requirement: ec_submit_unmap
-		 * handles UNMAPs that span multiple WIB regions (the whole-blob
-		 * bitmap persist has no region concept; the scrubber defers
-		 * region by region), so a larger request is served correctly.
-		 * Bounding it here just keeps one UNMAP from spanning many
-		 * regions and deferring behind the startup scrub. In typical
-		 * hardware (4 MiB base max_unmap, k=4, 64 KiB strip -> 16 MiB
-		 * EC max_unmap, 256 MiB WIB region) the cap never fires. The
-		 * value is EC-level blocks; each base bdev sees num_blocks / k
-		 * after fan-out.
-		 */
-		{
-			uint64_t wib_region_blocks =
-				EC_WIB_REGION_STRIPES * ec->stripe_blocks;
-			if (ec->bdev.max_unmap == 0 ||
-			    ec->bdev.max_unmap > wib_region_blocks) {
-				ec->bdev.max_unmap =
-					(wib_region_blocks > UINT32_MAX) ?
-					UINT32_MAX : (uint32_t)wib_region_blocks;
-			}
-		}
-	}
+	ec_set_unmap_limits(ec);
 
 	/*
 	 * Validate that one strip is large enough to hold the WIB on-disk
