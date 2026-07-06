@@ -687,7 +687,6 @@ ec_compute_geometry(struct ec_bdev *ec)
 {
 	uint64_t          min_blockcnt = UINT64_MAX;
 	uint64_t          max_blockcnt = 0;
-	uint32_t          gi;
 	uint64_t          total_physical_stripes;
 	uint64_t          map_bytes_needed;
 	uint64_t          wib_total_needed;
@@ -695,26 +694,11 @@ ec_compute_geometry(struct ec_bdev *ec)
 
 	/*
 	 * Size the EC bdev to the smallest open base disk's blockcnt so no
-	 * user stripe can map past any one disk's EOF. The resize path uses
-	 * the same min(blockcnt) rule (bdev_ec_resize.c). Track max so a
-	 * mismatch surfaces in the log -- a heterogeneous create still
-	 * succeeds, but the wasted blocks on oversized slots are worth a
+	 * user stripe can map past any one disk's EOF. A heterogeneous create
+	 * still succeeds, but the wasted blocks on oversized slots earn a
 	 * NOTICE so an operator can spot a provisioning typo.
 	 */
-	for (gi = 0; gi < ec->n; gi++) {
-		struct spdk_bdev *base;
-
-		if (!ec->descs[gi]) {
-			continue;
-		}
-		base = spdk_bdev_desc_get_bdev(ec->descs[gi]);
-		if (base->blockcnt < min_blockcnt) {
-			min_blockcnt = base->blockcnt;
-		}
-		if (base->blockcnt > max_blockcnt) {
-			max_blockcnt = base->blockcnt;
-		}
-	}
+	ec_base_blockcnt_range(ec, &min_blockcnt, &max_blockcnt);
 	if (min_blockcnt == UINT64_MAX) {
 		SPDK_ERRLOG("EC bdev %s: no open base bdevs for geometry\n",
 			    ec->bdev.name);

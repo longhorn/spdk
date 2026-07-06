@@ -1117,6 +1117,39 @@ ec_calc_mapping(const struct ec_bdev *ec, uint64_t offset_blocks,
 }
 
 /*
+ * Min and max blockcnt across open base bdevs. Slots without an open
+ * descriptor are skipped, so this is safe on degraded and salvage paths.
+ * Sets *min_out to UINT64_MAX when no base is open; callers decide whether
+ * that is an error. max_out may be NULL when only the min is needed.
+ */
+static inline void
+ec_base_blockcnt_range(const struct ec_bdev *ec, uint64_t *min_out, uint64_t *max_out)
+{
+	uint64_t min = UINT64_MAX;
+	uint64_t max = 0;
+	uint32_t i;
+
+	for (i = 0; i < ec->n; i++) {
+		struct spdk_bdev *base;
+
+		if (!ec->descs[i]) {
+			continue;
+		}
+		base = spdk_bdev_desc_get_bdev(ec->descs[i]);
+		if (base->blockcnt < min) {
+			min = base->blockcnt;
+		}
+		if (base->blockcnt > max) {
+			max = base->blockcnt;
+		}
+	}
+	*min_out = min;
+	if (max_out) {
+		*max_out = max;
+	}
+}
+
+/*
  * True only for NORMAL slots. REPLACING slots have a live descriptor but
  * their data is incomplete until rebuild finishes; reading them during
  * reconstruction would silently corrupt the result.

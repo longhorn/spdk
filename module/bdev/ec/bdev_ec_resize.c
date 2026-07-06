@@ -407,7 +407,6 @@ ec_bdev_resize(const char *ec_name,
 	uint64_t              old_effective, new_effective;
 	uint64_t              new_total_physical_stripes;
 	uint64_t              new_num_stripes, new_blockcnt;
-	uint32_t              i;
 	int                   quiesce_rc;
 
 	/* Step 1: Find EC bdev */
@@ -454,16 +453,12 @@ ec_bdev_resize(const char *ec_name,
 	 * reservation, both unchanged across resize).
 	 */
 
-	/* Step 3: Find minimum base bdev size. The failed_count != 0 guard
-	 * above already excludes any non-NORMAL slot, so every descs[i] is
-	 * non-NULL here. */
-	for (i = 0; i < ec->n; i++) {
-		struct spdk_bdev *base = spdk_bdev_desc_get_bdev(ec->descs[i]);
-
-		if (base->blockcnt < min_blockcnt) {
-			min_blockcnt = base->blockcnt;
-		}
-	}
+	/*
+	 * Step 3: Find minimum base bdev size. The failed_count != 0 guard
+	 * above ensures every slot is open, so the helper's skip-unopened path
+	 * is a no-op here.
+	 */
+	ec_base_blockcnt_range(ec, &min_blockcnt, NULL);
 
 	/*
 	 * Step 4: Validate growth.
