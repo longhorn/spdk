@@ -831,6 +831,7 @@ ec_alloc_runtime_arrays(struct ec_bdev *ec)
 {
 	uint64_t map_words        = EC_BITMAP_WORDS(ec->num_stripes);
 	uint64_t wib_region_words = EC_BITMAP_WORDS(ec->wib_num_regions);
+	uint64_t wib_buf_bytes    = (uint64_t)ec->strip_size * ec->bdev.blocklen;
 
 	assert(ec->wib_region_map == NULL);
 
@@ -884,16 +885,12 @@ ec_alloc_runtime_arrays(struct ec_bdev *ec)
 		goto err;
 	}
 
-	{
-		uint64_t wib_buf_bytes = (uint64_t)ec->strip_size * ec->bdev.blocklen;
-
-		ec->wib_buf = spdk_dma_zmalloc(wib_buf_bytes, EC_DMA_ALIGN, NULL);
-		if (!ec->wib_buf) {
-			SPDK_ERRLOG("EC bdev %s: OOM for wib_buf "
-				    "(%" PRIu64 " bytes)\n",
-				    ec->bdev.name, wib_buf_bytes);
-			goto err;
-		}
+	ec->wib_buf = spdk_dma_zmalloc(wib_buf_bytes, EC_DMA_ALIGN, NULL);
+	if (!ec->wib_buf) {
+		SPDK_ERRLOG("EC bdev %s: OOM for wib_buf "
+			    "(%" PRIu64 " bytes)\n",
+			    ec->bdev.name, wib_buf_bytes);
+		goto err;
 	}
 
 	/* Scalar / pointer / array fields are already zeroed by the calloc
