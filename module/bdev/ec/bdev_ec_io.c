@@ -1010,11 +1010,110 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 	}
 }
 
+/*
+ * Carry out the persist/dispatch decision for a full-stripe write whose WIB
+ * region is already marked: defer it, start the WIB persist (fan-out then
+ * resumes in ec_full_write_wib_set_cb), or fan out now if the region was
+ * already durable.
+ *
+ * Returns 0 once the write is handed off (caller returns 0), or a negative
+ * errno on defer/failure (caller jumps to its error unwind). On the
+ * was_clean path, an alloc or persist failure clears the region bit this
+ * write set before returning.
+ *
+ * Mirrors ec_rmw_persist_and_dispatch, with two deliberate differences:
+ *   - defers with -EAGAIN (which becomes a NOMEM requeue upstream) instead
+ *     of queuing on wib_deferred_writes;
+ *   - always sets wib_repersist_needed, not only on the was_clean path
+ *     (harmless -- at worst one extra persist).
+ */
+static int
+ec_full_write_persist_and_dispatch(struct ec_bdev_io *ec_io, bool was_clean)
+{
+	struct ec_bdev *ec     = ec_from_bdev_io(ec_io->bdev_io);
+	uint32_t        region = ec_io->wib_region;
+	int             rc;
+
+	/*
+	 * wib_persist_in_flight must be consulted even when the in-memory bit
+	 * was already dirty -- an in-flight persist may be *clearing* the bit
+	 * (initiated by the idle poller before our setter ran). Proceeding
+	 * straight to fan-out in that window would let a crash leave on-disk
+	 * WIB clean while the stripe is mid-write.
+	 */
+	if (ec->wib_persist_in_flight) {
+		ec->wib_repersist_needed = true;
+		ec->full_stripe_writes_deferred++;
+		return -EAGAIN;
+	}
+
+	/*
+	 * Past every reject (-EINVAL) and defer (-EAGAIN) gate: the write is
+	 * now accepted and will fan out. Count it here so a deferred-then-
+	 * retried write is not counted on each attempt and an invalid request
+	 * is not counted at all.
+	 */
+	ec->full_stripe_writes++;
+
+	if (was_clean) {
+		int persist_rc;
+
+		rc = ec_alloc_full_stripe(ec_io, ec);
+		if (rc != 0) {
+			/*
+			 * We set this region's WIB bit in the mark step, but no
+			 * persist will record it and the caller's error path does
+			 * not clear it. Roll it back so the in-memory bit never
+			 * outlives its on-disk record: otherwise the NOMEM retry
+			 * would see the region already dirty, skip the WIB persist,
+			 * and fan out data with no recoverable write-intent. Safe --
+			 * no fan-out happened, so nothing needs scrubbing.
+			 */
+			ec_wib_region_clear_dirty(ec, region);
+			return rc;
+		}
+
+		persist_rc = ec_wib_persist(ec, ec_full_write_wib_set_cb, ec_io);
+		if (persist_rc != 0) {
+			/* Same rollback as the alloc-failure path above. */
+			ec_wib_region_clear_dirty(ec, region);
+			return persist_rc;
+		}
+		return 0;
+	}
+
+	/* Region already durable on disk: alloc and fan out directly. */
+	rc = ec_alloc_full_stripe(ec_io, ec);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/*
+	 * Fan-out routing: dispatches base I/O on ec_io->ch->base_chans[]
+	 * (submitter-owned). When the caller is already on the submitter
+	 * thread the inline path runs; otherwise we hop to the submitter so
+	 * the base I/O dispatch happens on the channel-owning thread.
+	 */
+	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
+		ec_full_write_fanout(ec_io);
+		return 0;
+	}
+
+	rc = spdk_thread_send_msg(ec_io->submitter_thread,
+				  ec_full_write_dispatch_on_submitter, ec_io);
+	if (rc != 0) {
+		return rc;
+	}
+	return 0;
+}
+
 static int
 ec_submit_full_write(struct ec_bdev_io *ec_io)
 {
-	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
-	int             rc = 0;
+	struct ec_bdev *ec        = ec_from_bdev_io(ec_io->bdev_io);
+	uint32_t        region;
+	bool            was_clean = false;
+	int             rc        = 0;
 
 	/*
 	 * Home-thread invariant: the WIB persist below (ec_wib_persist)
@@ -1096,104 +1195,26 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	}
 
 	/*
-	 * WIB region marking. A crash partway through the fan-out can
-	 * leave a subset of the k+m chunks at the new value and the rest
-	 * at the old value. Without a WIB bit, recovery has no record
-	 * that this stripe was mid-write, so no scrub runs and parity
-	 * stays inconsistent with whatever data did land -- a later disk
-	 * failure would reconstruct using stale parity and surface
-	 * silently wrong bytes (the same write-hole the WIB prevents for
-	 * RMW). The mark + inflight + dirty_ts trio mirrors the RMW and
-	 * UNMAP submit paths exactly; the idle WIB poller is gated by
-	 * all three so the bit cannot be cleared mid-fanout.
+	 * WIB region marking. A crash mid-fan-out can leave some of the
+	 * k+m chunks new and the rest old; without a WIB bit, recovery has
+	 * no record the stripe was mid-write, so no scrub runs and a later
+	 * disk failure reconstructs from stale parity -- the write hole.
+	 * Mark the region dirty (if clean), take an inflight ref, stamp
+	 * dirty_ticks; the idle WIB poller is gated by the inflight ref so
+	 * the bit can't be cleared mid-fan-out. The persist decision
+	 * follows in ec_full_write_persist_and_dispatch.
 	 */
-	{
-		uint64_t stripe_idx = ec_io->stripe_claim_index;
-		uint32_t region     = ec_wib_stripe_to_region(stripe_idx);
-		bool     any_was_clean = false;
-
-		if (!ec_wib_region_is_dirty(ec, region)) {
-			ec_wib_region_set_dirty(ec, region);
-			any_was_clean = true;
-		}
-		ec_wib_region_inflight_inc(ec, region);
-		ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
-
-		ec_io->wib_region        = region;
-		ec_io->wib_inflight_held = true;
-
-		/*
-		 * Persist decision tree mirrors the RMW / UNMAP submit
-		 * paths. wib_persist_in_flight must be consulted on every
-		 * branch -- even when the in-memory bit was already dirty,
-		 * an in-flight persist may be *clearing* the bit (initiated
-		 * by the idle poller before our setter ran). Proceeding
-		 * straight to fan-out in that window would let a crash
-		 * leave on-disk WIB clean while the stripe is mid-write.
-		 */
-		if (ec->wib_persist_in_flight) {
-			ec->wib_repersist_needed = true;
-			ec->full_stripe_writes_deferred++;
-			rc = -EAGAIN;
-			goto error;
-		}
-
-		/*
-		 * Past every reject (-EINVAL) and defer (-EAGAIN) gate: the
-		 * write is now accepted and will fan out. Count it here so a
-		 * deferred-then-retried write is not counted on each attempt and
-		 * an invalid request is not counted at all.
-		 */
-		ec->full_stripe_writes++;
-
-		if (any_was_clean) {
-			int persist_rc;
-
-			rc = ec_alloc_full_stripe(ec_io, ec);
-			if (rc != 0) {
-				/*
-				 * We set this region's WIB bit above, but no
-				 * persist will record it and the error path does
-				 * not clear it. Roll it back so the in-memory bit
-				 * never outlives its on-disk record: otherwise the
-				 * NOMEM retry would see the region already dirty,
-				 * skip the WIB persist, and fan out data with no
-				 * recoverable write-intent. Safe -- no fan-out
-				 * happened, so nothing needs scrubbing.
-				 */
-				ec_wib_region_clear_dirty(ec, region);
-				goto error;
-			}
-
-			persist_rc = ec_wib_persist(ec, ec_full_write_wib_set_cb, ec_io);
-			if (persist_rc != 0) {
-				/* Same rollback as the alloc-failure path above. */
-				ec_wib_region_clear_dirty(ec, region);
-				rc = persist_rc;
-				goto error;
-			}
-			return 0;
-		}
+	region = ec_wib_stripe_to_region(ec_io->stripe_claim_index);
+	if (!ec_wib_region_is_dirty(ec, region)) {
+		ec_wib_region_set_dirty(ec, region);
+		was_clean = true;
 	}
+	ec_wib_region_inflight_inc(ec, region);
+	ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
+	ec_io->wib_region        = region;
+	ec_io->wib_inflight_held = true;
 
-	rc = ec_alloc_full_stripe(ec_io, ec);
-	if (rc != 0) {
-		goto error;
-	}
-
-	/*
-	 * Fan-out routing: dispatches base I/O on ec_io->ch->base_chans[]
-	 * (submitter-owned). When the caller is already on the submitter
-	 * thread the inline path runs; otherwise we hop to the submitter
-	 * so the base I/O dispatch happens on the channel-owning thread.
-	 */
-	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
-		ec_full_write_fanout(ec_io);
-		return 0;
-	}
-
-	rc = spdk_thread_send_msg(ec_io->submitter_thread,
-				  ec_full_write_dispatch_on_submitter, ec_io);
+	rc = ec_full_write_persist_and_dispatch(ec_io, was_clean);
 	if (rc != 0) {
 		goto error;
 	}
