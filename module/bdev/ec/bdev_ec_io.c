@@ -1110,10 +1110,9 @@ ec_full_write_persist_and_dispatch(struct ec_bdev_io *ec_io, bool was_clean)
 static int
 ec_submit_full_write(struct ec_bdev_io *ec_io)
 {
-	struct ec_bdev *ec        = ec_from_bdev_io(ec_io->bdev_io);
-	uint32_t        region;
-	bool            was_clean = false;
-	int             rc        = 0;
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	bool            was_clean;
+	int             rc = 0;
 
 	/*
 	 * Home-thread invariant: the WIB persist below (ec_wib_persist)
@@ -1199,19 +1198,12 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	 * k+m chunks new and the rest old; without a WIB bit, recovery has
 	 * no record the stripe was mid-write, so no scrub runs and a later
 	 * disk failure reconstructs from stale parity -- the write hole.
-	 * Mark the region dirty (if clean), take an inflight ref, stamp
-	 * dirty_ticks; the idle WIB poller is gated by the inflight ref so
-	 * the bit can't be cleared mid-fan-out. The persist decision
-	 * follows in ec_full_write_persist_and_dispatch.
+	 * ec_wib_mark_region marks the region and takes an inflight ref (which
+	 * gates the idle poller so the bit can't clear mid-fan-out); the
+	 * persist decision follows in ec_full_write_persist_and_dispatch.
 	 */
-	region = ec_wib_stripe_to_region(ec_io->stripe_claim_index);
-	if (!ec_wib_region_is_dirty(ec, region)) {
-		ec_wib_region_set_dirty(ec, region);
-		was_clean = true;
-	}
-	ec_wib_region_inflight_inc(ec, region);
-	ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
-	ec_io->wib_region        = region;
+	was_clean = ec_wib_mark_region(ec, ec_io->stripe_claim_index);
+	ec_io->wib_region        = ec_wib_stripe_to_region(ec_io->stripe_claim_index);
 	ec_io->wib_inflight_held = true;
 
 	rc = ec_full_write_persist_and_dispatch(ec_io, was_clean);

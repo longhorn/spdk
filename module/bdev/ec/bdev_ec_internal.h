@@ -1511,6 +1511,31 @@ ec_wib_region_inflight_get(const struct ec_bdev *ec, uint32_t region)
 }
 
 /*
+ * Claim the stripe's WIB region for an in-flight write: set the dirty bit if
+ * it was clean, take an inflight ref, and stamp dirty_ticks. Returns true if
+ * this call set the bit. Shared by ec_submit_full_write and ec_rmw_submit_core.
+ *
+ * Does not record held-state on any io context: full-write gates its unwind
+ * on ec_io->wib_inflight_held (ec_io flows through paths that never took a
+ * ref), while RMW's mctx lifecycle guarantees the ref once setup ran and its
+ * teardown decs unconditionally. Each caller records its own.
+ */
+static inline bool
+ec_wib_mark_region(struct ec_bdev *ec, uint64_t stripe_idx)
+{
+	uint32_t region    = ec_wib_stripe_to_region(stripe_idx);
+	bool     was_clean = !ec_wib_region_is_dirty(ec, region);
+
+	if (was_clean) {
+		ec_wib_region_set_dirty(ec, region);
+	}
+	ec_wib_region_inflight_inc(ec, region);
+	ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
+
+	return was_clean;
+}
+
+/*
  * Global in-flight RMW counter helpers. Same shape as
  * wib_region_inflight: inc on home during RMW setup, dec on submitter
  * during completion / partial-failure cleanup. Stats-only today (the

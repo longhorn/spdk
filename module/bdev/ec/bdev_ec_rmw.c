@@ -935,6 +935,7 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 	uint64_t           stripe_index;
 	struct ec_rmw_ctx *mctx;
 	uint32_t           disk;
+	bool               was_clean;
 	int                rc;
 
 	/* Setup invariant: the stripe-busy claim is a non-atomic test-and-set, and home is the only setter for stripe_dirty_map / wib_region_inflight / dirty_ticks. Running setup off home would race a concurrent claimant. */
@@ -1039,39 +1040,27 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 	 * ec_rmw_complete is called directly and decrements this counter; the
 	 * increment here ensures the counter stays consistent.
 	 *
-	 * The WIB region in-memory bit set + persist decision lives here
-	 * (rather than after modify/encode). The persist must land on disk
-	 * BEFORE the read fan-out so a single multi-reactor hop at the
-	 * persist-completion -> reads edge covers the entire submitter
-	 * half. was_clean is the pre-set snapshot of the bit; it drives
-	 * the persist decision in ec_rmw_persist_and_dispatch. dirty_ticks
-	 * is stamped on every RMW (last-write time), so the idle poller's
-	 * EC_WIB_IDLE_MS quiet-window restarts on each write -- matching
-	 * the full-stripe path in bdev_ec_io.c.
+	 * The WIB region mark + persist decision lives here (rather than after
+	 * modify/encode). The persist must land on disk BEFORE the read fan-out
+	 * so a single multi-reactor hop at the persist-completion -> reads edge
+	 * covers the entire submitter half. ec_wib_mark_region sets the bit,
+	 * takes an inflight ref, and stamps dirty_ticks; was_clean (whether this
+	 * call set the bit) drives the persist decision in
+	 * ec_rmw_persist_and_dispatch.
 	 */
-	{
-		uint32_t region = ec_wib_stripe_to_region(stripe_index);
-		bool     was_clean;
+	was_clean = ec_wib_mark_region(ec, stripe_index);
 
-		was_clean = !ec_wib_region_is_dirty(ec, region);
-		ec_wib_region_inflight_inc(ec, region);
-		if (was_clean) {
-			ec_wib_region_set_dirty(ec, region);
-		}
-		ec->wib_region_dirty_ticks[region] = spdk_get_ticks();
-
-		/*
-		 * Setup complete. Hand off to the persist + dispatch decision.
-		 * persist_and_dispatch owns the mctx from this point: it either
-		 * starts a persist (ec_rmw_wib_set_cb -> ec_rmw_dispatch_reads),
-		 * queues on wib_deferred_writes (ec_wib_deferred_drain ->
-		 * ec_rmw_dispatch_reads), or proceeds directly to dispatch when
-		 * the bit was already durable. The setup half returns 0 ("queued
-		 * via the cb chain"); any error completion happens through
-		 * ec_rmw_complete -> spdk_bdev_io_complete.
-		 */
-		ec_rmw_persist_and_dispatch(mctx, was_clean);
-	}
+	/*
+	 * Setup complete. Hand off to the persist + dispatch decision.
+	 * persist_and_dispatch owns the mctx from this point: it either
+	 * starts a persist (ec_rmw_wib_set_cb -> ec_rmw_dispatch_reads),
+	 * queues on wib_deferred_writes (ec_wib_deferred_drain ->
+	 * ec_rmw_dispatch_reads), or proceeds directly to dispatch when
+	 * the bit was already durable. The setup half returns 0 ("queued
+	 * via the cb chain"); any error completion happens through
+	 * ec_rmw_complete -> spdk_bdev_io_complete.
+	 */
+	ec_rmw_persist_and_dispatch(mctx, was_clean);
 
 	return 0;
 }
