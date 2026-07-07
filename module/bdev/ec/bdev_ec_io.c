@@ -1011,6 +1011,30 @@ ec_full_write_wib_set_cb(void *cb_arg, int rc)
 }
 
 /*
+ * Claim the stripe for this write so a concurrent rebuild or UNMAP on the
+ * same stripe defers. Returns false if the stripe is already claimed (caller
+ * returns -EAGAIN); on success it records the claim on ec_io, which
+ * ec_io_release_state later clears.
+ *
+ * The claim is recorded here -- unlike the WIB held-state, which
+ * ec_wib_mark_region leaves to the caller -- because both callers record it
+ * the same way and unwind through the same ec_io_release_state gate.
+ */
+static bool
+ec_stripe_try_claim(struct ec_bdev *ec, struct ec_bdev_io *ec_io)
+{
+	uint64_t stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
+
+	if (ec_stripe_is_dirty(ec, stripe_idx)) {
+		return false;
+	}
+	ec_stripe_set_dirty(ec, stripe_idx);
+	ec_io->stripe_claimed     = true;
+	ec_io->stripe_claim_index = stripe_idx;
+	return true;
+}
+
+/*
  * Carry out the persist/dispatch decision for a full-stripe write whose WIB
  * region is already marked: defer it, start the WIB persist (fan-out then
  * resumes in ec_full_write_wib_set_cb), or fan out now if the region was
@@ -1157,15 +1181,8 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	 * leaving the REPLACING slot inconsistent with the rest of the
 	 * array. ec_child_io_complete releases the claim on final completion.
 	 */
-	{
-		uint64_t stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
-
-		if (ec_stripe_is_dirty(ec, stripe_idx)) {
-			return -EAGAIN;
-		}
-		ec_stripe_set_dirty(ec, stripe_idx);
-		ec_io->stripe_claimed     = true;
-		ec_io->stripe_claim_index = stripe_idx;
+	if (!ec_stripe_try_claim(ec, ec_io)) {
+		return -EAGAIN;
 	}
 
 	/*
@@ -1432,12 +1449,9 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	}
 
 	/* 1. Claim stripe-busy. */
-	if (ec_stripe_is_dirty(ec, stripe_idx)) {
+	if (!ec_stripe_try_claim(ec, ec_io)) {
 		return -EAGAIN;
 	}
-	ec_stripe_set_dirty(ec, stripe_idx);
-	ec_io->stripe_claimed     = true;
-	ec_io->stripe_claim_index = stripe_idx;
 	ec_io->is_write_into_unmapped = true;
 
 	/*
