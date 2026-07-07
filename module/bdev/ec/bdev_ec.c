@@ -1115,6 +1115,7 @@ ec_destroy_ch(void *io_device, void *ctx_buf)
 
 static void ec_device_unregister_done(void *io_device);
 static void ec_release_dedicated_channels(struct ec_bdev *ec);
+static int  ec_open_dedicated_channels(struct ec_bdev *ec);
 /* ec_scrub_free_resources declared in bdev_ec_internal.h. */
 
 /*
@@ -1497,7 +1498,6 @@ ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, uint3
 	struct ec_bdev                  *ec;
 	struct ec_bdev_create_async_ctx *ctx;
 	int      rc;
-	uint32_t i, j;
 	bool     io_device_registered = false;
 
 	rc = _ec_bdev_create(name, strip_size_kb, k, m, uuid, &ec);
@@ -1535,41 +1535,9 @@ ec_bdev_create_async(const char *name, uint32_t strip_size_kb, uint32_t k, uint3
 		goto error_cleanup;
 	}
 
-	/* Open dedicated WIB channels for each parity disk. */
-	for (j = 0; j < ec->m; j++) {
-		uint32_t pslot = ec->k + j;
-
-		if (!ec->descs[pslot]) {
-			ec->wib_chans[j] = NULL;
-			continue;
-		}
-		ec->wib_chans[j] = spdk_bdev_get_io_channel(ec->descs[pslot]);
-		if (!ec->wib_chans[j]) {
-			SPDK_ERRLOG("EC bdev %s: failed to open WIB channel "
-				    "for parity slot %u\n", name, pslot);
-			rc = -ENOMEM;
-			goto error_cleanup;
-		}
-	}
-
-	/*
-	 * Open dedicated bitmap channels for every disk. The in-band
-	 * unmapped bitmap is raw-replicated to all n disks (unlike the
-	 * WIB which lives only on the m parity disks), so the channel
-	 * array is n entries wide.
-	 */
-	for (i = 0; i < ec->n; i++) {
-		if (!ec->descs[i]) {
-			ec->bitmap_chans[i] = NULL;
-			continue;
-		}
-		ec->bitmap_chans[i] = spdk_bdev_get_io_channel(ec->descs[i]);
-		if (!ec->bitmap_chans[i]) {
-			SPDK_ERRLOG("EC bdev %s: failed to open bitmap channel "
-				    "for slot %u\n", name, i);
-			rc = -ENOMEM;
-			goto error_cleanup;
-		}
+	rc = ec_open_dedicated_channels(ec);
+	if (rc != 0) {
+		goto error_cleanup;
 	}
 
 	ec->wib_poller = spdk_poller_register(ec_wib_idle_poller_cb, ec,
@@ -1637,6 +1605,61 @@ error_cleanup:
 		ec_bdev_free(ec);
 	}
 	return rc;
+}
+
+/*
+ * Open the long-lived WIB (one per parity slot) and bitmap (one per slot)
+ * channels. Must run on the home thread -- channels bind to the calling
+ * thread. On failure, releases any partial opens; no channels remain.
+ * Inverse of ec_release_dedicated_channels (which also unregisters the WIB
+ * idle poller -- registered later in the create sequence, not here).
+ */
+static int
+ec_open_dedicated_channels(struct ec_bdev *ec)
+{
+	uint32_t i, j;
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	/* WIB channels: one per parity slot; the WIB lives only on the m parity disks. */
+	for (j = 0; j < ec->m; j++) {
+		uint32_t pslot = ec->k + j;
+
+		if (!ec->descs[pslot]) {
+			ec->wib_chans[j] = NULL;
+			continue;
+		}
+		ec->wib_chans[j] = spdk_bdev_get_io_channel(ec->descs[pslot]);
+		if (!ec->wib_chans[j]) {
+			SPDK_ERRLOG("EC bdev %s: failed to open WIB channel "
+				    "for parity slot %u\n", ec->bdev.name, pslot);
+			goto err;
+		}
+	}
+
+	/*
+	 * Bitmap channels: one per slot. The in-band unmapped bitmap is
+	 * raw-replicated to all n disks (unlike the WIB, on the m parity disks
+	 * only), so the array is n entries wide.
+	 */
+	for (i = 0; i < ec->n; i++) {
+		if (!ec->descs[i]) {
+			ec->bitmap_chans[i] = NULL;
+			continue;
+		}
+		ec->bitmap_chans[i] = spdk_bdev_get_io_channel(ec->descs[i]);
+		if (!ec->bitmap_chans[i]) {
+			SPDK_ERRLOG("EC bdev %s: failed to open bitmap channel "
+				    "for slot %u\n", ec->bdev.name, i);
+			goto err;
+		}
+	}
+
+	return 0;
+
+err:
+	ec_release_dedicated_channels(ec);
+	return -ENOMEM;
 }
 
 /*
