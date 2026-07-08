@@ -218,6 +218,68 @@ ec_unmap_release_claims(struct ec_bdev *ec,
 }
 
 /*
+ * Claim every stripe in [start_stripe, end_stripe) for an UNMAP. Runs under
+ * the home-thread invariant, so check-all-then-set-all has no concurrent-
+ * claimer race. Returns -EAGAIN (and bumps unmaps_deferred_busy) if any
+ * stripe is busy -- RMW, full-stripe write, rebuild, or a prior UNMAP --
+ * with no stripe left claimed. Heavy small-write pressure can starve UNMAP;
+ * that shows up in the unmaps_deferred_busy counter.
+ */
+static int
+ec_unmap_try_claim_range(struct ec_bdev *ec, uint64_t start_stripe, uint64_t end_stripe)
+{
+	uint64_t stripe;
+
+	for (stripe = start_stripe; stripe < end_stripe; stripe++) {
+		if (ec_stripe_is_dirty(ec, stripe)) {
+			ec->unmaps_deferred_busy++;
+			return -EAGAIN;
+		}
+	}
+	for (stripe = start_stripe; stripe < end_stripe; stripe++) {
+		ec_stripe_set_dirty(ec, stripe);
+	}
+	return 0;
+}
+
+/*
+ * Set the UNMAP range's bits in the staged shadow map. Plain stores -- the
+ * shadow is private until the persist applies it to the live map.
+ */
+static void
+ec_unmap_stage_range(uint64_t *staged_map, uint64_t start_stripe, uint64_t end_stripe)
+{
+	uint64_t stripe;
+
+	for (stripe = start_stripe; stripe < end_stripe; stripe++) {
+		ec_bitmap_word_set(staged_map, stripe);
+	}
+}
+
+/*
+ * Publish the UNMAP range into the live map so readers see it now. A
+ * per-stripe ec_stripe_set_unmapped loop, not a whole-map memcpy, for two
+ * reasons:
+ *
+ *   1. Release-store semantics. Each bit is published with __ATOMIC_RELEASE,
+ *      so a submitter-thread reader using acquire-load sees the post-state.
+ *      A whole-map memcpy is an unordered word copy that races the reader
+ *      formally (and trips TSAN even when benign on x86).
+ *
+ *   2. Touches only the changed words. At large geometries the whole map is
+ *      tens of MiB; this loop touches one word per up-to-64 stripes.
+ */
+static void
+ec_unmap_publish_range(struct ec_bdev *ec, uint64_t start_stripe, uint64_t end_stripe)
+{
+	uint64_t stripe;
+
+	for (stripe = start_stripe; stripe < end_stripe; stripe++) {
+		ec_stripe_set_unmapped(ec, stripe);
+	}
+}
+
+/*
  * Route an UNMAP that cannot use the real fan-out (sub-stripe range)
  * through the existing WRITE_ZEROES path. ec_bdev_io_init() set
  * is_zero_fill = false for UNMAP; flip it so the RMW modify step
@@ -492,26 +554,9 @@ ec_unmap_inner_fanout(struct ec_bdev_io *ec_io,
 		return -EAGAIN;
 	}
 
-	/*
-	 * Multi-stripe stripe-busy claim. The claim path runs under the
-	 * home thread invariant, so check-all-then-set-all has no
-	 * concurrent-claimer race. If any stripe is busy (RMW, full-stripe
-	 * write, rebuild, prior UNMAP), defer the whole request via NOMEM
-	 * requeue. Under heavy small-write pressure UNMAP can starve; that
-	 * surfaces via the unmaps_deferred_busy counter.
-	 */
-	{
-		uint64_t stripe;
-
-		for (stripe = start_stripe; stripe < end_stripe; stripe++) {
-			if (ec_stripe_is_dirty(ec, stripe)) {
-				ec->unmaps_deferred_busy++;
-				return -EAGAIN;
-			}
-		}
-		for (stripe = start_stripe; stripe < end_stripe; stripe++) {
-			ec_stripe_set_dirty(ec, stripe);
-		}
+	/* Claim the stripe range; defer the whole request if any stripe is busy. */
+	if (ec_unmap_try_claim_range(ec, start_stripe, end_stripe) != 0) {
+		return -EAGAIN;
 	}
 
 	uctx = calloc(1, sizeof(*uctx));
@@ -545,13 +590,7 @@ ec_unmap_inner_fanout(struct ec_bdev_io *ec_io,
 
 	memcpy(uctx->staged_map, ec->stripe_unmapped_map,
 	       map_words * sizeof(uint64_t));
-	{
-		uint64_t stripe;
-
-		for (stripe = start_stripe; stripe < end_stripe; stripe++) {
-			ec_bitmap_word_set(uctx->staged_map, stripe);
-		}
-	}
+	ec_unmap_stage_range(uctx->staged_map, start_stripe, end_stripe);
 
 	uctx->ec_io           = ec_io;
 	uctx->start_stripe    = start_stripe;
@@ -633,34 +672,8 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 		return;
 	}
 
-	/*
-	 * Apply: durability is established, so the new bits become visible
-	 * to readers now.
-	 *
-	 * The shadow differs from live only in [start_stripe, end_stripe),
-	 * so a per-stripe loop calling ec_stripe_set_unmapped is equivalent
-	 * to a whole-map memcpy but has two important properties the memcpy
-	 * lacks:
-	 *
-	 *   1. Release-store semantics. The helper publishes each bit with
-	 *      __ATOMIC_RELEASE, so a submitter-thread reader using
-	 *      acquire-load sees the post-state correctly. A whole-map
-	 *      memcpy is a plain word-by-word copy with no ordering, racing
-	 *      the reader formally (and surfacing under TSAN even when
-	 *      benign on x86).
-	 *
-	 *   2. Touches only the changed words. At large geometries the
-	 *      whole-map is tens of MiB; the per-stripe loop touches one
-	 *      word per up-to-64 stripes (the TODO(perf) at the staging
-	 *      site notes the same cost).
-	 */
-	{
-		uint64_t stripe;
-
-		for (stripe = uctx->start_stripe; stripe < uctx->end_stripe; stripe++) {
-			ec_stripe_set_unmapped(ec, stripe);
-		}
-	}
+	/* Apply: durability is established, so publish the new bits to readers. */
+	ec_unmap_publish_range(ec, uctx->start_stripe, uctx->end_stripe);
 	/* NULL after apply; ec_unmap_uctx_complete's free is then a no-op. */
 	free(uctx->staged_map);
 	uctx->staged_map = NULL;
