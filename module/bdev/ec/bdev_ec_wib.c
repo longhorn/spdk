@@ -620,13 +620,52 @@ ec_wib_load_async_finish(struct ec_wib_load_async_ctx *ctx)
 }
 
 /*
- * Merge the best valid copy for disk ctx->parity_idx into ec->wib_region_map.
+ * Merge one parity disk's newest valid WIB copy into memory: OR its bits
+ * into both the live map and the crash map, adopt its generation and
+ * active slot if newer, and mark that a valid copy was found. The loaded
+ * bits are regions that were mid-write when the crash hit.
+ */
+static void
+ec_wib_adopt_best_copy(struct ec_bdev *ec, struct ec_wib_load_async_ctx *ctx)
+{
+	uint32_t map_words = EC_BITMAP_WORDS(ec->wib_num_regions);
+	bool pick_b = ctx->valid_b && (!ctx->valid_a || ctx->gen_b >= ctx->gen_a);
+	const void *best = pick_b ? ctx->bufb : ctx->bufa;
+	const struct ec_wib_header *hdr = (const struct ec_wib_header *)best;
+	const uint64_t             *bits = (const uint64_t *)(hdr + 1);
+	uint64_t                    best_gen = pick_b ? ctx->gen_b : ctx->gen_a;
+	uint32_t                    w;
+
+	/*
+	 * This OR-merge skips ec_wib_region_set_dirty's release stores, safe
+	 * for the same reason as ec_bitmap_apply_buf: it runs in the WIB load
+	 * chain during ec_bdev_create_async, before the create RPC returns.
+	 * Only two readers can race it, and neither does. SPDK examine runs on
+	 * the register thread (= home), so it serializes with this merge on
+	 * home. Workload readers on other reactors cannot reach the bdev until
+	 * the create RPC returns, which waits for spdk_bdev_wait_for_examine
+	 * after the load; by then the post-create release barriers have
+	 * published the merge.
+	 */
+	for (w = 0; w < map_words; w++) {
+		ec->wib_region_map[w]      |= bits[w];
+		ec->wib_crash_dirty_map[w] |= bits[w];
+	}
+
+	if (best_gen > ec->wib_generation) {
+		ec->wib_generation  = best_gen;
+		ec->wib_active_copy = pick_b ? 1 : 0;
+	}
+	ctx->any_valid = true;
+}
+
+/*
+ * Merge the best valid copy for disk ctx->parity_idx into the WIB maps.
  */
 static void
 ec_wib_load_async_merge_disk(struct ec_wib_load_async_ctx *ctx)
 {
-	struct ec_bdev *ec        = ctx->ec;
-	uint32_t        map_words = EC_BITMAP_WORDS(ec->wib_num_regions);
+	struct ec_bdev *ec = ctx->ec;
 
 	if (!ctx->valid_a && !ctx->valid_b) {
 		SPDK_WARNLOG("EC bdev %s: no valid WIB copy on parity "
@@ -635,47 +674,7 @@ ec_wib_load_async_merge_disk(struct ec_wib_load_async_ctx *ctx)
 		return;
 	}
 
-	{
-		bool pick_b = ctx->valid_b &&
-			      (!ctx->valid_a || ctx->gen_b >= ctx->gen_a);
-		const void *best = pick_b ? ctx->bufb : ctx->bufa;
-		const struct ec_wib_header *hdr = (const struct ec_wib_header *)best;
-		const uint64_t             *bits = (const uint64_t *)(hdr + 1);
-		uint64_t                    best_gen = pick_b ? ctx->gen_b : ctx->gen_a;
-		uint32_t                    w;
-
-		/*
-		 * The OR-merge below bypasses ec_wib_region_set_dirty's
-		 * release-store discipline. Safe by the same logic as
-		 * ec_bitmap_apply_buf: this runs in the ec_wib_load_async
-		 * chain during ec_bdev_create_async, before the create-RPC
-		 * returns. The bdev is registered before the async load
-		 * starts, but the only reader that can reach it in the
-		 * register-to-load-finished window is SPDK examine -- which
-		 * runs on the register thread (= home), so it serializes
-		 * with the merge here on home. Workload (cross-reactor)
-		 * readers cannot reach the bdev until the create-RPC
-		 * returns, which waits for spdk_bdev_wait_for_examine after
-		 * the load completes. By the time any non-home reader runs
-		 * acquire-load on wib_region_map, this merge is published
-		 * by the post-create release barriers SPDK inserts when the
-		 * bdev becomes visible to consumers.
-		 */
-		/*
-		 * Loaded bits are regions that were mid-write at the crash, so
-		 * they seed both the live map and the crash map.
-		 */
-		for (w = 0; w < map_words; w++) {
-			ec->wib_region_map[w]      |= bits[w];
-			ec->wib_crash_dirty_map[w] |= bits[w];
-		}
-
-		if (best_gen > ec->wib_generation) {
-			ec->wib_generation  = best_gen;
-			ec->wib_active_copy = pick_b ? 1 : 0;
-		}
-		ctx->any_valid = true;
-	}
+	ec_wib_adopt_best_copy(ec, ctx);
 }
 
 static void
