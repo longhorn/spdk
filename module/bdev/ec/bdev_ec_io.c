@@ -1564,6 +1564,23 @@ ec_io_complete_status_on_submitter(void *ctx)
 	spdk_bdev_io_complete(ec_io->bdev_io, ec_io->status);
 }
 
+void
+ec_io_route_complete_to_submitter(struct ec_bdev_io *ec_io, const char *what)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	int             send_rc;
+
+	send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
+				       ec_io_complete_status_on_submitter, ec_io);
+	if (send_rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: cannot hand off %s to submitter "
+			    "thread '%s' (rc=%d %s); bdev_io stays in-flight\n",
+			    ec->bdev.name, what,
+			    spdk_thread_get_name(ec_io->submitter_thread),
+			    send_rc, spdk_strerror(-send_rc));
+	}
+}
+
 static void ec_submit_write_on_home(void *ctx);
 
 int
@@ -1647,7 +1664,6 @@ static void
 ec_submit_write_on_home(void *ctx)
 {
 	struct ec_bdev_io *ec_io = ctx;
-	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
 	int                rc;
 
 	rc = ec_submit_write(ec_io);
@@ -1658,16 +1674,5 @@ ec_submit_write_on_home(void *ctx)
 	ec_io->status = (rc == -EAGAIN || rc == -ENOMEM)
 			? SPDK_BDEV_IO_STATUS_NOMEM
 			: SPDK_BDEV_IO_STATUS_FAILED;
-	{
-		int send_rc = spdk_thread_send_msg(ec_io->submitter_thread,
-			ec_io_complete_status_on_submitter, ec_io);
-		if (send_rc != 0) {
-			SPDK_ERRLOG("EC bdev %s: cannot hand off submit "
-				    "failure to submitter thread '%s' (rc=%d %s); "
-				    "bdev_io stays in-flight\n",
-				    ec->bdev.name,
-				    spdk_thread_get_name(ec_io->submitter_thread),
-				    send_rc, spdk_strerror(-send_rc));
-		}
-	}
+	ec_io_route_complete_to_submitter(ec_io, "submit failure");
 }

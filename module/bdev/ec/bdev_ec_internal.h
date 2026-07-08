@@ -2070,4 +2070,13 @@ int  ec_submit_unmap(struct ec_bdev_io *ec_io);
  */
 void ec_io_complete_status_on_submitter(void *ctx);
 
+/*
+ * Hand off the parent bdev_io completion to the submitter thread. The
+ * caller sets ec_io->status first; `what` labels the error log. If the
+ * send fails, the bdev_io stays in-flight -- it cannot be completed from
+ * the wrong thread.
+ */
+void ec_io_route_complete_to_submitter(struct ec_bdev_io *ec_io,
+				       const char *what);
+
 #endif /* SPDK_BDEV_EC_INTERNAL_H */
