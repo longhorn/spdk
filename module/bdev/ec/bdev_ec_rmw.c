@@ -262,6 +262,98 @@ ec_rmw_wib_set_cb(void *cb_arg, int rc)
 }
 
 /*
+ * Step 2 of the RMW: overlay the write payload onto the stripe data.
+ * Pack the k data chunks into a scratch buffer, apply the payload at its
+ * byte offset, then redistribute back into the chunk buffers. scratch is a
+ * plain heap buffer (not DMA) -- CPU-side manipulation only. Returns
+ * -ENOMEM if the scratch allocation fails; the caller completes the
+ * bdev_io in that case.
+ */
+static int
+ec_rmw_apply_payload(struct ec_rmw_ctx *mctx)
+{
+	struct ec_bdev_io *ec_io            = mctx->ec_io;
+	struct ec_bdev    *ec               = ec_from_bdev_io(ec_io->bdev_io);
+	uint64_t           chunk_bytes      = ec->strip_size * ec->bdev.blocklen;
+	uint64_t           total_data_bytes = ec->stripe_blocks * ec->bdev.blocklen;
+	uint64_t           stripe_off_bytes = mctx->stripe_off_blocks * ec->bdev.blocklen;
+	uint64_t           payload_bytes    = mctx->num_blocks * ec->bdev.blocklen;
+	uint8_t           *scratch;
+	uint32_t           i;
+
+	scratch = malloc(total_data_bytes);
+	if (!scratch) {
+		SPDK_ERRLOG("EC bdev %s: OOM for RMW scratch buffer "
+			    "(%" PRIu64 " bytes, stripe %" PRIu64 ")\n",
+			    ec->bdev.name, total_data_bytes,
+			    mctx->stripe_index);
+		return -ENOMEM;
+	}
+
+	/* Reassemble: pack chunk_bufs[0..k-1] into scratch linearly */
+	for (i = 0; i < ec->k; i++) {
+		memcpy(scratch + (i * chunk_bytes),
+		       mctx->chunk_bufs[i],
+		       chunk_bytes);
+	}
+
+	/*
+	 * Overlay the write payload at stripe_off_bytes.
+	 *
+	 * WRITE_ZEROES, UNMAP-emulated-as-WRITE_ZEROES, and the
+	 * partial-stripe head/tail segments of an unaligned multi-stripe
+	 * UNMAP (ec_submit_rmw_zero_fill_range) all carry no user
+	 * iov; the payload is conceptually all zeros. Use memset to
+	 * fill the modified region directly. The parity re-encode
+	 * then computes the correct parity for "old data with a zero
+	 * hole" -- exactly the deallocated-reads-as-zero semantics
+	 * expected by callers.
+	 */
+	if (mctx->is_zero_fill) {
+		memset(scratch + stripe_off_bytes, 0, payload_bytes);
+	} else {
+		spdk_copy_iovs_to_buf(scratch + stripe_off_bytes,
+				      payload_bytes,
+				      ec_io->iovs,
+				      ec_io->iovcnt);
+	}
+
+	/* Redistribute back into chunk_bufs[0..k-1] */
+	for (i = 0; i < ec->k; i++) {
+		memcpy(mctx->chunk_bufs[i],
+		       scratch + (i * chunk_bytes),
+		       chunk_bytes);
+	}
+
+	free(scratch);
+	return 0;
+}
+
+/*
+ * Step 3 of the RMW: re-encode all m parity chunks from the modified data.
+ * data_ptrs map to chunk_bufs[0..k-1], parity_ptrs to chunk_bufs[k..n-1].
+ */
+static void
+ec_rmw_encode_parity(struct ec_rmw_ctx *mctx)
+{
+	struct ec_bdev *ec          = ec_from_bdev_io(mctx->ec_io->bdev_io);
+	uint64_t        chunk_bytes = ec->strip_size * ec->bdev.blocklen;
+	uint8_t        *data_ptrs[EC_MAX_BASE_BDEVS];
+	uint8_t        *parity_ptrs[EC_MAX_BASE_BDEVS];
+	uint32_t        i;
+
+	for (i = 0; i < ec->k; i++) {
+		data_ptrs[i] = mctx->chunk_bufs[i];
+	}
+	for (i = 0; i < ec->m; i++) {
+		parity_ptrs[i] = mctx->chunk_bufs[ec->k + i];
+	}
+
+	ec_encode_data((int)chunk_bytes, (int)ec->k, (int)ec->m,
+		       ec->g_tbls, data_ptrs, parity_ptrs);
+}
+
+/*
  * Called once all read children for this RMW have completed.
  *
  * Steps:
@@ -279,7 +371,6 @@ ec_rmw_reads_done(struct ec_rmw_ctx *mctx)
 	struct ec_bdev_io *ec_io      = mctx->ec_io;
 	struct ec_bdev    *ec         = ec_from_bdev_io(ec_io->bdev_io);
 	uint64_t           chunk_bytes = ec->strip_size * ec->bdev.blocklen;
-	uint64_t           total_data_bytes = ec->stripe_blocks * ec->bdev.blocklen;
 	uint32_t           i;
 	int                rc;
 
@@ -323,96 +414,16 @@ ec_rmw_reads_done(struct ec_rmw_ctx *mctx)
 		}
 	}
 
-	/* ------------------------------------------------------------------ */
-	/* Step 2: overlay the write payload                                  */
-	/*                                                                    */
-	/* Reassemble the k data chunks into a contiguous scratch buffer,     */
-	/* apply the write payload at the correct byte offset, then           */
-	/* redistribute back into chunk_bufs[0..k-1].                        */
-	/*                                                                    */
-	/* scratch is a regular heap allocation (not DMA) because it is only  */
-	/* used for CPU-side data manipulation, not for I/O.                  */
-	/* ------------------------------------------------------------------ */
-	{
-		uint8_t *scratch;
-		uint64_t stripe_off_bytes = mctx->stripe_off_blocks *
-					    ec->bdev.blocklen;
-		uint64_t payload_bytes    = mctx->num_blocks *
-					    ec->bdev.blocklen;
-
-		scratch = malloc(total_data_bytes);
-		if (!scratch) {
-			SPDK_ERRLOG("EC bdev %s: OOM for RMW scratch buffer "
-				    "(%" PRIu64 " bytes, stripe %" PRIu64 ")\n",
-				    ec->bdev.name, total_data_bytes,
-				    mctx->stripe_index);
-			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
-			ec_rmw_complete(mctx);
-			return;
-		}
-
-		/* Reassemble: pack chunk_bufs[0..k-1] into scratch linearly */
-		for (i = 0; i < ec->k; i++) {
-			memcpy(scratch + (i * chunk_bytes),
-			       mctx->chunk_bufs[i],
-			       chunk_bytes);
-		}
-
-		/*
-		 * Overlay the write payload at stripe_off_bytes.
-		 *
-		 * WRITE_ZEROES, UNMAP-emulated-as-WRITE_ZEROES, and the
-		 * partial-stripe head/tail segments of an unaligned multi-stripe
-		 * UNMAP (ec_submit_rmw_zero_fill_range) all carry no user
-		 * iov; the payload is conceptually all zeros. Use memset to
-		 * fill the modified region directly. The parity re-encode
-		 * below then computes the correct parity for "old data with
-		 * a zero hole" -- exactly the deallocated-reads-as-zero
-		 * semantics expected by callers.
-		 */
-		if (mctx->is_zero_fill) {
-			memset(scratch + stripe_off_bytes, 0, payload_bytes);
-		} else {
-			spdk_copy_iovs_to_buf(scratch + stripe_off_bytes,
-					      payload_bytes,
-					      ec_io->iovs,
-					      ec_io->iovcnt);
-		}
-
-		/* Redistribute back into chunk_bufs[0..k-1] */
-		for (i = 0; i < ec->k; i++) {
-			memcpy(mctx->chunk_bufs[i],
-			       scratch + (i * chunk_bytes),
-			       chunk_bytes);
-		}
-
-		free(scratch);
+	/* Step 2: overlay the write payload onto the k data chunks. */
+	rc = ec_rmw_apply_payload(mctx);
+	if (rc != 0) {
+		mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+		ec_rmw_complete(mctx);
+		return;
 	}
 
-	/* ------------------------------------------------------------------ */
-	/* Step 3: re-encode all m parity chunks                              */
-	/*                                                                    */
-	/* data_ptrs[0..k-1]  -> chunk_bufs[0..k-1]   (modified data)        */
-	/* parity_ptrs[0..m-1] -> chunk_bufs[k..n-1]  (parity output)        */
-	/* ------------------------------------------------------------------ */
-	{
-		uint8_t *data_ptrs[EC_MAX_BASE_BDEVS];
-		uint8_t *parity_ptrs[EC_MAX_BASE_BDEVS];
-
-		for (i = 0; i < ec->k; i++) {
-			data_ptrs[i] = mctx->chunk_bufs[i];
-		}
-		for (i = 0; i < ec->m; i++) {
-			parity_ptrs[i] = mctx->chunk_bufs[ec->k + i];
-		}
-
-		ec_encode_data((int)chunk_bytes,
-			       (int)ec->k,
-			       (int)ec->m,
-			       ec->g_tbls,
-			       data_ptrs,
-			       parity_ptrs);
-	}
+	/* Step 3: re-encode all m parity chunks. */
+	ec_rmw_encode_parity(mctx);
 
 	/*
 	 * The WIB persist already happened in the setup phase (before reads),
