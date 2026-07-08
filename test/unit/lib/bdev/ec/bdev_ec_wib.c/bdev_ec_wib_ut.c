@@ -206,6 +206,65 @@ test_idle_poller_preserves_crash_regions(void)
 	ut_run_preserve_case(NULL, 1);
 }
 
+/*
+ * A partial write failure marks the region crash-dirty via
+ * ec_wib_mark_failed_write, then releases its inflight ref. From that point the
+ * idle poller must NEVER clear the region (even quiet, inflight == 0) -- that is
+ * the bug the mark fixes: without it the poller would erase the on-disk record
+ * while the parity is still inconsistent, and a later degraded read would serve
+ * garbage. The mark also bumps wib_failed_write_marks once per region.
+ */
+static void
+test_mark_failed_write_survives_poller(void)
+{
+	struct ec_bdev ec;
+	uint64_t       gen_before;
+	int            rc;
+	int            tick;
+
+	ut_wib_init(&ec);
+
+	/* A write marked region 1 live-dirty and took an inflight ref. */
+	ec_wib_region_set_dirty(&ec, 1);
+	ec_wib_region_inflight_inc(&ec, 1);
+	ec.wib_region_dirty_ticks[1] = 0;   /* written "long ago" (tick 0) */
+
+	/*
+	 * The write fails partway: mark crash-dirty BEFORE releasing the inflight
+	 * ref, mirroring ec_child_io_complete / ec_rmw_teardown on failure.
+	 */
+	ec_wib_mark_failed_write(&ec, 1);
+	ec_wib_region_inflight_dec(&ec, 1);
+
+	CU_ASSERT(ec_wib_crash_is_dirty(&ec, 1));
+	CU_ASSERT(ec_wib_region_is_dirty(&ec, 1));
+	CU_ASSERT(ec_wib_region_inflight_get(&ec, 1) == 0);
+	CU_ASSERT(ec.wib_failed_write_marks == 1);        /* counted once */
+
+	/* Marking the same region again does not double-count. */
+	ec_wib_mark_failed_write(&ec, 1);
+	CU_ASSERT(ec.wib_failed_write_marks == 1);
+
+	/*
+	 * Region is quiet and inflight == 0 -- without the crash mark the poller
+	 * would clear it here. The mark is the thing tested.
+	 */
+	MOCK_SET(spdk_get_ticks, (uint64_t)spdk_get_ticks_hz() * EC_WIB_IDLE_MS / 1000 + 1);
+	gen_before = ec.wib_generation;
+
+	for (tick = 0; tick < 3; tick++) {
+		rc = ec_wib_idle_poller_cb(&ec);
+		CU_ASSERT(rc == SPDK_POLLER_IDLE);            /* nothing cleared */
+		CU_ASSERT(ec_wib_crash_is_dirty(&ec, 1));
+		CU_ASSERT(ec_wib_region_is_dirty(&ec, 1));
+		ut_wib_assert_superset(&ec);
+	}
+	CU_ASSERT(ec.wib_generation == gen_before);       /* no persist ran: record kept */
+
+	MOCK_CLEAR(spdk_get_ticks);
+	ut_wib_free(&ec);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -218,6 +277,7 @@ main(int argc, char **argv)
 
 	CU_ADD_TEST(suite, test_idle_poller_clears_write_intent);
 	CU_ADD_TEST(suite, test_idle_poller_preserves_crash_regions);
+	CU_ADD_TEST(suite, test_mark_failed_write_survives_poller);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

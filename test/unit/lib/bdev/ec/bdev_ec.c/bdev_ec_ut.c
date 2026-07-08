@@ -1541,6 +1541,48 @@ test_rebuild_counts_crash_dirty_stripes(void)
 	ec_free_runtime_arrays(&ec);
 }
 
+/*
+ * ec_wib_mark_failed_write (the partial-write-failure mark) sets the region
+ * crash-dirty, engaging the degraded-RMW guard: a degraded RMW to the region
+ * defers with -EAGAIN instead of reconstructing from the inconsistent parity.
+ * It bumps wib_failed_write_marks once per region.
+ */
+static void
+test_mark_failed_write_defers_rmw(void)
+{
+	struct ec_bdev ec;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	/* Degraded, no scrub running -- the window guard 2 covers. */
+	ec.failed_count = 1;
+	ec.scrub_ctx    = NULL;
+
+	/* Region 0 dirty from a foreground write only: guard 2 does not defer. */
+	ec_wib_region_set_dirty(&ec, 0);
+	rc = ec_rmw_check_guards(&ec, 0);
+	CU_ASSERT(rc == 0);
+
+	/* A partial write failure marks the region: guard 2 now defers. */
+	ec_wib_mark_failed_write(&ec, 0);
+	CU_ASSERT(ec.wib_failed_write_marks == 1);
+	CU_ASSERT(ec_wib_crash_is_dirty(&ec, 0));
+
+	rc = ec_rmw_check_guards(&ec, 0);
+	CU_ASSERT(rc == -EAGAIN);
+
+	/* Idempotent: re-marking does not double-count. */
+	ec_wib_mark_failed_write(&ec, 0);
+	CU_ASSERT(ec.wib_failed_write_marks == 1);
+
+	ec_free_runtime_arrays(&ec);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1584,6 +1626,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_scrub_uses_crash_map);
 	CU_ADD_TEST(suite, test_guard2_defers_crash_not_write_intent);
 	CU_ADD_TEST(suite, test_rebuild_counts_crash_dirty_stripes);
+	CU_ADD_TEST(suite, test_mark_failed_write_defers_rmw);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

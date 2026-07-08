@@ -2066,6 +2066,8 @@ ec_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 
 	spdk_json_write_named_uint64(w, "degraded_read_eio_dirty",
 				     __atomic_load_n(&ec->degraded_read_eio_dirty, __ATOMIC_RELAXED));
+	spdk_json_write_named_uint64(w, "wib_failed_write_marks",
+				     __atomic_load_n(&ec->wib_failed_write_marks, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "crash_dirty_stripes_rebuilt",
 				     __atomic_load_n(&ec->crash_dirty_stripes_rebuilt, __ATOMIC_RELAXED));
 	spdk_json_write_named_bool(w, "scrub_in_progress", ec->scrub_ctx != NULL);

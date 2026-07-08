@@ -762,6 +762,7 @@ struct ec_bdev {
 	 * cross-thread counter plain is a data race.
 	 */
 	uint64_t degraded_read_eio_dirty;        /* reads rejected: dirty WIB region */
+	uint64_t wib_failed_write_marks;         /* regions marked crash-dirty by a partial write failure */
 	uint64_t degraded_reads_reconstructed;   /* reads served via reconstruction  */
 	/*
 	 * Data-slot stripes the rebuild reconstructed while their region was
@@ -1390,18 +1391,55 @@ ec_wib_region_clear_dirty(struct ec_bdev *ec, uint32_t region)
 	}
 }
 
-/* Crash-dirty map accessors. Home-thread only, so plain access. */
+/*
+ * Read and set the crash-dirty bit for a WIB region. Reads run on the home
+ * thread, but a partial write failure sets the bit from the submitter thread,
+ * so access is atomic -- release on set, acquire on read -- so every reader
+ * sees a runtime set.
+ */
 static inline bool
 ec_wib_crash_is_dirty(const struct ec_bdev *ec, uint32_t region)
 {
-	return !!(ec->wib_crash_dirty_map[region / 64] &
-		  (UINT64_C(1) << (region % 64)));
+	uint64_t word = __atomic_load_n(&ec->wib_crash_dirty_map[region / 64],
+					__ATOMIC_ACQUIRE);
+	return !!(word & (UINT64_C(1) << (region % 64)));
 }
 
 static inline void
 ec_wib_crash_set_dirty(struct ec_bdev *ec, uint32_t region)
 {
-	ec->wib_crash_dirty_map[region / 64] |= UINT64_C(1) << (region % 64);
+	__atomic_fetch_or(&ec->wib_crash_dirty_map[region / 64],
+			  UINT64_C(1) << (region % 64), __ATOMIC_RELEASE);
+}
+
+/*
+ * Mark the stripe's WIB region crash-dirty after a partial write failure. The
+ * stripe's parity may no longer match its data, and the on-disk WIB bit
+ * (persisted before fan-out) is the only durable record of that. Crash-dirty
+ * stops the idle poller from clearing the region, makes degraded reads return
+ * -EIO, and gets the stripe re-encoded by the scrub -- so reads see -EIO, never
+ * garbage, until it is repaired. That scrub runs at next load today; a runtime
+ * scrub kick is a follow-up.
+ *
+ * Call this before releasing the write's WIB inflight ref: the idle poller
+ * reads inflight before crash-dirty, so marking first means it can never see
+ * inflight == 0 without also seeing this mark.
+ */
+static inline void
+ec_wib_mark_failed_write(struct ec_bdev *ec, uint32_t region)
+{
+	uint64_t mask = UINT64_C(1) << (region % 64);
+	uint64_t old  = __atomic_fetch_or(&ec->wib_crash_dirty_map[region / 64],
+					  mask, __ATOMIC_RELEASE);
+
+	if (!(old & mask)) {
+		/* First failure to dirty this region -- count and warn once. */
+		__atomic_fetch_add(&ec->wib_failed_write_marks, 1, __ATOMIC_RELAXED);
+		SPDK_WARNLOG("EC bdev %s: partial write failure left WIB region %u "
+			     "with inconsistent parity; marked for scrub re-encode "
+			     "(degraded reads return -EIO until repaired)\n",
+			     ec->bdev.name, region);
+	}
 }
 
 static inline void
@@ -1458,27 +1496,21 @@ ec_scrub_blocks_stripe(const struct ec_bdev *ec, uint64_t stripe_idx)
 }
 
 /*
- * Bracket the in-flight write counter for a single WIB region. Two
- * paths inc it: ec_submit_rmw_write (sub-stripe RMW) and
- * ec_submit_full_write (full-stripe write). Each inc must be
- * balanced by exactly one dec -- for RMW, in ec_rmw_complete or the
- * synchronous read-submit failure cleanup; for full-stripe writes,
- * in ec_child_io_complete via ec_bdev_io.wib_inflight_held. The dec
- * guards against underflow defensively; underflow indicates a
- * balance bug higher up the chain.
- */
-/*
- * Threading: inc happens on home (during submit claim), dec happens on
- * submitter (during completion cleanup). Inc must be atomic even though
- * home is the only incrementer, because submitter is a concurrent
- * decrementer; the read-modify-write pair would otherwise race. Relaxed
- * ordering is sufficient (the counter is internal state, not a data-
- * publication signal).
+ * Per-region in-flight write counter. A write increments it on the home thread
+ * when it claims the region (ec_submit_rmw_write, ec_submit_full_write) and
+ * decrements it on the submitter thread when it completes (ec_rmw_complete for
+ * RMW, ec_child_io_complete for full-stripe writes). Every inc must be matched
+ * by exactly one dec; the dec guards against underflow, which would mean a
+ * balance bug upstream.
  *
- * The dec uses a CAS loop with an underflow guard: a plain fetch_sub
- * would briefly observe UINT32_MAX before being restored, creating a
- * window where the idle WIB poller could read garbage. The CAS loop
- * atomically transitions only when the current value is positive.
+ * Both are atomic because home and submitter touch the counter concurrently.
+ * The dec is RELEASE and the poller's read is ACQUIRE: a failed write marks its
+ * region crash-dirty and then decs here, so the poller can never see the count
+ * reach zero without also seeing that mark. The inc stays relaxed.
+ *
+ * The dec uses a CAS loop, not a plain fetch_sub: fetch_sub on a zero counter
+ * would briefly wrap to UINT32_MAX before restoring, and the idle poller could
+ * read that garbage. The CAS decrements only when the count is positive.
  */
 static inline void
 ec_wib_region_inflight_inc(struct ec_bdev *ec, uint32_t region)
@@ -1495,7 +1527,7 @@ ec_wib_region_inflight_dec(struct ec_bdev *ec, uint32_t region)
 	while (current > 0) {
 		if (__atomic_compare_exchange_n(&ec->wib_region_inflight[region],
 						&current, current - 1, false,
-						__ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+						__ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
 			return;
 		}
 		/* current updated with latest value; loop and re-check > 0 */
@@ -1507,7 +1539,7 @@ ec_wib_region_inflight_dec(struct ec_bdev *ec, uint32_t region)
 static inline uint32_t
 ec_wib_region_inflight_get(const struct ec_bdev *ec, uint32_t region)
 {
-	return __atomic_load_n(&ec->wib_region_inflight[region], __ATOMIC_RELAXED);
+	return __atomic_load_n(&ec->wib_region_inflight[region], __ATOMIC_ACQUIRE);
 }
 
 /*

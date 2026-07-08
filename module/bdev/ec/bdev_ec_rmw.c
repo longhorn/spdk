@@ -62,6 +62,15 @@ ec_rmw_teardown(struct ec_rmw_ctx *mctx)
 
 	ec_stripe_clear_dirty(ec, mctx->stripe_index);
 	ec_rmw_in_flight_dec(ec);
+	if (mctx->status != SPDK_BDEV_IO_STATUS_SUCCESS) {
+		/*
+		 * Partial failure may leave parity inconsistent with data -- and RMW
+		 * leaves committed chunks the caller never touched, so this can
+		 * corrupt data the caller never wrote. Mark crash-dirty before the
+		 * inflight dec (see ec_wib_mark_failed_write for why the order matters).
+		 */
+		ec_wib_mark_failed_write(ec, region);
+	}
 	ec_wib_region_inflight_dec(ec, region);
 	ec_rmw_free_ctx(mctx, ec);
 }
@@ -100,9 +109,10 @@ ec_rmw_complete(struct ec_rmw_ctx *mctx)
 	 *   - ec_wib_deferred_drain's failure path -- on home; hops.
 	 *
 	 * Routing the WHOLE function (cleanup + completion) is safe
-	 * because the cleanup ops are atomic: ec_stripe_clear_dirty,
-	 * ec_rmw_in_flight_dec, ec_wib_region_inflight_dec all use
-	 * relaxed atomics and work from any thread.
+	 * because the cleanup ops are atomic and work from any thread:
+	 * ec_stripe_clear_dirty, ec_rmw_in_flight_dec, and
+	 * ec_wib_region_inflight_dec (release-ordered for its crash-dirty
+	 * publication role; see its comment).
 	 *
 	 * On send_msg failure, perform the cleanup inline here (so mctx
 	 * is not leaked) and accept the bdev_io hang. The on-disk WIB

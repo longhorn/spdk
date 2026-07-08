@@ -299,6 +299,15 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 		 * which branch runs next.
 		 */
 		if (ec_io->wib_inflight_held) {
+			if (ec_io->status != SPDK_BDEV_IO_STATUS_SUCCESS) {
+				/*
+				 * Partial failure may leave parity inconsistent with
+				 * data. Mark crash-dirty before releasing the inflight
+				 * ref (see ec_wib_mark_failed_write for why the order
+				 * matters).
+				 */
+				ec_wib_mark_failed_write(ec, ec_io->wib_region);
+			}
 			ec_wib_region_inflight_dec(ec, ec_io->wib_region);
 			ec_io->wib_inflight_held = false;
 		}

@@ -366,6 +366,8 @@ ec_write_bdev_info_json(struct spdk_json_write_ctx *w, struct ec_bdev *ec)
 	ec_write_io_stats_json(w, ec);
 	spdk_json_write_named_uint64(w, "degraded_read_eio_dirty",
 				     ec->degraded_read_eio_dirty);
+	spdk_json_write_named_uint64(w, "wib_failed_write_marks",
+				     __atomic_load_n(&ec->wib_failed_write_marks, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "crash_dirty_stripes_rebuilt",
 				     __atomic_load_n(&ec->crash_dirty_stripes_rebuilt,
 						     __ATOMIC_RELAXED));

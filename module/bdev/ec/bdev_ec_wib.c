@@ -433,14 +433,21 @@ ec_wib_idle_poller_cb(void *arg)
 			continue;
 		}
 		/*
+		 * Order is load-bearing: read inflight before crash-dirty. A failed
+		 * write marks its region crash-dirty, then releases its inflight ref
+		 * (a release dec). Seeing inflight == 0 here (an acquire load) then
+		 * guarantees the crash mark is visible on the next check, so we never
+		 * clear a region a just-failed write marked. Don't reorder these two.
+		 */
+		if (ec_wib_region_inflight_get(ec, region) > 0) {
+			continue;
+		}
+		/*
 		 * Never clear a crash region here -- only the scrub may, once it
 		 * re-encodes the parity. Clearing it would drop the crash record
 		 * and let degraded reads trust stale parity.
 		 */
 		if (ec_wib_crash_is_dirty(ec, region)) {
-			continue;
-		}
-		if (ec_wib_region_inflight_get(ec, region) > 0) {
 			continue;
 		}
 		if ((now - ec->wib_region_dirty_ticks[region]) < idle_ticks) {
