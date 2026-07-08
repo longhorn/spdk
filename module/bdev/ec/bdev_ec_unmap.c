@@ -356,6 +356,7 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 	uint64_t        len = ec_io->num_blocks;
 	uint64_t        end = off + len;
 	uint64_t        start_stripe, end_stripe;
+	uint64_t        head_off, head_len, tail_off, tail_len;
 
 	if (len == 0) {
 		/* No home-thread state touched; complete inline on the
@@ -462,17 +463,15 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 	 * silently killing every subsequent fstrim. Splitting fixes that
 	 * AND fully reclaims the partial fragments.
 	 */
-	{
-		uint64_t head_off = off;
-		uint64_t head_len = (start_stripe * ec->stripe_blocks) - off;
-		uint64_t tail_off = end_stripe * ec->stripe_blocks;
-		uint64_t tail_len = end - tail_off;
+	head_off = off;
+	head_len = (start_stripe * ec->stripe_blocks) - off;
+	tail_off = end_stripe * ec->stripe_blocks;
+	tail_len = end - tail_off;
 
-		rc = ec_submit_unmap_split(ec_io,
-					   head_off, head_len,
-					   start_stripe, end_stripe,
-					   tail_off, tail_len);
-	}
+	rc = ec_submit_unmap_split(ec_io,
+				   head_off, head_len,
+				   start_stripe, end_stripe,
+				   tail_off, tail_len);
 
 out:
 	if (rc != 0 && rc != -EAGAIN) {
@@ -651,6 +650,7 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 {
 	struct ec_unmap_ctx *uctx = cb_arg;
 	struct ec_bdev      *ec   = ec_from_bdev_io(uctx->ec_io->bdev_io);
+	int                  send_rc;
 
 	if (persist_rc != 0) {
 		/*
@@ -710,47 +710,43 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 		return;
 	}
 
-	{
-		int send_rc;
+	send_rc = spdk_thread_send_msg(uctx->ec_io->submitter_thread,
+		ec_unmap_dispatch_fanout_on_submitter, uctx);
+	if (send_rc != 0) {
+		/*
+		 * Cannot reach the submitter. Release the stripe-busy
+		 * claims, mark FAILED, and route the cb_fn invocation
+		 * back via a second send_msg (cb_fn ultimately calls
+		 * spdk_bdev_io_complete, which asserts owner thread).
+		 * If even the second send_msg fails, the bdev_io stays
+		 * in flight rather than being completed on the wrong
+		 * thread. The bitmap apply already happened, so the
+		 * read-as-zero contract is intact; the FAILED return
+		 * tells the caller no physical reclamation occurred.
+		 */
+		int complete_rc;
 
-		send_rc = spdk_thread_send_msg(uctx->ec_io->submitter_thread,
-			ec_unmap_dispatch_fanout_on_submitter, uctx);
-		if (send_rc != 0) {
-			/*
-			 * Cannot reach the submitter. Release the stripe-busy
-			 * claims, mark FAILED, and route the cb_fn invocation
-			 * back via a second send_msg (cb_fn ultimately calls
-			 * spdk_bdev_io_complete, which asserts owner thread).
-			 * If even the second send_msg fails, the bdev_io stays
-			 * in flight rather than being completed on the wrong
-			 * thread. The bitmap apply already happened, so the
-			 * read-as-zero contract is intact; the FAILED return
-			 * tells the caller no physical reclamation occurred.
-			 */
-			int complete_rc;
-
-			SPDK_ERRLOG("EC bdev %s: cannot hand off UNMAP fan-out "
-				    "to submitter thread '%s' (rc=%d %s) at stripes "
-				    "[%" PRIu64 "..%" PRIu64 "); failing\n",
+		SPDK_ERRLOG("EC bdev %s: cannot hand off UNMAP fan-out "
+			    "to submitter thread '%s' (rc=%d %s) at stripes "
+			    "[%" PRIu64 "..%" PRIu64 "); failing\n",
+			    ec->bdev.name,
+			    spdk_thread_get_name(uctx->ec_io->submitter_thread),
+			    send_rc, spdk_strerror(-send_rc),
+			    uctx->start_stripe, uctx->end_stripe);
+		ec_unmap_release_claims(ec, uctx->start_stripe,
+					uctx->end_stripe);
+		uctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+		complete_rc = spdk_thread_send_msg(
+			uctx->ec_io->submitter_thread,
+			ec_unmap_fire_cb_on_submitter, uctx);
+		if (complete_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: also cannot hand off "
+				    "failure completion to submitter thread "
+				    "'%s' (rc=%d %s); bdev_io stays in-flight\n",
 				    ec->bdev.name,
 				    spdk_thread_get_name(uctx->ec_io->submitter_thread),
-				    send_rc, spdk_strerror(-send_rc),
-				    uctx->start_stripe, uctx->end_stripe);
-			ec_unmap_release_claims(ec, uctx->start_stripe,
-						uctx->end_stripe);
-			uctx->status = SPDK_BDEV_IO_STATUS_FAILED;
-			complete_rc = spdk_thread_send_msg(
-				uctx->ec_io->submitter_thread,
-				ec_unmap_fire_cb_on_submitter, uctx);
-			if (complete_rc != 0) {
-				SPDK_ERRLOG("EC bdev %s: also cannot hand off "
-					    "failure completion to submitter thread "
-					    "'%s' (rc=%d %s); bdev_io stays in-flight\n",
-					    ec->bdev.name,
-					    spdk_thread_get_name(uctx->ec_io->submitter_thread),
-					    complete_rc, spdk_strerror(-complete_rc));
-				free(uctx);
-			}
+				    complete_rc, spdk_strerror(-complete_rc));
+			free(uctx);
 		}
 	}
 }
