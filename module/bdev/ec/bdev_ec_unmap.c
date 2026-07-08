@@ -589,6 +589,24 @@ ec_unmap_inner_fanout(struct ec_bdev_io *ec_io,
 	return 0;
 }
 
+/*
+ * Free the staged shadow and uctx, then fire the completion callback.
+ * staged_map is NULL after the persist applies it, so the free reclaims
+ * the shadow only on the pre-apply failure path. `status` is a parameter
+ * because the failure paths complete FAILED while uctx->status still
+ * reads SUCCESS.
+ */
+static void
+ec_unmap_uctx_complete(struct ec_unmap_ctx *uctx, enum spdk_bdev_io_status status)
+{
+	ec_unmap_inner_complete_cb cb_fn  = uctx->cb_fn;
+	void                      *cb_arg = uctx->cb_arg;
+
+	free(uctx->staged_map);
+	free(uctx);
+	cb_fn(cb_arg, status);
+}
+
 static void
 ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 {
@@ -611,14 +629,7 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 			     uctx->start_stripe, uctx->end_stripe);
 		ec_unmap_release_claims(ec, uctx->start_stripe,
 					uctx->end_stripe);
-		{
-			ec_unmap_inner_complete_cb cb_fn  = uctx->cb_fn;
-			void                      *cb_arg = uctx->cb_arg;
-
-			free(uctx->staged_map);
-			free(uctx);
-			cb_fn(cb_arg, SPDK_BDEV_IO_STATUS_FAILED);
-		}
+		ec_unmap_uctx_complete(uctx, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
@@ -650,6 +661,7 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 			ec_stripe_set_unmapped(ec, stripe);
 		}
 	}
+	/* NULL after apply; ec_unmap_uctx_complete's free is then a no-op. */
 	free(uctx->staged_map);
 	uctx->staged_map = NULL;
 
@@ -680,13 +692,7 @@ ec_unmap_bitmap_persist_done(void *cb_arg, int persist_rc)
 			 */
 			ec_unmap_release_claims(ec, uctx->start_stripe,
 						uctx->end_stripe);
-			{
-				ec_unmap_inner_complete_cb cb_fn  = uctx->cb_fn;
-				void                      *cb_arg = uctx->cb_arg;
-
-				free(uctx);
-				cb_fn(cb_arg, SPDK_BDEV_IO_STATUS_FAILED);
-			}
+			ec_unmap_uctx_complete(uctx, SPDK_BDEV_IO_STATUS_FAILED);
 		}
 		return;
 	}
@@ -760,13 +766,7 @@ ec_unmap_dispatch_fanout_on_submitter(void *ctx)
 			    uctx->end_stripe, rc);
 		ec_unmap_release_claims(ec, uctx->start_stripe,
 					uctx->end_stripe);
-		{
-			ec_unmap_inner_complete_cb cb_fn  = uctx->cb_fn;
-			void                      *cb_arg = uctx->cb_arg;
-
-			free(uctx);
-			cb_fn(cb_arg, SPDK_BDEV_IO_STATUS_FAILED);
-		}
+		ec_unmap_uctx_complete(uctx, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
@@ -774,18 +774,14 @@ ec_unmap_dispatch_fanout_on_submitter(void *ctx)
  * send_msg target for routing the cb_fn invocation back to the
  * submitter on the second-stage failure where the fan-out hand-off
  * itself failed. uctx->status carries the completion status (set by
- * the caller to FAILED before send_msg). Frees uctx after firing.
+ * the caller to FAILED before send_msg).
  */
 static void
 ec_unmap_fire_cb_on_submitter(void *ctx)
 {
-	struct ec_unmap_ctx        *uctx   = ctx;
-	ec_unmap_inner_complete_cb  cb_fn  = uctx->cb_fn;
-	void                       *cb_arg = uctx->cb_arg;
-	enum spdk_bdev_io_status    status = uctx->status;
+	struct ec_unmap_ctx *uctx = ctx;
 
-	free(uctx);
-	cb_fn(cb_arg, status);
+	ec_unmap_uctx_complete(uctx, uctx->status);
 }
 
 static int
@@ -870,14 +866,7 @@ ec_unmap_child_complete(struct spdk_bdev_io *child, bool success, void *cb_arg)
 	 * completion (see ec_unmap_inner_complete_default); bumping per
 	 * sub-segment would over-count a multi-segment request.
 	 */
-	{
-		ec_unmap_inner_complete_cb cb_fn  = uctx->cb_fn;
-		void                      *cb_arg = uctx->cb_arg;
-		enum spdk_bdev_io_status   status = uctx->status;
-
-		free(uctx);
-		cb_fn(cb_arg, status);
-	}
+	ec_unmap_uctx_complete(uctx, uctx->status);
 }
 
 /* =========================================================================
