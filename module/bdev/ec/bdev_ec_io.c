@@ -81,8 +81,14 @@ ec_free_io_buffers(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 	}
 }
 
+/*
+ * Allocate the zeroed full-stripe staging buffer and the data/parity chunk
+ * iovs, without gathering the caller's payload. The buffer stays zeroed: the
+ * caller either uses it as-is (zero-fill) or writes its payload at a
+ * sub-stripe offset and relies on the rest staying zero (write-into-unmapped).
+ */
 static int
-ec_alloc_full_stripe(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
+ec_alloc_full_stripe_zeroed(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 {
 	uint32_t i;
 	uint64_t chunk_bytes       = ec->strip_size * ec->bdev.blocklen;
@@ -91,16 +97,6 @@ ec_alloc_full_stripe(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 	ec_io->bounce_buf = spdk_dma_zmalloc(total_data_bytes, EC_DMA_ALIGN, NULL);
 	if (!ec_io->bounce_buf) {
 		return -ENOMEM;
-	}
-
-	/*
-	 * WRITE_ZEROES fast path: spdk_dma_zmalloc already returned a zeroed
-	 * buffer, so the data chunks are zero and the parity (RS_encode of all
-	 * zeros) is also zero. Skip the iov copy.
-	 */
-	if (!ec_io->is_zero_fill) {
-		spdk_copy_iovs_to_buf(ec_io->bounce_buf, total_data_bytes,
-				      ec_io->iovs, ec_io->iovcnt);
 	}
 
 	ec_io->data_iovs = calloc(ec->k, sizeof(struct iovec));
@@ -126,6 +122,31 @@ ec_alloc_full_stripe(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
 		}
 		ec_io->parity_iovs[i].iov_base = ec_io->parity_bufs[i];
 		ec_io->parity_iovs[i].iov_len  = chunk_bytes;
+	}
+
+	return 0;
+}
+
+/*
+ * ec_alloc_full_stripe_zeroed, then gather the caller's iovs into the staging
+ * buffer -- skipped for a zero-fill write, where the zeroed buffer is already
+ * the payload.
+ */
+static int
+ec_alloc_full_stripe(struct ec_bdev_io *ec_io, const struct ec_bdev *ec)
+{
+	uint64_t total_data_bytes = ec->stripe_blocks * ec->bdev.blocklen;
+	int      rc;
+
+	rc = ec_alloc_full_stripe_zeroed(ec_io, ec);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* Zero-fill: the buffer is already all-zero, so skip the gather. */
+	if (!ec_io->is_zero_fill) {
+		spdk_copy_iovs_to_buf(ec_io->bounce_buf, total_data_bytes,
+				      ec_io->iovs, ec_io->iovcnt);
 	}
 
 	return 0;
@@ -1426,7 +1447,6 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	uint64_t        stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
 	uint64_t        stripe_offset_bytes;
 	uint64_t        payload_bytes;
-	bool            saved_is_zero_fill;
 	int             rc;
 
 	/*
@@ -1464,17 +1484,11 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	ec_io->is_write_into_unmapped = true;
 
 	/*
-	 * 2. Allocate full-stripe scratch zero-initialised. We trick
-	 * ec_alloc_full_stripe into skipping the iov copy by temporarily
-	 * setting is_zero_fill = true; we then place the caller's payload
-	 * at the correct sub-stripe offset ourselves in step 3. The real
-	 * is_zero_fill is restored so the rest of the path (encode +
-	 * fanout + completion) sees the original value.
+	 * 2. Allocate the zeroed full-stripe staging buffer. No gather --
+	 * step 3 places the caller's payload at its sub-stripe offset, and
+	 * the untouched lead/tail regions stay zero.
 	 */
-	saved_is_zero_fill   = ec_io->is_zero_fill;
-	ec_io->is_zero_fill  = true;
-	rc                   = ec_alloc_full_stripe(ec_io, ec);
-	ec_io->is_zero_fill  = saved_is_zero_fill;
+	rc = ec_alloc_full_stripe_zeroed(ec_io, ec);
 	if (rc != 0) {
 		ec_io->is_write_into_unmapped = false;
 		ec_io_release_state(ec_io, ec);
@@ -1491,7 +1505,7 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	 * at its true position within the stripe; the unwritten leading
 	 * and trailing regions stay zero.
 	 */
-	if (!saved_is_zero_fill) {
+	if (!ec_io->is_zero_fill) {
 		stripe_offset_bytes = (ec_io->offset_blocks % ec->stripe_blocks)
 				      * ec->bdev.blocklen;
 		payload_bytes       = ec_io->num_blocks * ec->bdev.blocklen;
