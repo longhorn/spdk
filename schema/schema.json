@@ -5291,6 +5291,198 @@
       ]
     },
     {
+      "name": "bdev_ec_create",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        },
+        {
+          "name": "strip_size_kb",
+          "type": "number",
+          "required": true,
+          "description": "Strip size in KiB (power of two)"
+        },
+        {
+          "name": "data_chunk_count",
+          "type": "number",
+          "required": true,
+          "description": "Number of data chunks (k)"
+        },
+        {
+          "name": "parity_chunk_count",
+          "type": "number",
+          "required": true,
+          "description": "Number of parity chunks (m)"
+        },
+        {
+          "name": "base_bdevs",
+          "type": "array",
+          "required": true,
+          "description": "List of base bdev names, one per slot (k + m entries)"
+        },
+        {
+          "name": "uuid",
+          "type": "string",
+          "required": false,
+          "description": "UUID for this EC bdev"
+        },
+        {
+          "name": "salvage_requested",
+          "type": "boolean",
+          "required": false,
+          "description": "Recover an existing array; fail if no valid on-disk bitmap is found instead of fresh-creating (default: `false`)"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_delete",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_replace_base_bdev",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        },
+        {
+          "name": "slot",
+          "type": "number",
+          "required": true,
+          "description": "Slot index of the base bdev to replace"
+        },
+        {
+          "name": "new_bdev_name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the replacement base bdev"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_get_bdevs",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": false,
+          "description": "EC bdev name (if omitted, list all EC bdevs)"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_start_rebuild",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_get_rebuild_progress",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_get_wib_status",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_get_unmap_status",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_get_scrub_progress",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_resize",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_set_rebuild_qos",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        },
+        {
+          "name": "max_stripes_per_sec",
+          "type": "number",
+          "required": false,
+          "description": "Rebuild rate limit in stripes per second (0 means unlimited)"
+        },
+        {
+          "name": "paused",
+          "type": "boolean",
+          "required": false,
+          "description": "If set, suspend the rebuild without cancelling it (default: `false`)"
+        }
+      ]
+    },
+    {
+      "name": "bdev_ec_stop_rebuild",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        }
+      ]
+    },
+    {
       "name": "bdev_split_create",
       "params": [
         {
