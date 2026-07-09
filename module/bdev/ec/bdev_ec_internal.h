@@ -590,7 +590,7 @@ struct ec_bdev {
 	/* Failure Tracking */
 	enum ec_base_bdev_state base_states[EC_MAX_BASE_BDEVS];
 
-	uint8_t failed_count;          /* non-NORMAL slot count (FAILED + REPLACING) */
+	uint32_t failed_count;         /* non-NORMAL slot count (FAILED + REPLACING) */
 	bool offline;
 
 	bool needs_rebuild[EC_MAX_BASE_BDEVS]; /* set on FAILED -> REPLACING */
