@@ -326,6 +326,12 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 				 * data. Mark crash-dirty before releasing the inflight
 				 * ref (see ec_wib_mark_failed_write for why the order
 				 * matters).
+				 *
+				 * This runs inside the child-write completion, so it is
+				 * reached only after a write was queued. The all-submit-fail
+				 * path exits via the error: label and never reaches here, so
+				 * a region whose parity was never touched is never marked.
+				 * Keep that split.
 				 */
 				ec_wib_mark_failed_write(ec, ec_io->wib_region);
 			}

@@ -62,12 +62,16 @@ ec_rmw_teardown(struct ec_rmw_ctx *mctx)
 
 	ec_stripe_clear_dirty(ec, mctx->stripe_index);
 	ec_rmw_in_flight_dec(ec);
-	if (mctx->status != SPDK_BDEV_IO_STATUS_SUCCESS) {
+	if (mctx->status != SPDK_BDEV_IO_STATUS_SUCCESS && mctx->writes_issued) {
 		/*
-		 * Partial failure may leave parity inconsistent with data -- and RMW
-		 * leaves committed chunks the caller never touched, so this can
-		 * corrupt data the caller never wrote. Mark crash-dirty before the
-		 * inflight dec (see ec_wib_mark_failed_write for why the order matters).
+		 * A write went out and the RMW still failed, so parity may no
+		 * longer match data. Mark the region crash-dirty before the
+		 * inflight dec (see ec_wib_mark_failed_write for why the order
+		 * matters).
+		 *
+		 * writes_issued excludes pre-write failures (WIB persist, reads):
+		 * they leave parity intact, so marking them would pin a healthy
+		 * region and fail its reads with -EIO for nothing.
 		 */
 		ec_wib_mark_failed_write(ec, region);
 	}
@@ -613,6 +617,8 @@ ec_rmw_submit_writes(struct ec_rmw_ctx *mctx)
 				    mctx->stripe_index, rc);
 			mctx->writes_remaining--;
 			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+		} else {
+			mctx->writes_issued = true;
 		}
 	}
 
@@ -638,6 +644,8 @@ ec_rmw_submit_writes(struct ec_rmw_ctx *mctx)
 				    mctx->stripe_index, rc);
 			mctx->writes_remaining--;
 			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+		} else {
+			mctx->writes_issued = true;
 		}
 	}
 

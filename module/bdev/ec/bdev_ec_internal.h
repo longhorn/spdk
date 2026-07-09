@@ -1037,6 +1037,13 @@ struct ec_rmw_ctx {
 	enum spdk_bdev_io_status status;
 
 	/*
+	 * Set once a data/parity write has been submitted. ec_rmw_teardown
+	 * marks the region crash-dirty only on a failure after this point --
+	 * a pre-write failure (WIB persist, reads) leaves parity intact.
+	 */
+	bool                     writes_issued;
+
+	/*
 	 * Inclusive range of data chunks modified by this RMW (0..k-1).
 	 * Derived at context creation from stripe_off_blocks and num_blocks.
 	 *
