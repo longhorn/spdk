@@ -186,9 +186,9 @@ ec_unmap_inner_complete_default(void *cb_arg,
 	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
 
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
-		__atomic_fetch_add(&ec->unmaps_completed, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->unmaps_completed);
 	} else {
-		__atomic_fetch_add(&ec->unmaps_failed,    1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->unmaps_failed);
 	}
 
 	/*
@@ -363,8 +363,8 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 		 * submitter (= owner) thread. Count here so the no-op path
 		 * still shows up in the accounting; see the field-cluster
 		 * comment in bdev_ec_internal.h for the closed identity. */
-		__atomic_fetch_add(&ec->unmaps_submitted, 1, __ATOMIC_RELAXED);
-		__atomic_fetch_add(&ec->unmaps_completed, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->unmaps_submitted);
+		ec_counter_inc(&ec->unmaps_completed);
 		spdk_bdev_io_complete(ec_io->bdev_io,
 				      SPDK_BDEV_IO_STATUS_SUCCESS);
 		return 0;
@@ -387,7 +387,7 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 					    ec_submit_unmap_on_home, ec_io);
 	}
 
-	__atomic_fetch_add(&ec->unmaps_submitted, 1, __ATOMIC_RELAXED);
+	ec_counter_inc(&ec->unmaps_submitted);
 
 	/*
 	 * Single-stripe shortcut: every block of the request lies within one
@@ -475,7 +475,7 @@ ec_submit_unmap(struct ec_bdev_io *ec_io)
 
 out:
 	if (rc != 0 && rc != -EAGAIN) {
-		__atomic_fetch_add(&ec->unmaps_failed, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->unmaps_failed);
 	}
 	return rc;
 }
@@ -861,7 +861,7 @@ ec_unmap_child_complete(struct spdk_bdev_io *child, bool success, void *cb_arg)
 
 	if (!success) {
 		uctx->status = SPDK_BDEV_IO_STATUS_FAILED;
-		__atomic_fetch_add(&ec->unmap_fanout_misses, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->unmap_fanout_misses);
 	}
 
 	if (--uctx->writes_remaining > 0) {
@@ -1085,9 +1085,9 @@ ec_unmap_split_complete(struct ec_unmap_split_ctx *sctx)
 	 * the closed accounting identity in bdev_ec_internal.h holds.
 	 */
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
-		__atomic_fetch_add(&ec->unmaps_completed, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->unmaps_completed);
 	} else {
-		__atomic_fetch_add(&ec->unmaps_failed,    1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->unmaps_failed);
 	}
 	free(sctx);
 

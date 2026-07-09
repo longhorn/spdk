@@ -761,9 +761,9 @@ struct ec_bdev {
 	 * home-only counter atomic is harmless but needless; making a
 	 * cross-thread counter plain is a data race.
 	 */
-	uint64_t degraded_read_eio_dirty;        /* reads rejected: dirty WIB region */
-	uint64_t wib_failed_write_marks;         /* regions marked crash-dirty by a partial write failure */
-	uint64_t degraded_reads_reconstructed;   /* reads served via reconstruction  */
+	uint64_t degraded_read_eio_dirty;        /* [shared] reads rejected: dirty WIB region */
+	uint64_t wib_failed_write_marks;         /* [shared] partial-write crash-dirty marks */
+	uint64_t degraded_reads_reconstructed;   /* [shared] reads served via reconstruction  */
 	/*
 	 * Data-slot stripes the rebuild reconstructed while their region was
 	 * crash-dirty -- write-hole suspects. If a write was torn at the crash
@@ -775,7 +775,7 @@ struct ec_bdev {
 	 * restart, so the WARNLOG in the journal is the durable record. Cross-
 	 * thread read via get_bdevs, so atomic per the counter rule above.
 	 */
-	uint64_t crash_dirty_stripes_rebuilt;
+	uint64_t crash_dirty_stripes_rebuilt;    /* [shared] batch add; see comment above */
 	/*
 	 * RMW / full-stripe write accounting. Unlike the UNMAP cluster
 	 * below, these counters do NOT form a closed-bucket identity:
@@ -796,12 +796,12 @@ struct ec_bdev {
 	 * not distinguish success from terminal failure -- those land on
 	 * the bdev_io owner thread via spdk_bdev_io_complete, not here.
 	 */
-	uint64_t rmw_total;                      /* sub-stripe writes accepted       */
-	uint64_t rmw_deferred_scrub;             /* RMW EAGAIN: scrub-active region  */
-	uint64_t rmw_deferred_dirty;             /* RMW EAGAIN: deferred-scrub guard */
-	uint64_t rmw_deferred_inflight;          /* RMW EAGAIN: stripe already dirty */
-	uint64_t full_stripe_writes;             /* full-stripe writes accepted      */
-	uint64_t full_stripe_writes_deferred;    /* full-stripe EAGAIN: scrub guard  */
+	uint64_t rmw_total;                      /* [home] sub-stripe writes accepted       */
+	uint64_t rmw_deferred_scrub;             /* [home] RMW EAGAIN: scrub-active region  */
+	uint64_t rmw_deferred_dirty;             /* [home] RMW EAGAIN: deferred-scrub guard */
+	uint64_t rmw_deferred_inflight;          /* [home] RMW EAGAIN: stripe already dirty */
+	uint64_t full_stripe_writes;             /* [home] full-stripe writes accepted      */
+	uint64_t full_stripe_writes_deferred;    /* [home] full-stripe EAGAIN: scrub guard  */
 	/*
 	 * UNMAP accounting. Each call to ec_submit_unmap that gets past the
 	 * cross-thread routing hop bumps unmaps_submitted exactly once and
@@ -831,18 +831,18 @@ struct ec_bdev {
 	 * fan-out, but operators counting "UNMAPs the EC saw" expect both
 	 * counters to advance so the identity stays closed.
 	 */
-	uint64_t unmaps_submitted;               /* parent UNMAP submits (once per request) */
-	uint64_t unmaps_completed;               /* native fan-out completed successfully */
-	uint64_t unmaps_deferred_busy;           /* UNMAP EAGAIN: stripe-busy/persist */
-	uint64_t unmaps_via_write_zeros;         /* single-stripe UNMAP -> RMW zero-fill */
-	uint64_t unmaps_failed;                  /* terminal failure (sync error or cb_fn FAILED) */
-	uint64_t unmap_fanout_misses;            /* per-disk spdk_bdev_unmap_blocks
+	uint64_t unmaps_submitted;               /* [shared] parent UNMAP submits (per request) */
+	uint64_t unmaps_completed;               /* [shared] native fan-out completed */
+	uint64_t unmaps_deferred_busy;           /* [home] UNMAP EAGAIN: stripe-busy/persist */
+	uint64_t unmaps_via_write_zeros;         /* [home] single-stripe UNMAP -> RMW zero-fill */
+	uint64_t unmaps_failed;                  /* [shared] terminal failure (sync or cb_fn) */
+	uint64_t unmap_fanout_misses;            /* [shared] per-disk spdk_bdev_unmap_blocks
 						  * failure -- physical space not
 						  * reclaimed on that disk; not a
 						  * bdev_io failure (bitmap already
 						  * says unmapped, reads still
 						  * synthesise zeros) */
-	uint64_t unmapped_reads_synthesized;     /* reads short-circuited to zero
+	uint64_t unmapped_reads_synthesized;     /* [shared] reads short-circuited to zero
 						  * fill because the target stripe's
 						  * unmapped bit was set. Production
 						  * signal that bitmap consultation
@@ -857,14 +857,14 @@ struct ec_bdev {
 	 * _failed counter without a corresponding stuck bdev_io is the
 	 * production signal for stripe-alloc / bit-clear-persist trouble.
 	 */
-	uint64_t writes_into_unmapped;           /* writes routed through the
+	uint64_t writes_into_unmapped;           /* [shared] writes routed through the
 						  * write-into-unmapped full-stripe
 						  * path (skip-WIB, zero-fill old
 						  * data, clear bit on completion).
 						  * Production signal that the
 						  * write-side hookup is firing on
 						  * post-trim write workloads. */
-	uint64_t writes_into_unmapped_failed;    /* write-into-unmapped paths
+	uint64_t writes_into_unmapped_failed;    /* [shared] write-into-unmapped paths
 						  * that failed at stripe-alloc
 						  * setup or at the bit-clear
 						  * submit/persist step. A data
@@ -1089,6 +1089,26 @@ static inline struct ec_bdev *
 ec_from_bdev_io(struct spdk_bdev_io *bdev_io)
 {
 	return (struct ec_bdev *)bdev_io->bdev->ctxt;
+}
+
+/*
+ * Increment a SHARED statistics counter -- one that more than one thread
+ * can bump (home + submitter writers, or child completions racing across
+ * submitter reactors). Relaxed is enough: these are statistics, read back
+ * with a relaxed load and tolerant of staleness. Home-serialized counters
+ * (one writer, on home) use plain ++ -- see the class tag at each
+ * declaration. ec_counter_add takes a batch count; ec_counter_inc is +1.
+ */
+static inline void
+ec_counter_add(uint64_t *counter, uint64_t n)
+{
+	__atomic_fetch_add(counter, n, __ATOMIC_RELAXED);
+}
+
+static inline void
+ec_counter_inc(uint64_t *counter)
+{
+	ec_counter_add(counter, 1);
 }
 
 /*
@@ -1434,7 +1454,7 @@ ec_wib_mark_failed_write(struct ec_bdev *ec, uint32_t region)
 
 	if (!(old & mask)) {
 		/* First failure to dirty this region -- count and warn once. */
-		__atomic_fetch_add(&ec->wib_failed_write_marks, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->wib_failed_write_marks);
 		SPDK_WARNLOG("EC bdev %s: partial write failure left WIB region %u "
 			     "with inconsistent parity; marked for scrub re-encode "
 			     "(degraded reads return -EIO until repaired)\n",

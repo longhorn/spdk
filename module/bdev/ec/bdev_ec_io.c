@@ -261,7 +261,7 @@ ec_write_into_unmapped_bit_cleared(void *cb_arg, int rc)
 			    "Data is on disk but masked by bitmap.\n",
 			    ec->bdev.name, rc, ec_io->stripe_claim_index);
 		ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
-		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->writes_into_unmapped_failed);
 	}
 
 	owner = spdk_bdev_io_get_thread(ec_io->bdev_io);
@@ -350,7 +350,7 @@ ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 				    ec->bdev.name, rc,
 				    ec_io->stripe_claim_index);
 			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
-			__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
+			ec_counter_inc(&ec->writes_into_unmapped_failed);
 		}
 
 		ec_io_release_state(ec_io, ec);
@@ -747,11 +747,11 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 		 * No per-I/O log -- a sustained read-storm in the brief
 		 * scrub window would flood the system log otherwise.
 		 */
-		__atomic_fetch_add(&ec->degraded_read_eio_dirty, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->degraded_read_eio_dirty);
 		return -EIO;
 	}
 
-	__atomic_fetch_add(&ec->degraded_reads_reconstructed, 1, __ATOMIC_RELAXED);
+	ec_counter_inc(&ec->degraded_reads_reconstructed);
 
 	dctx = calloc(1, sizeof(*dctx));
 	if (!dctx) {
@@ -882,7 +882,7 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 				memset(ec_io->iovs[i].iov_base, 0,
 				       ec_io->iovs[i].iov_len);
 			}
-			__atomic_fetch_add(&ec->unmapped_reads_synthesized, 1, __ATOMIC_RELAXED);
+			ec_counter_inc(&ec->unmapped_reads_synthesized);
 			spdk_bdev_io_complete(ec_io->bdev_io,
 					      SPDK_BDEV_IO_STATUS_SUCCESS);
 			return 0;
@@ -1378,8 +1378,7 @@ error:
 	 * gauge reflects every write-into-unmapped that failed to land.
 	 */
 	if (ec_io->is_write_into_unmapped) {
-		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1,
-				   __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->writes_into_unmapped_failed);
 	}
 	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 }
@@ -1492,7 +1491,7 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	if (rc != 0) {
 		ec_io->is_write_into_unmapped = false;
 		ec_io_release_state(ec_io, ec);
-		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1, __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->writes_into_unmapped_failed);
 		return rc;
 	}
 
@@ -1536,7 +1535,7 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	 * we hop to the submitter so base I/O dispatch happens on the
 	 * channel-owning thread.
 	 */
-	__atomic_fetch_add(&ec->writes_into_unmapped, 1, __ATOMIC_RELAXED);
+	ec_counter_inc(&ec->writes_into_unmapped);
 
 	if (spdk_likely(spdk_get_thread() == ec_io->submitter_thread)) {
 		ec_full_write_fanout(ec_io);
@@ -1555,8 +1554,7 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 		 */
 		ec_io->is_write_into_unmapped = false;
 		ec_io_release_state(ec_io, ec);
-		__atomic_fetch_add(&ec->writes_into_unmapped_failed, 1,
-				   __ATOMIC_RELAXED);
+		ec_counter_inc(&ec->writes_into_unmapped_failed);
 		return rc;
 	}
 	return 0;

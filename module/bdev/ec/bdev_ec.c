@@ -1989,6 +1989,9 @@ ec_write_rebuild_progress_json(struct spdk_json_write_ctx *w,
 void
 ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 {
+	/* Both callers are RPC handlers, which run on the create/home thread. */
+	assert(spdk_get_thread() == ec->home_thread);
+
 	spdk_json_write_named_uint32(w, "rmw_in_flight", ec_rmw_in_flight_get(ec));
 	if (ec->stripe_dirty_map) {
 		spdk_json_write_named_uint64(w, "dirty_stripes",

@@ -319,9 +319,7 @@ ec_rebuild_finish(struct ec_rebuild_ctx *ctx, int rc)
 			char regions[256];
 
 			ec_format_crash_regions(ec, regions, sizeof(regions));
-			__atomic_fetch_add(&ec->crash_dirty_stripes_rebuilt,
-					   ctx->crash_dirty_stripes,
-					   __ATOMIC_RELAXED);
+			ec_counter_add(&ec->crash_dirty_stripes_rebuilt, ctx->crash_dirty_stripes);
 			SPDK_WARNLOG("EC bdev %s: rebuild reconstructed %" PRIu64
 				     " data-slot stripe(s) inside crash-dirty WIB "
 				     "region(s) %s. If a write was torn and this "
