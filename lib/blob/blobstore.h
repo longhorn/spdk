@@ -194,6 +194,13 @@ struct spdk_blob_store {
 	uint64_t			total_clusters;
 	uint64_t			total_data_clusters;
 	uint64_t			num_free_clusters;	/* Protected by used_lock */
+	/*
+	 * True once the out-of-space warning has been printed. Cleared when a
+	 * cluster or metadata page is released, so each full -> free -> full
+	 * cycle warns once instead of flooding a log line per failed
+	 * thin-provision write. Protected by used_lock.
+	 */
+	bool				out_of_clusters_warned;
 	uint64_t			pages_per_cluster;
 	uint64_t			io_units_per_cluster;
 	uint8_t				pages_per_cluster_shift;

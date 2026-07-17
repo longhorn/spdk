@@ -128,6 +128,7 @@ bs_release_md_page(struct spdk_blob_store *bs, uint32_t page)
 	assert(spdk_bit_array_get(bs->used_md_pages, page) == true);
 
 	spdk_bit_array_clear(bs->used_md_pages, page);
+	bs->out_of_clusters_warned = false;
 }
 
 static uint32_t
@@ -160,6 +161,7 @@ bs_release_cluster(struct spdk_blob_store *bs, uint32_t cluster_num)
 
 	spdk_bit_pool_free_bit(bs->used_clusters, cluster_num);
 	bs->num_free_clusters++;
+	bs->out_of_clusters_warned = false;
 }
 
 static int
@@ -204,8 +206,16 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 			*lowest_free_md_page = spdk_bit_array_find_first_clear(blob->bs->used_md_pages,
 					       *lowest_free_md_page);
 			if (*lowest_free_md_page == UINT32_MAX) {
-				/* No more free md pages. Cannot satisfy the request */
+				/*
+				 * No more free md pages. Cannot satisfy the request.
+				 * The release below is an internal rollback, not a
+				 * user-visible free, so keep the out-of-space warn
+				 * gate as it was.
+				 */
+				bool warned = blob->bs->out_of_clusters_warned;
+
 				bs_release_cluster(blob->bs, *cluster);
+				blob->bs->out_of_clusters_warned = warned;
 				return -ENOSPC;
 			}
 			bs_claim_md_page(blob->bs, *lowest_free_md_page);
@@ -2850,11 +2860,17 @@ blob_free_cluster_cpl(void *cb_arg, int bserrno)
 static void
 blob_insert_cluster_revert(struct spdk_blob_copy_cluster_ctx *ctx)
 {
+	/* Internal rollback, not a user-visible free: keep the out-of-space
+	 * warn gate as it was. */
+	bool warned;
+
 	spdk_spin_lock(&ctx->blob->bs->used_lock);
+	warned = ctx->blob->bs->out_of_clusters_warned;
 	bs_release_cluster(ctx->blob->bs, ctx->new_cluster);
 	if (ctx->new_extent_page != 0) {
 		bs_release_md_page(ctx->blob->bs, ctx->new_extent_page);
 	}
+	ctx->blob->bs->out_of_clusters_warned = warned;
 	spdk_spin_unlock(&ctx->blob->bs->used_lock);
 }
 
@@ -3010,6 +3026,8 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	bool is_zeroes;
 	bool can_copy;
 	bool is_valid_range;
+	bool warn_out_of_clusters = false;
+	uint64_t free_clusters = 0;
 	uint64_t copy_src_lba;
 	int rc;
 
@@ -3071,8 +3089,23 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	spdk_spin_lock(&blob->bs->used_lock);
 	rc = bs_allocate_cluster(blob, cluster_number, &ctx->new_cluster, &ctx->new_extent_page,
 				 false);
+	if (rc == -ENOSPC && !blob->bs->out_of_clusters_warned) {
+		/* Decide and snapshot under the lock; print after unlock. */
+		blob->bs->out_of_clusters_warned = true;
+		warn_out_of_clusters = true;
+		free_clusters = blob->bs->num_free_clusters;
+	}
 	spdk_spin_unlock(&blob->bs->used_lock);
 	if (rc != 0) {
+		if (warn_out_of_clusters) {
+			SPDK_WARNLOG("Blobstore out of space: cannot allocate %s "
+				     "for a thin-provisioned write (free clusters: %" PRIu64
+				     " of %" PRIu64 " data clusters); failing writes with "
+				     "ENOSPC until space is freed\n",
+				     free_clusters == 0 ? "a data cluster" : "a metadata page",
+				     free_clusters,
+				     blob->bs->total_data_clusters);
+		}
 		spdk_free(ctx->buf);
 		free(ctx);
 		bs_user_op_abort(op, rc);
@@ -3085,8 +3118,14 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 
 	ctx->seq = bs_sequence_start_blob(_ch, &cpl, blob);
 	if (!ctx->seq) {
+		/* Internal rollback, not a user-visible free: keep the
+		 * out-of-space warn gate as it was. */
+		bool seq_warned;
+
 		spdk_spin_lock(&blob->bs->used_lock);
+		seq_warned = blob->bs->out_of_clusters_warned;
 		bs_release_cluster(blob->bs, ctx->new_cluster);
+		blob->bs->out_of_clusters_warned = seq_warned;
 		spdk_spin_unlock(&blob->bs->used_lock);
 		spdk_free(ctx->buf);
 		free(ctx);
@@ -6431,9 +6470,15 @@ bs_create_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	uint32_t page_idx = bs_blobid_to_page(blob->id);
 
 	if (bserrno != 0) {
+		/* Internal rollback of this create's own claim: keep the
+		 * out-of-space warn gate as it was. */
+		bool warned;
+
 		spdk_spin_lock(&blob->bs->used_lock);
+		warned = blob->bs->out_of_clusters_warned;
 		spdk_bit_array_clear(blob->bs->used_blobids, page_idx);
 		bs_release_md_page(blob->bs, page_idx);
+		blob->bs->out_of_clusters_warned = warned;
 		spdk_spin_unlock(&blob->bs->used_lock);
 	}
 
@@ -6512,6 +6557,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 	struct spdk_blob_xattr_opts internal_xattrs_default;
 	spdk_bs_sequence_t	*seq;
 	spdk_blob_id		id;
+	bool warned;
 	int rc;
 
 	assert(spdk_get_thread() == bs->md_thread);
@@ -6609,9 +6655,13 @@ error:
 	if (blob != NULL) {
 		blob_free(blob);
 	}
+	/* Internal rollback of this create's own claim: keep the
+	 * out-of-space warn gate as it was. */
 	spdk_spin_lock(&bs->used_lock);
+	warned = bs->out_of_clusters_warned;
 	spdk_bit_array_clear(bs->used_blobids, page_idx);
 	bs_release_md_page(bs, page_idx);
+	bs->out_of_clusters_warned = warned;
 	spdk_spin_unlock(&bs->used_lock);
 	cb_fn(cb_arg, 0, rc);
 }
@@ -9966,9 +10016,15 @@ blob_insert_cluster_msg(void *arg)
 		 * different cluster in the same extent page. In such case proceed with
 		 * updating the existing extent page, but release the additional one. */
 		if (ctx->extent_page != 0) {
+			/* Net-zero release of this operation's own claim: keep
+			 * the out-of-space warn gate as it was. */
+			bool warned;
+
 			spdk_spin_lock(&ctx->blob->bs->used_lock);
+			warned = ctx->blob->bs->out_of_clusters_warned;
 			assert(spdk_bit_array_get(ctx->blob->bs->used_md_pages, ctx->extent_page) == true);
 			bs_release_md_page(ctx->blob->bs, ctx->extent_page);
+			ctx->blob->bs->out_of_clusters_warned = warned;
 			spdk_spin_unlock(&ctx->blob->bs->used_lock);
 			ctx->extent_page = 0;
 		}

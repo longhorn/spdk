@@ -4789,6 +4789,172 @@ blob_thin_prov_rw(void)
 	g_blobid = 0;
 }
 
+/*
+ * The out-of-clusters warn-once gate: the first thin-provision write that
+ * fails cluster allocation sets out_of_clusters_warned, repeat failures
+ * keep it set, and releasing clusters clears it so the next exhaustion
+ * warns again.
+ */
+static void
+blob_out_of_clusters_warn_once(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *thick, *thin;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	uint64_t io_units_per_cluster;
+	uint8_t payload[BLOCKLEN];
+
+	io_units_per_cluster = spdk_bs_get_cluster_size(bs) /
+			       spdk_bs_get_io_unit_size(bs);
+	memset(payload, 0xAA, sizeof(payload));
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	/* A thick blob takes every free cluster; the store is now full. */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = spdk_bs_free_cluster_count(bs);
+	thick = ut_blob_create_and_open(bs, &opts);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == 0);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 2;
+	thin = ut_blob_create_and_open(bs, &opts);
+
+	CU_ASSERT(bs->out_of_clusters_warned == false);
+
+	/* The first failed allocation warns and sets the flag. */
+	spdk_blob_io_write(thin, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOSPC);
+	CU_ASSERT(bs->out_of_clusters_warned == true);
+
+	/* Repeat failures keep it set: no warning per failed write. */
+	spdk_blob_io_write(thin, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOSPC);
+	CU_ASSERT(bs->out_of_clusters_warned == true);
+
+	/* Releasing clusters clears the flag. */
+	ut_blob_close_and_delete(bs, thick);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) > 0);
+	CU_ASSERT(bs->out_of_clusters_warned == false);
+
+	/* With space available the write succeeds and does not warn. */
+	spdk_blob_io_write(thin, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(bs->out_of_clusters_warned == false);
+
+	/* Exhaust again: the next failed allocation warns anew. */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = spdk_bs_free_cluster_count(bs);
+	thick = ut_blob_create_and_open(bs, &opts);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == 0);
+
+	spdk_blob_io_write(thin, channel, payload, io_units_per_cluster, 1,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOSPC);
+	CU_ASSERT(bs->out_of_clusters_warned == true);
+
+	ut_blob_close_and_delete(bs, thick);
+	ut_blob_close_and_delete(bs, thin);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
+/*
+ * The second ENOSPC cause: metadata (extent page) exhaustion with free
+ * data clusters available. The first failure must warn and set the flag,
+ * repeat failures must stay quiet (the internal cluster rollback in
+ * bs_allocate_cluster must not clear the flag), and freeing metadata
+ * pages must clear it so the next failure warns again, even though no
+ * data cluster is released.
+ */
+static void
+blob_out_of_md_pages_warn_once(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *thin, *spare;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	uint8_t payload[BLOCKLEN];
+	bool *was_set;
+	uint32_t md_cap, i;
+
+	if (!g_use_extent_table) {
+		/* Only extent-table blobs allocate metadata pages on write. */
+		return;
+	}
+
+	memset(payload, 0xAA, sizeof(payload));
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	/* The spare holds md pages but no clusters; deleting it later frees
+	 * metadata only. */
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 1;
+	spare = ut_blob_create_and_open(bs, &opts);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 1;
+	thin = ut_blob_create_and_open(bs, &opts);
+
+	/* Mark every md page used so the extent-page allocation fails. */
+	md_cap = spdk_bit_array_capacity(bs->used_md_pages);
+	was_set = calloc(md_cap, sizeof(*was_set));
+	SPDK_CU_ASSERT_FATAL(was_set != NULL);
+	for (i = 0; i < md_cap; i++) {
+		was_set[i] = spdk_bit_array_get(bs->used_md_pages, i);
+		spdk_bit_array_set(bs->used_md_pages, i);
+	}
+
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) > 0);
+	CU_ASSERT(bs->out_of_clusters_warned == false);
+
+	/* The first failure warns and sets the flag even though clusters
+	 * are free. */
+	spdk_blob_io_write(thin, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOSPC);
+	CU_ASSERT(bs->out_of_clusters_warned == true);
+
+	/* The rollback inside bs_allocate_cluster must not clear the flag. */
+	spdk_blob_io_write(thin, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOSPC);
+	CU_ASSERT(bs->out_of_clusters_warned == true);
+
+	/* Deleting the spare frees only metadata pages: the flag clears
+	 * with zero data clusters released. */
+	ut_blob_close_and_delete(bs, spare);
+	CU_ASSERT(bs->out_of_clusters_warned == false);
+
+	/* Restore the md-page map; the write then succeeds. */
+	for (i = 0; i < md_cap; i++) {
+		if (!was_set[i]) {
+			spdk_bit_array_clear(bs->used_md_pages, i);
+		}
+	}
+	free(was_set);
+
+	spdk_blob_io_write(thin, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(bs->out_of_clusters_warned == false);
+
+	ut_blob_close_and_delete(bs, thin);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
 static void
 blob_thin_prov_write_count_io(void)
 {
@@ -11232,6 +11398,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_thin_prov_alloc);
 		CU_ADD_TEST(suite_bs, blob_insert_cluster_msg_test);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw);
+		CU_ADD_TEST(suite_bs, blob_out_of_clusters_warn_once);
+		CU_ADD_TEST(suite_bs, blob_out_of_md_pages_warn_once);
 		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
 		CU_ADD_TEST(suite, blob_thin_prov_unmap_cluster);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rle);
