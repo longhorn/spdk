@@ -991,15 +991,27 @@ lvol_op_comp(void *cb_arg, int bserrno)
 	struct spdk_io_channel *channel = spdk_bdev_io_get_io_channel(bdev_io);
 	struct spdk_lvol_channel *lvol_channel = spdk_io_channel_get_ctx(channel);
 
+	TAILQ_REMOVE(&lvol_channel->submitted_io, (struct vbdev_lvol_io *)bdev_io->driver_ctx, link);
+
 	if (bserrno != 0) {
 		if (bserrno == -ENOMEM) {
 			status = SPDK_BDEV_IO_STATUS_NOMEM;
+		} else if (bserrno == -ENOSPC) {
+			/*
+			 * The blobstore is out of space: no free clusters, or
+			 * metadata (md page / extent page) exhaustion. Report
+			 * NVMe CAPACITY EXCEEDED instead of a generic device
+			 * error so initiators see the real cause and hosts fail
+			 * the I/O with ENOSPC.
+			 */
+			spdk_bdev_io_complete_nvme_status(bdev_io, 0,
+							  SPDK_NVME_SCT_GENERIC,
+							  SPDK_NVME_SC_CAPACITY_EXCEEDED);
+			return;
 		} else {
 			status = SPDK_BDEV_IO_STATUS_FAILED;
 		}
 	}
-
-	TAILQ_REMOVE(&lvol_channel->submitted_io, (struct vbdev_lvol_io *)bdev_io->driver_ctx, link);
 
 	spdk_bdev_io_complete(bdev_io, status);
 }

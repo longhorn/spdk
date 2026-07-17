@@ -41,6 +41,7 @@ bool g_lvs_with_name_already_exists = false;
 bool g_ext_api_called;
 bool g_bdev_is_missing = false;
 bool g_snapshot_xattr_called = false;
+int g_blob_io_bserrno = 0;
 
 DEFINE_STUB_V(spdk_bdev_module_fini_start_done, (void));
 DEFINE_STUB_V(spdk_bdev_update_bs_blockcnt, (struct spdk_bs_dev *bs_dev));
@@ -675,6 +676,15 @@ spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status sta
 	bdev_io->internal.status = status;
 }
 
+void
+spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, int sct, int sc)
+{
+	bdev_io->internal.error.nvme.cdw0 = cdw0;
+	bdev_io->internal.error.nvme.sct = sct;
+	bdev_io->internal.error.nvme.sc = sc;
+	bdev_io->internal.status = SPDK_BDEV_IO_STATUS_NVME_ERROR;
+}
+
 struct spdk_io_channel *spdk_lvol_get_io_channel(struct spdk_lvol *lvol)
 {
 	CU_ASSERT(lvol == g_lvol);
@@ -749,7 +759,7 @@ spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel,
 	CU_ASSERT(channel == g_bs_ch);
 	CU_ASSERT(offset == g_io->u.bdev.offset_blocks);
 	CU_ASSERT(length == g_io->u.bdev.num_blocks);
-	cb_fn(cb_arg, 0);
+	cb_fn(cb_arg, g_blob_io_bserrno);
 }
 
 void
@@ -766,7 +776,7 @@ spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 	CU_ASSERT(length == g_io->u.bdev.num_blocks);
 	CU_ASSERT(io_opts == &lvol_io->ext_io_opts);
 	g_ext_api_called = true;
-	cb_fn(cb_arg, 0);
+	cb_fn(cb_arg, g_blob_io_bserrno);
 }
 
 void
@@ -1942,6 +1952,65 @@ ut_lvol_read_write(void)
 	CU_ASSERT(g_lvol_store == NULL);
 }
 
+/*
+ * A write that fails blob-side with -ENOSPC (thin-provision cluster
+ * allocation on a full lvstore) must complete with NVMe CAPACITY
+ * EXCEEDED, not a generic device error.
+ */
+static void
+ut_lvol_write_enospc(void)
+{
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *lvol = NULL;
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev *bdev;
+	int sz = 10;
+	int rc;
+
+	ut_init_bdev(DEFAULT_BDEV_NAME, DEFAULT_BDEV_UUID);
+
+	rc = vbdev_lvs_create("bdev", "lvs", 0, LVS_CLEAR_WITH_UNMAP, 0,
+			      lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+	lvs = g_lvol_store;
+
+	g_lvolerrno = -1;
+	rc = vbdev_lvol_create(lvs, "lvol_enospc", sz, false, LVOL_CLEAR_WITH_DEFAULT,
+			       vbdev_lvol_create_complete, NULL);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	CU_ASSERT(g_lvolerrno == 0);
+
+	lvol = g_lvol;
+	io_ch = _vbdev_lvol_get_io_channel(lvol);
+
+	bdev = calloc(1, sizeof(struct spdk_bdev));
+	g_io = calloc(1, sizeof(struct spdk_bdev_io) + vbdev_lvs_get_ctx_size());
+	g_io->bdev = bdev;
+	g_io->bdev->ctxt = lvol;
+	g_io->u.bdev.offset_blocks = 20;
+	g_io->u.bdev.num_blocks = 20;
+
+	g_blob_io_bserrno = -ENOSPC;
+	g_io->type = SPDK_BDEV_IO_TYPE_WRITE;
+	vbdev_lvol_submit_request(io_ch, g_io);
+	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_NVME_ERROR);
+	CU_ASSERT(g_io->internal.error.nvme.sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_io->internal.error.nvme.sc == SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	g_blob_io_bserrno = 0;
+
+	free(bdev);
+	free(g_io);
+	_vbdev_lvol_put_io_channel(io_ch);
+	vbdev_lvol_destroy(g_lvol, lvol_store_op_complete, NULL);
+	CU_ASSERT(g_lvol == NULL);
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	CU_ASSERT(g_lvol_store == NULL);
+}
+
 static void
 ut_lvol_flush(void)
 {
@@ -2625,6 +2694,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_vbdev_lvol_get_io_channel);
 	CU_ADD_TEST(suite, ut_vbdev_lvol_io_type_supported);
 	CU_ADD_TEST(suite, ut_lvol_read_write);
+	CU_ADD_TEST(suite, ut_lvol_write_enospc);
 	CU_ADD_TEST(suite, ut_lvol_flush);
 	CU_ADD_TEST(suite, ut_lvol_examine_config);
 	CU_ADD_TEST(suite, ut_lvol_examine_disk);
