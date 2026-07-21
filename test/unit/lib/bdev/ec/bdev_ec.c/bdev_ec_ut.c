@@ -1583,6 +1583,52 @@ test_mark_failed_write_defers_rmw(void)
 	ec_free_runtime_arrays(&ec);
 }
 
+/*
+ * The per-slot failure-log gate: log the 1st and every 1024th failure;
+ * an unknown slot (slot == n) is not counted and always logs; clearing
+ * the counter on hot-swap re-arms the gate.
+ */
+static void
+test_slot_failure_log_gate(void)
+{
+	struct ec_bdev ec;
+	uint64_t       failures = 0;
+	uint64_t       i;
+
+	memset(&ec, 0, sizeof(ec));
+	ec.n = 2;
+
+	/* 1st failure logs. */
+	CU_ASSERT(ec_slot_failure_should_log(&ec, 0, &failures) == true);
+	CU_ASSERT(failures == 1);
+
+	/* 2..1023 stay quiet. */
+	for (i = 2; i <= 1023; i++) {
+		CU_ASSERT(ec_slot_failure_should_log(&ec, 0, &failures) == false);
+	}
+	CU_ASSERT(failures == 1023);
+
+	/* 1024 logs; 1025 does not. */
+	CU_ASSERT(ec_slot_failure_should_log(&ec, 0, &failures) == true);
+	CU_ASSERT(failures == 1024);
+	CU_ASSERT(ec_slot_failure_should_log(&ec, 0, &failures) == false);
+
+	/* Slots count independently. */
+	CU_ASSERT(ec_slot_failure_should_log(&ec, 1, &failures) == true);
+	CU_ASSERT(failures == 1);
+
+	/* Unknown slot always logs and is not counted. */
+	CU_ASSERT(ec_slot_failure_should_log(&ec, ec.n, &failures) == true);
+	CU_ASSERT(failures == 1);
+	CU_ASSERT(ec_slot_failure_should_log(&ec, ec.n, &failures) == true);
+	CU_ASSERT(ec.child_io_failures[0] == 1025);
+
+	/* Hot-swap reset re-arms the gate. */
+	ec.child_io_failures[0] = 0;
+	CU_ASSERT(ec_slot_failure_should_log(&ec, 0, &failures) == true);
+	CU_ASSERT(failures == 1);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1627,6 +1673,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_guard2_defers_crash_not_write_intent);
 	CU_ADD_TEST(suite, test_rebuild_counts_crash_dirty_stripes);
 	CU_ADD_TEST(suite, test_mark_failed_write_defers_rmw);
+	CU_ADD_TEST(suite, test_slot_failure_log_gate);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

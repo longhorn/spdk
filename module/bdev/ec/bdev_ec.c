@@ -1943,6 +1943,9 @@ ec_write_base_bdevs_array_json(struct spdk_json_write_ctx *w,
 		spdk_json_write_named_uint32(w, "slot", i);
 		spdk_json_write_named_string(w, "role",
 					     i < ec->k ? "data" : "parity");
+		spdk_json_write_named_uint64(w, "child_io_failures",
+					     __atomic_load_n(&ec->child_io_failures[i],
+							     __ATOMIC_RELAXED));
 
 		switch (ec->base_states[i]) {
 		case EC_BASE_STATE_FAILED:
@@ -2297,6 +2300,9 @@ ec_replace_finish(struct ec_replace_ctx *rctx, int rc)
 	ec->replace_in_progress = false;
 
 	if (rc == 0) {
+		/* New disk in the slot: restart its failure count. */
+		__atomic_store_n(&ec->child_io_failures[slot], 0, __ATOMIC_RELAXED);
+
 		/*
 		 * Rejoin the hot-swapped slot to the bitmap quorum. Its bitmap
 		 * channel was released when the old disk failed

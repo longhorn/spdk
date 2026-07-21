@@ -883,6 +883,11 @@ struct ec_bdev {
 						  * unmapped bit stays set in every
 						  * failure case. */
 
+	uint64_t child_io_failures[EC_MAX_BASE_BDEVS]; /* [shared] failed child
+						  * submits + completions per slot;
+						  * gates the failure ERRLOGs;
+						  * reset on hot-swap. */
+
 	/*
 	 * Backpressure transition tracking. Set when the scrub guards (active
 	 * scrub or deferred scrub) first defer an RMW; cleared when the
@@ -1137,6 +1142,25 @@ ec_slot_publish_base_bdev(struct ec_bdev *ec, uint32_t slot,
 			  struct spdk_bdev *bdev)
 {
 	__atomic_store_n(&ec->base_bdevs[slot], bdev, __ATOMIC_RELEASE);
+}
+
+/*
+ * Rate gate for the per-slot failure ERRLOGs: log the 1st and every
+ * 1024th failure. Counts both submit and completion failures. Unknown
+ * slot (slot == ec->n) is not counted and always logs.
+ */
+static inline bool
+ec_slot_failure_should_log(struct ec_bdev *ec, uint32_t slot,
+			   uint64_t *failures_out)
+{
+	uint64_t failures = 1;
+
+	if (slot < ec->n) {
+		failures = __atomic_add_fetch(&ec->child_io_failures[slot], 1,
+					      __ATOMIC_RELAXED);
+	}
+	*failures_out = failures;
+	return failures == 1 || failures % 1024 == 0;
 }
 
 /*

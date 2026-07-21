@@ -284,17 +284,61 @@ ec_write_into_unmapped_bit_cleared(void *cb_arg, int rc)
 	}
 }
 
+/*
+ * Map a child bdev to its slot by pointer compare against base_bdevs[].
+ * Safe on completion threads (see the field's declaration). Returns
+ * ec->n if the bdev is not an open base.
+ */
+static uint32_t
+ec_slot_for_base_bdev(const struct ec_bdev *ec, const struct spdk_bdev *bdev)
+{
+	uint32_t i;
+
+	for (i = 0; i < ec->n; i++) {
+		if (__atomic_load_n(&ec->base_bdevs[i], __ATOMIC_ACQUIRE) == bdev) {
+			return i;
+		}
+	}
+	return ec->n;
+}
+
 static void
 ec_child_io_complete(struct spdk_bdev_io *child_io, bool success, void *cb_arg)
 {
 	struct ec_bdev_io *ec_io = cb_arg;
 	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
 
-	spdk_bdev_free_io(child_io);
-
 	if (!success) {
+		/* Reads complete here too, so derive op and stripe from the
+		 * parent (stripe_claim_index is write-only). */
+		uint32_t slot = ec_slot_for_base_bdev(ec, child_io->bdev);
+		uint64_t failures;
+
+		if (ec_slot_failure_should_log(ec, slot, &failures)) {
+			if (slot < ec->n) {
+				SPDK_ERRLOG("EC bdev %s: child %s to base bdev %s failed at "
+					    "stripe %" PRIu64 " (%" PRIu64 " failures on "
+					    "slot %u)\n",
+					    ec->bdev.name,
+					    ec_io->bdev_io->type == SPDK_BDEV_IO_TYPE_READ ?
+					    "read" : "write",
+					    spdk_bdev_get_name(child_io->bdev),
+					    ec_io->offset_blocks / ec->stripe_blocks,
+					    failures, slot);
+			} else {
+				SPDK_ERRLOG("EC bdev %s: child %s to base bdev %s failed at "
+					    "stripe %" PRIu64 " (unknown slot)\n",
+					    ec->bdev.name,
+					    ec_io->bdev_io->type == SPDK_BDEV_IO_TYPE_READ ?
+					    "read" : "write",
+					    spdk_bdev_get_name(child_io->bdev),
+					    ec_io->offset_blocks / ec->stripe_blocks);
+			}
+		}
 		ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
 	}
+
+	spdk_bdev_free_io(child_io);
 
 	ec_io->base_io_remaining--;
 
@@ -1357,6 +1401,17 @@ ec_full_write_fanout(struct ec_bdev_io *ec_io)
 			offset_in_disk, chunk_blocks,
 			ec_child_io_complete, ec_io);
 		if (rc != 0) {
+			uint64_t failures;
+
+			/* Throttled: an -ENOMEM storm otherwise logs per slot
+			 * per requeued write. */
+			if (ec_slot_failure_should_log(ec, i, &failures)) {
+				SPDK_ERRLOG("EC bdev %s: data slot %u write submit failed "
+					    "(rc=%d %s) at stripe %" PRIu64 " (%" PRIu64
+					    " failures on slot)\n",
+					    ec->bdev.name, i, rc, spdk_strerror(-rc),
+					    stripe_index, failures);
+			}
 			ec_io->base_io_remaining--;
 			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
 		}
@@ -1373,6 +1428,15 @@ ec_full_write_fanout(struct ec_bdev_io *ec_io)
 			offset_in_disk, chunk_blocks,
 			ec_child_io_complete, ec_io);
 		if (rc != 0) {
+			uint64_t failures;
+
+			if (ec_slot_failure_should_log(ec, bdev_idx, &failures)) {
+				SPDK_ERRLOG("EC bdev %s: parity slot %u write submit failed "
+					    "(rc=%d %s) at stripe %" PRIu64 " (%" PRIu64
+					    " failures on slot)\n",
+					    ec->bdev.name, bdev_idx, rc, spdk_strerror(-rc),
+					    stripe_index, failures);
+			}
 			ec_io->base_io_remaining--;
 			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
 		}
