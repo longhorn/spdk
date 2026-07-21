@@ -587,6 +587,15 @@ struct ec_bdev {
 	/* Base Device Management */
 	struct spdk_bdev_desc *descs[EC_MAX_BASE_BDEVS];
 
+	/*
+	 * [shared] Bdev pointer per open slot, kept in lockstep with descs[].
+	 * Lets completion threads map a bdev to a slot by pointer compare
+	 * without touching descs[i], which home may be closing. Home writes
+	 * with release (NULL before spdk_bdev_close); readers use acquire
+	 * and never dereference the pointer.
+	 */
+	struct spdk_bdev *base_bdevs[EC_MAX_BASE_BDEVS];
+
 	/* Failure Tracking */
 	enum ec_base_bdev_state base_states[EC_MAX_BASE_BDEVS];
 
@@ -1116,6 +1125,18 @@ static inline void
 ec_counter_inc(uint64_t *counter)
 {
 	ec_counter_add(counter, 1);
+}
+
+/*
+ * Update a slot's cached bdev pointer. Home-thread only; call at every
+ * descs[slot] set/clear, with NULL before spdk_bdev_close. See the
+ * base_bdevs[] declaration.
+ */
+static inline void
+ec_slot_publish_base_bdev(struct ec_bdev *ec, uint32_t slot,
+			  struct spdk_bdev *bdev)
+{
+	__atomic_store_n(&ec->base_bdevs[slot], bdev, __ATOMIC_RELEASE);
 }
 
 /*

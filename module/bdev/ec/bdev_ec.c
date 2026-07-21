@@ -201,6 +201,7 @@ ec_cleanup_close_descriptor(struct ec_base_bdev_cleanup_ctx *ctx)
 	if (ec->descs[slot]) {
 		SPDK_NOTICELOG("EC bdev %s: closing descriptor for failed slot %u\n",
 			       ec->bdev.name, slot);
+		ec_slot_publish_base_bdev(ec, slot, NULL);
 		spdk_bdev_close(ec->descs[slot]);
 		ec->descs[slot] = NULL;
 	}
@@ -307,7 +308,10 @@ ec_cleanup_quiesce_cb(void *cb_arg, int status)
 		SPDK_ERRLOG("EC bdev %s: quiesce failed (status %d); "
 			    "closing descriptor without full cleanup\n",
 			    ec->bdev.name, status);
+		/* Closes without draining; retract the cached bdev pointer
+		 * before the close. */
 		if (ec->descs[slot]) {
+			ec_slot_publish_base_bdev(ec, slot, NULL);
 			spdk_bdev_close(ec->descs[slot]);
 			ec->descs[slot] = NULL;
 		}
@@ -547,6 +551,7 @@ ec_close_base_bdevs(struct ec_bdev *ec)
 
 	for (i = 0; i < ec->n; i++) {
 		if (ec->descs[i]) {
+			ec_slot_publish_base_bdev(ec, i, NULL);
 			spdk_bdev_close(ec->descs[i]);
 			ec->descs[i] = NULL;
 		}
@@ -572,6 +577,7 @@ ec_open_base_bdevs(struct ec_bdev *ec, const char **base_bdev_names)
 				       "(missing base bdev)\n",
 				       ec->bdev.name, i);
 			ec->descs[i]       = NULL;
+			ec_slot_publish_base_bdev(ec, i, NULL);
 			ec->base_states[i] = EC_BASE_STATE_FAILED;
 			ec->failed_count++;
 			continue;
@@ -590,6 +596,7 @@ ec_open_base_bdevs(struct ec_bdev *ec, const char **base_bdev_names)
 		}
 
 		base_bdev = spdk_bdev_desc_get_bdev(ec->descs[i]);
+		ec_slot_publish_base_bdev(ec, i, base_bdev);
 
 		if (!blocklen_set) {
 			ec->bdev.blocklen = base_bdev->blocklen;
@@ -2408,6 +2415,7 @@ ec_replace_finish_failed(struct ec_replace_ctx *rctx, int rc)
 	 * closing new_desc again would double-close.
 	 */
 	if (ec->descs[slot] != NULL) {
+		ec_slot_publish_base_bdev(ec, slot, NULL);
 		spdk_bdev_close(ec->descs[slot]);
 		ec->descs[slot] = NULL;
 	}
@@ -2563,6 +2571,8 @@ ec_replace_start_channel_walk(struct ec_replace_ctx *rctx)
 	struct ec_replace_chan_ctx *cctx;
 
 	ec->descs[slot]         = rctx->new_desc;
+	ec_slot_publish_base_bdev(ec, slot,
+				  spdk_bdev_desc_get_bdev(rctx->new_desc));
 	ec->base_states[slot]   = EC_BASE_STATE_REPLACING;
 	ec->needs_rebuild[slot] = true;
 
@@ -2575,6 +2585,7 @@ ec_replace_start_channel_walk(struct ec_replace_ctx *rctx)
 		SPDK_ERRLOG("EC bdev %s: OOM for channel walk ctx; "
 			    "rolling slot %u back from REPLACING to FAILED\n",
 			    ec->bdev.name, slot);
+		ec_slot_publish_base_bdev(ec, slot, NULL);
 		ec->descs[slot]         = NULL;
 		ec->base_states[slot]   = EC_BASE_STATE_FAILED;
 		ec->needs_rebuild[slot] = false;
