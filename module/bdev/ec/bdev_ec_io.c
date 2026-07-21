@@ -1135,6 +1135,12 @@ ec_full_write_persist_and_dispatch(struct ec_bdev_io *ec_io, bool was_clean)
 
 		persist_rc = ec_wib_persist(ec, ec_full_write_wib_set_cb, ec_io);
 		if (persist_rc != 0) {
+			SPDK_ERRLOG("EC bdev %s: WIB persist submit failed "
+				    "(rc=%d %s) for full-stripe write at "
+				    "stripe %" PRIu64 "\n",
+				    ec->bdev.name, persist_rc,
+				    spdk_strerror(-persist_rc),
+				    ec_io->stripe_claim_index);
 			/* Same rollback as the alloc-failure path above. */
 			ec_wib_region_clear_dirty(ec, region);
 			return persist_rc;
@@ -1162,6 +1168,11 @@ ec_full_write_persist_and_dispatch(struct ec_bdev_io *ec_io, bool was_clean)
 	rc = spdk_thread_send_msg(ec_io->submitter_thread,
 				  ec_full_write_dispatch_on_submitter, ec_io);
 	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: cannot hand off full-stripe fan-out to "
+			    "submitter thread '%s' (rc=%d %s) at stripe %" PRIu64 "\n",
+			    ec->bdev.name,
+			    spdk_thread_get_name(ec_io->submitter_thread),
+			    rc, spdk_strerror(-rc), ec_io->stripe_claim_index);
 		return rc;
 	}
 	return 0;
@@ -1368,6 +1379,11 @@ ec_full_write_fanout(struct ec_bdev_io *ec_io)
 	}
 
 	if (ec_io->base_io_remaining == 0) {
+		SPDK_ERRLOG("EC bdev %s: every child write submit failed at "
+			    "stripe %" PRIu64 " (%s); completing FAILED\n",
+			    ec->bdev.name, stripe_index,
+			    ec_io->is_write_into_unmapped ?
+			    "write-into-unmapped" : "full-stripe");
 		goto error;
 	}
 
@@ -1551,6 +1567,12 @@ ec_submit_write_into_unmapped(struct ec_bdev_io *ec_io)
 	rc = spdk_thread_send_msg(ec_io->submitter_thread,
 				  ec_full_write_dispatch_on_submitter, ec_io);
 	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: cannot hand off write-into-unmapped "
+			    "fan-out to submitter thread '%s' (rc=%d %s) at "
+			    "stripe %" PRIu64 "\n",
+			    ec->bdev.name,
+			    spdk_thread_get_name(ec_io->submitter_thread),
+			    rc, spdk_strerror(-rc), ec_io->stripe_claim_index);
 		/*
 		 * Cannot reach submitter; roll back the same state the
 		 * alloc-failure rollback above does. The bit-clear path
@@ -1689,8 +1711,16 @@ ec_submit_write_on_home(void *ctx)
 		return;
 	}
 
-	ec_io->status = (rc == -EAGAIN || rc == -ENOMEM)
-			? SPDK_BDEV_IO_STATUS_NOMEM
-			: SPDK_BDEV_IO_STATUS_FAILED;
+	if (rc == -EAGAIN || rc == -ENOMEM) {
+		ec_io->status = SPDK_BDEV_IO_STATUS_NOMEM;
+	} else {
+		struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+		SPDK_ERRLOG("EC bdev %s: write submit failed hard (rc=%d %s) at "
+			    "offset %" PRIu64 " len %" PRIu64 "; completing FAILED\n",
+			    ec->bdev.name, rc, spdk_strerror(-rc),
+			    ec_io->offset_blocks, ec_io->num_blocks);
+		ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
+	}
 	ec_io_route_complete_to_submitter(ec_io, "submit failure");
 }

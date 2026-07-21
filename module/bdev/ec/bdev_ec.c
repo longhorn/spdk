@@ -2199,6 +2199,13 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 		if (rc == -EAGAIN || rc == -ENOMEM) {
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
 		} else {
+			SPDK_ERRLOG("EC bdev %s: I/O type %d submit failed hard "
+				    "(rc=%d %s) at offset %" PRIu64 " len %" PRIu64 "; "
+				    "completing FAILED\n",
+				    ec->bdev.name, bdev_io->type, rc,
+				    spdk_strerror(-rc),
+				    bdev_io->u.bdev.offset_blocks,
+				    bdev_io->u.bdev.num_blocks);
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		}
 	}
