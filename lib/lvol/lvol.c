@@ -734,19 +734,40 @@ lvs_opts_copy(const struct spdk_lvs_opts *src, struct spdk_lvs_opts *dst)
 	return 0;
 }
 
-static void
-setup_lvs_opts(struct spdk_bs_opts *bs_opts, struct spdk_lvs_opts *o, uint32_t total_clusters,
+static int
+setup_lvs_opts(struct spdk_bs_opts *bs_opts, struct spdk_lvs_opts *o, uint64_t total_clusters,
 	       void *esnap_ctx)
 {
+	uint64_t num_md_pages;
+
 	assert(o != NULL);
+
+	if (o->num_md_pages_per_cluster_ratio > 0 &&
+	    total_clusters > UINT64_MAX / o->num_md_pages_per_cluster_ratio) {
+		SPDK_ERRLOG("num_md_pages calculation overflows "
+			    "(num_md_pages_per_cluster_ratio %" PRIu32 ", total_clusters %" PRIu64 ")\n",
+			    o->num_md_pages_per_cluster_ratio, total_clusters);
+		return -EINVAL;
+	}
+
+	num_md_pages = ((uint64_t)o->num_md_pages_per_cluster_ratio * total_clusters) / 100;
+	if (num_md_pages > UINT32_MAX) {
+		SPDK_ERRLOG("num_md_pages %" PRIu64 " exceeds UINT32_MAX "
+			    "(num_md_pages_per_cluster_ratio %" PRIu32 ", total_clusters %" PRIu64 ")\n",
+			    num_md_pages, o->num_md_pages_per_cluster_ratio, total_clusters);
+		return -EINVAL;
+	}
+
 	lvs_bs_opts_init(bs_opts);
 	bs_opts->cluster_sz = o->cluster_sz;
 	bs_opts->clear_method = (enum bs_clear_method)o->clear_method;
-	bs_opts->num_md_pages = (o->num_md_pages_per_cluster_ratio * total_clusters) / 100;
+	bs_opts->num_md_pages = (uint32_t)num_md_pages;
 	bs_opts->md_page_size = o->md_page_size;
 	bs_opts->esnap_bs_dev_create = o->esnap_bs_dev_create;
 	bs_opts->esnap_ctx = esnap_ctx;
 	snprintf(bs_opts->bstype.bstype, sizeof(bs_opts->bstype.bstype), "LVOLSTORE");
+
+	return 0;
 }
 
 int
@@ -757,7 +778,7 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 	struct spdk_lvs_with_handle_req *lvs_req;
 	struct spdk_bs_opts opts = {};
 	struct spdk_lvs_opts lvs_opts;
-	uint32_t total_clusters;
+	uint64_t total_clusters;
 	int rc, len;
 
 	if (bs_dev == NULL) {
@@ -789,7 +810,11 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		return -ENOMEM;
 	}
 
-	setup_lvs_opts(&opts, o, total_clusters, lvs);
+	rc = setup_lvs_opts(&opts, o, total_clusters, lvs);
+	if (rc != 0) {
+		lvs_free(lvs);
+		return rc;
+	}
 
 	len = strnlen(lvs_opts.name, SPDK_LVS_NAME_MAX);
 	if (len == 0 || len == SPDK_LVS_NAME_MAX) {
