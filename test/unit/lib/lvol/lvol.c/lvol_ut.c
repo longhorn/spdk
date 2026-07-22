@@ -852,6 +852,70 @@ lvs_init_opts_success(void)
 }
 
 static void
+lvs_init_md_pages_boundary(void)
+{
+	struct lvol_ut_bs_dev dev;
+	struct spdk_lvs_opts opts;
+	int rc = 0;
+
+	/* Use cluster_sz == blocklen so total_clusters == blockcnt. */
+	init_dev(&dev);
+	dev.bs_dev.blocklen = DEV_BUFFER_BLOCKLEN;
+
+	/* Above the old 32-bit wrap point (ratio * clusters > UINT32_MAX):
+	 * previously num_md_pages silently wrapped to 7; now it is exact. */
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+	opts.cluster_sz = DEV_BUFFER_BLOCKLEN;
+	opts.num_md_pages_per_cluster_ratio = 1000;
+	dev.bs_dev.blockcnt = 4294968;
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+	CU_ASSERT(dev.bs->bs_opts.num_md_pages == 42949680);
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+	free_dev(&dev);
+
+	/* Largest device accepted at ratio 1000: num_md_pages == 4294967290. */
+	dev.bs_dev.blockcnt = 429496729;
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+	CU_ASSERT(dev.bs->bs_opts.num_md_pages == 4294967290);
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+	free_dev(&dev);
+
+	/* One cluster more pushes num_md_pages past UINT32_MAX: rejected. */
+	dev.bs_dev.blockcnt = 429496730;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Default ratio (100): boundary is at UINT32_MAX clusters. */
+	opts.num_md_pages_per_cluster_ratio = 100;
+	dev.bs_dev.blockcnt = (uint64_t)UINT32_MAX + 1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* ratio * total_clusters overflowing uint64_t is rejected, not wrapped. */
+	opts.num_md_pages_per_cluster_ratio = UINT32_MAX;
+	dev.bs_dev.blockcnt = UINT64_MAX / UINT32_MAX + 1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+}
+
+static void
 lvs_unload_lvs_is_null_fail(void)
 {
 	int rc = 0;
@@ -4057,6 +4121,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvs_init_unload_success);
 	CU_ADD_TEST(suite, lvs_init_destroy_success);
 	CU_ADD_TEST(suite, lvs_init_opts_success);
+	CU_ADD_TEST(suite, lvs_init_md_pages_boundary);
 	CU_ADD_TEST(suite, lvs_unload_lvs_is_null_fail);
 	CU_ADD_TEST(suite, lvs_names);
 	CU_ADD_TEST(suite, lvol_create_destroy_success);
