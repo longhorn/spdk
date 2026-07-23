@@ -74,6 +74,9 @@ DEFINE_STUB(spdk_bdev_writev_blocks, int, (struct spdk_bdev_desc *desc,
 		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
 		uint64_t offset_blocks, uint64_t num_blocks,
 		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_write, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				   void *buf, uint64_t offset, uint64_t nbytes,
+				   spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *bdev_io));
 DEFINE_STUB_V(spdk_bdev_io_complete, (struct spdk_bdev_io *bdev_io,
 				      enum spdk_bdev_io_status status));
@@ -1087,7 +1090,121 @@ test_resize_wib_reset_on_grow(void)
 	 */
 	CU_ASSERT(ec_wib_crash_count(&ec) == 0);
 	CU_ASSERT(!ec_wib_crash_is_dirty(&ec, new_regions - 1));
+	ec_free_runtime_arrays(&ec);
+}
 
+/*
+ * Unit coverage: the precondition checks at the top of ec_bdev_resize.
+ *
+ * Every rejection below fires before quiesce, so the calls are
+ * side-effect free and the completion callback must never run. Pins the
+ * error split the RPC layer and the longhorn-spdk-engine expand retry
+ * depend on:
+ *   -EALREADY -- nothing to grow (idempotent no-op; the RPC layer maps
+ *                it to success with "resized": false),
+ *   -ERANGE   -- genuine sizing errors (too small for the front
+ *                reservation, or past the fixed-max stripe ceiling),
+ *   -EBUSY / -EIO / -ENODEV -- guard conditions.
+ */
+
+static bool g_ut_resize_cb_called;
+
+static void
+ut_resize_cb(void *cb_arg, int rc)
+{
+	g_ut_resize_cb_called = true;
+}
+
+static void
+test_resize_precondition_errors(void)
+{
+	struct ec_bdev   ec;
+	struct spdk_bdev bases[6];
+	uint64_t         base_blockcnt = (1ull << 30) / UT_BLOCKLEN;
+	uint32_t         i;
+	int              rc;
+
+	ut_init_ec(&ec, 4, 2, 64, base_blockcnt);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	/* Give every slot its own base bdev so growth can be asymmetric. */
+	memset(bases, 0, sizeof(bases));
+	for (i = 0; i < ec.n; i++) {
+		bases[i].blockcnt = base_blockcnt;
+		ec.descs[i] = (struct spdk_bdev_desc *)&bases[i];
+	}
+
+	ec.bdev.name = "ec_ut_resize";
+	TAILQ_INSERT_TAIL(&g_ec_bdev_list, &ec, link);
+	g_ut_resize_cb_called = false;
+
+	/* Unknown name -> -ENODEV. */
+	rc = ec_bdev_resize("ec_ut_no_such", ut_resize_cb, NULL);
+	CU_ASSERT(rc == -ENODEV);
+
+	/* Guard conditions -> -EBUSY / -EIO. */
+	ec.resize_ctx = (struct ec_resize_ctx *)0x1;
+	CU_ASSERT(ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL) == -EBUSY);
+	ec.resize_ctx = NULL;
+
+	ec.rebuild_ctx = (struct ec_rebuild_ctx *)0x1;
+	CU_ASSERT(ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL) == -EBUSY);
+	ec.rebuild_ctx = NULL;
+
+	ec.scrub_ctx = (struct ec_scrub_ctx *)0x1;
+	CU_ASSERT(ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL) == -EBUSY);
+	ec.scrub_ctx = NULL;
+
+	ec.failed_count = 1;
+	CU_ASSERT(ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL) == -EBUSY);
+	ec.failed_count = 0;
+
+	ec.offline = true;
+	CU_ASSERT(ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL) == -EIO);
+	ec.offline = false;
+
+	/* Base bdevs unchanged -> -EALREADY (idempotent no-op). */
+	rc = ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL);
+	CU_ASSERT(rc == -EALREADY);
+
+	/*
+	 * Partial growth: one base grown, the min unchanged. Effective size
+	 * is min-based, so this is still a no-op, not an error.
+	 */
+	bases[0].blockcnt = base_blockcnt * 2;
+	rc = ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL);
+	CU_ASSERT(rc == -EALREADY);
+	bases[0].blockcnt = base_blockcnt;
+
+	/*
+	 * All bases shrunk below the front metadata reservation -> -ERANGE,
+	 * never -EALREADY: a retry loop must not treat this as done.
+	 */
+	for (i = 0; i < ec.n; i++) {
+		bases[i].blockcnt = ec.data_offset_stripes * ec.strip_size;
+	}
+	rc = ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL);
+	CU_ASSERT(rc == -ERANGE);
+
+	/*
+	 * All bases grown past the fixed-max stripe ceiling the front
+	 * reservations were sized for -> -ERANGE.
+	 */
+	for (i = 0; i < ec.n; i++) {
+		bases[i].blockcnt = (ec_max_num_stripes(&ec) +
+				     ec.data_offset_stripes + 2) * ec.strip_size;
+	}
+	rc = ec_bdev_resize("ec_ut_resize", ut_resize_cb, NULL);
+	CU_ASSERT(rc == -ERANGE);
+
+	/* Every rejection above fires before quiesce: no callback, ever. */
+	CU_ASSERT(g_ut_resize_cb_called == false);
+	CU_ASSERT(ec.resize_ctx == NULL);
+
+	TAILQ_REMOVE(&g_ec_bdev_list, &ec, link);
 	ec_free_runtime_arrays(&ec);
 }
 
@@ -1660,6 +1777,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_bitmap_validate_accepts_smaller);
 
 	CU_ADD_TEST(suite, test_resize_wib_reset_on_grow);
+	CU_ADD_TEST(suite, test_resize_precondition_errors);
 
 	CU_ADD_TEST(suite, test_dedicated_channel_release);
 	CU_ADD_TEST(suite, test_dedicated_release_deferred_gate);
