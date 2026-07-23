@@ -476,6 +476,8 @@ ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
 					    "%u/%u disks failed (max %u). OFFLINE.\n",
 					    ec->bdev.name, ec->failed_count, ec->n, ec->m);
 				ec->offline = true;
+				/* Fail the writes parked on stripe conflicts. */
+				ec_stripe_waitq_fail_all(ec, SPDK_BDEV_IO_STATUS_ABORTED);
 			} else {
 				SPDK_WARNLOG("EC bdev %s: %s disk %s (slot %u/%u) failed "
 					     "(%u/%u disks failed, can tolerate %u more)\n",
@@ -903,6 +905,7 @@ ec_alloc_runtime_arrays(struct ec_bdev *ec)
 	/* Scalar / pointer / array fields are already zeroed by the calloc
 	 * in _ec_bdev_create; only the list heads need explicit init. */
 	TAILQ_INIT(&ec->wib_deferred_writes);
+	TAILQ_INIT(&ec->stripe_waitq);
 	TAILQ_INIT(&ec->pending_bit_clears);
 	TAILQ_INIT(&ec->in_flight_bit_clears);
 
@@ -1817,6 +1820,9 @@ ec_destruct(void *ctx)
 	assert(spdk_get_thread() == ec->home_thread);
 	ec->destructing = true;
 
+	/* Parked writes would otherwise hold the unregister open forever. */
+	ec_stripe_waitq_fail_all(ec, SPDK_BDEV_IO_STATUS_ABORTED);
+
 	TAILQ_REMOVE(&g_ec_bdev_list, ec, link);
 
 	/*
@@ -2025,6 +2031,12 @@ ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 				     ec->full_stripe_deferred_wib);
 	spdk_json_write_named_uint64(w, "nomem_completions",
 				     __atomic_load_n(&ec->nomem_completions, __ATOMIC_RELAXED));
+	spdk_json_write_named_uint64(w, "stripe_waitq_parked",
+				     ec->stripe_waitq_parked);
+	spdk_json_write_named_uint32(w, "stripe_waitq_depth",
+				     __atomic_load_n(&ec->stripe_waitq_depth, __ATOMIC_RELAXED));
+	spdk_json_write_named_uint64(w, "stripe_waitq_max_depth",
+				     ec->stripe_waitq_max_depth);
 	spdk_json_write_named_uint64(w, "unmaps_submitted",
 				     __atomic_load_n(&ec->unmaps_submitted, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmaps_completed",
@@ -2134,8 +2146,8 @@ ec_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 }
 
 /*
- * RESET / FLUSH have no payload at the EC layer: complete immediately
- * with SUCCESS. Returning 0 keeps the dispatch table's "non-zero rc =>
+ * FLUSH has no payload at the EC layer: complete immediately with
+ * SUCCESS. Returning 0 keeps the dispatch table's "non-zero rc =>
  * status mapping" invariant uniform across every entry.
  */
 static int
@@ -2143,6 +2155,34 @@ ec_submit_noop_success(struct ec_bdev_io *ec_io)
 {
 	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 	return 0;
+}
+
+/* Home-thread body of RESET: abort parked writes, then complete. */
+static void
+ec_reset_on_home(void *ctx)
+{
+	struct ec_bdev_io *ec_io = ctx;
+	struct ec_bdev    *ec    = ec_from_bdev_io(ec_io->bdev_io);
+
+	ec_stripe_waitq_fail_all(ec, SPDK_BDEV_IO_STATUS_ABORTED);
+	ec_io->status = SPDK_BDEV_IO_STATUS_SUCCESS;
+	ec_io_route_complete_to_submitter(ec_io, "reset completion");
+}
+
+/*
+ * RESET aborts the writes parked on the stripe wait queue and completes.
+ * The wait queue is home-only, so route there first.
+ */
+static int
+ec_submit_reset(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+	if (spdk_get_thread() == ec->home_thread) {
+		ec_reset_on_home(ec_io);
+		return 0;
+	}
+	return spdk_thread_send_msg(ec->home_thread, ec_reset_on_home, ec_io);
 }
 
 /*
@@ -2175,7 +2215,7 @@ static const ec_io_submit_fn g_ec_submit_dispatch[] = {
 	[SPDK_BDEV_IO_TYPE_WRITE]        = ec_submit_write,
 	[SPDK_BDEV_IO_TYPE_WRITE_ZEROES] = ec_submit_reject_write_zeroes,
 	[SPDK_BDEV_IO_TYPE_UNMAP]        = ec_submit_unmap,
-	[SPDK_BDEV_IO_TYPE_RESET]        = ec_submit_noop_success,
+	[SPDK_BDEV_IO_TYPE_RESET]        = ec_submit_reset,
 	[SPDK_BDEV_IO_TYPE_FLUSH]        = ec_submit_noop_success,
 };
 

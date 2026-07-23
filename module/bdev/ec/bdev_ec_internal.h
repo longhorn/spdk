@@ -692,6 +692,18 @@ struct ec_bdev {
 	TAILQ_HEAD(, ec_rmw_ctx) wib_deferred_writes;
 
 	/*
+	 * Writes parked because their target stripe is busy or earlier
+	 * writes for the same stripe are already parked. Home-thread only.
+	 * Drained by ec_stripe_waitq_kick when a stripe is released; failed
+	 * by ec_stripe_waitq_fail_all on reset, offline, and destruct.
+	 *
+	 * stripe_waitq_depth mirrors the queue length. Written on home;
+	 * read atomically by ec_stripe_clear_dirty on submitter threads.
+	 */
+	TAILQ_HEAD(, ec_bdev_io) stripe_waitq;
+	uint32_t                 stripe_waitq_depth;
+
+	/*
 	 * In-band unmapped bitmap -- see the bitmap section earlier in this
 	 * header and bdev_ec_bitmap.c for the on-disk model. bitmap_chans[]
 	 * holds n entries (touched by every disk, unlike WIB which only
@@ -814,6 +826,8 @@ struct ec_bdev {
 	uint64_t full_stripe_deferred_claim;     /* [home] full-stripe EAGAIN: stripe busy  */
 	uint64_t full_stripe_deferred_wib;       /* [home] full-stripe EAGAIN: WIB persist
 						  * in flight */
+	uint64_t stripe_waitq_parked;            /* [home] writes parked on stripe conflict */
+	uint64_t stripe_waitq_max_depth;         /* [home] parked-writes high-water mark    */
 	/*
 	 * bdev_ios completed as NOMEM by ec_submit_request. Each NOMEM
 	 * stalls new submissions on that channel until in-flight IO
@@ -994,6 +1008,9 @@ struct ec_bdev_io {
 	 * Asserted at every base-I/O dispatch site.
 	 */
 	struct spdk_thread *submitter_thread;
+
+	/* Linkage for the stripe-conflict wait queue (ec->stripe_waitq). */
+	TAILQ_ENTRY(ec_bdev_io) waitq_link;
 };
 
 /* =========================================================================
@@ -1293,6 +1310,15 @@ ec_only_parity_failed(const struct ec_bdev *ec)
 }
 
 /*
+ * Stripe-conflict wait queue (bdev_ec_io.c). kick schedules a home-thread
+ * drain of ec->stripe_waitq; fail_all completes every parked write with
+ * the given status (home-thread only).
+ */
+void ec_stripe_waitq_kick(struct ec_bdev *ec);
+void ec_stripe_waitq_fail_all(struct ec_bdev *ec,
+			      enum spdk_bdev_io_status status);
+
+/*
  * Stripe dirty bitmap helpers. One bit per stripe, set during in-flight
  * RMW or full-stripe write to gate concurrent claimers (returns -EAGAIN
  * for a second claim on the same stripe).
@@ -1320,6 +1346,14 @@ ec_stripe_clear_dirty(struct ec_bdev *ec, uint64_t stripe_index)
 
 	__atomic_and_fetch(&ec->stripe_dirty_map[stripe_index / 64], ~mask,
 			   __ATOMIC_RELAXED);
+
+	/*
+	 * A release may unblock parked writes. Depth is read atomically
+	 * because clears also run on submitter threads.
+	 */
+	if (__atomic_load_n(&ec->stripe_waitq_depth, __ATOMIC_ACQUIRE) != 0) {
+		ec_stripe_waitq_kick(ec);
+	}
 }
 
 static inline bool

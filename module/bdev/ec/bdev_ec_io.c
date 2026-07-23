@@ -1687,11 +1687,147 @@ ec_io_route_complete_to_submitter(struct ec_bdev_io *ec_io, const char *what)
 }
 
 static void ec_submit_write_on_home(void *ctx);
+static int ec_submit_write_dispatch(struct ec_bdev_io *ec_io);
+
+/* =========================================================================
+ * Stripe-conflict wait queue
+ *
+ * Writes whose target stripe is busy park on ec->stripe_waitq instead of
+ * completing NOMEM, which would suspend the whole channel. Queue state is
+ * home-thread only; releases can happen on submitter threads, so the
+ * drain is always scheduled via send_msg to home.
+ * ========================================================================= */
+
+/*
+ * Map a synchronous write-submit rc to a bdev_io completion routed to the
+ * submitter thread. Shared by ec_submit_write_on_home and the wait-queue
+ * drain.
+ */
+static void
+ec_write_complete_submit_rc(struct ec_bdev_io *ec_io, int rc)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+	if (rc == -EAGAIN || rc == -ENOMEM) {
+		__atomic_fetch_add(&ec->nomem_completions, 1,
+				   __ATOMIC_RELAXED);
+		ec_io->status = SPDK_BDEV_IO_STATUS_NOMEM;
+	} else {
+		SPDK_ERRLOG("EC bdev %s: write submit failed hard (rc=%d %s) at "
+			    "offset %" PRIu64 " len %" PRIu64 "; completing FAILED\n",
+			    ec->bdev.name, rc, spdk_strerror(-rc),
+			    ec_io->offset_blocks, ec_io->num_blocks);
+		ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
+	}
+	ec_io_route_complete_to_submitter(ec_io, "submit failure");
+}
+
+static bool
+ec_stripe_waitq_contains(struct ec_bdev *ec, uint64_t stripe_index)
+{
+	struct ec_bdev_io *p;
+
+	TAILQ_FOREACH(p, &ec->stripe_waitq, waitq_link) {
+		if (p->offset_blocks / ec->stripe_blocks == stripe_index) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+ec_stripe_waitq_park(struct ec_bdev *ec, struct ec_bdev_io *ec_io)
+{
+	uint32_t depth;
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	TAILQ_INSERT_TAIL(&ec->stripe_waitq, ec_io, waitq_link);
+	depth = __atomic_load_n(&ec->stripe_waitq_depth, __ATOMIC_RELAXED) + 1;
+	__atomic_store_n(&ec->stripe_waitq_depth, depth, __ATOMIC_RELEASE);
+	ec->stripe_waitq_parked++;
+	if (depth > ec->stripe_waitq_max_depth) {
+		ec->stripe_waitq_max_depth = depth;
+	}
+}
+
+static void
+ec_stripe_waitq_remove(struct ec_bdev *ec, struct ec_bdev_io *ec_io)
+{
+	assert(spdk_get_thread() == ec->home_thread);
+
+	TAILQ_REMOVE(&ec->stripe_waitq, ec_io, waitq_link);
+	__atomic_store_n(&ec->stripe_waitq_depth,
+			 __atomic_load_n(&ec->stripe_waitq_depth,
+					 __ATOMIC_RELAXED) - 1,
+			 __ATOMIC_RELEASE);
+}
+
+/*
+ * Resume the first parked write of every stripe that is no longer busy.
+ * Dispatch re-claims the stripe synchronously, so later parked writes for
+ * the same stripe stay queued (FIFO per stripe).
+ */
+static void
+ec_stripe_waitq_drain_on_home(void *ctx)
+{
+	struct ec_bdev *ec = ctx;
+	struct ec_bdev_io *p, *tmp;
+	int rc;
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	TAILQ_FOREACH_SAFE(p, &ec->stripe_waitq, waitq_link, tmp) {
+		if (ec_stripe_is_dirty(ec, p->offset_blocks / ec->stripe_blocks)) {
+			continue;
+		}
+		ec_stripe_waitq_remove(ec, p);
+		rc = ec_submit_write_dispatch(p);
+		if (rc != 0) {
+			ec_write_complete_submit_rc(p, rc);
+		}
+	}
+}
+
+/*
+ * Schedule a drain on the home thread. Safe from any thread; always a
+ * send_msg so a release inside a completion path never re-enters the
+ * dispatch inline.
+ */
+void
+ec_stripe_waitq_kick(struct ec_bdev *ec)
+{
+	int rc = spdk_thread_send_msg(ec->home_thread,
+				      ec_stripe_waitq_drain_on_home, ec);
+
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: cannot schedule stripe waitq drain "
+			    "(rc=%d %s); parked writes wait for the next "
+			    "release\n",
+			    ec->bdev.name, rc, spdk_strerror(-rc));
+	}
+}
+
+/* Complete every parked write with the given status. */
+void
+ec_stripe_waitq_fail_all(struct ec_bdev *ec, enum spdk_bdev_io_status status)
+{
+	struct ec_bdev_io *p;
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	while ((p = TAILQ_FIRST(&ec->stripe_waitq)) != NULL) {
+		ec_stripe_waitq_remove(ec, p);
+		p->status = status;
+		ec_io_route_complete_to_submitter(p, "parked write abort");
+	}
+}
 
 int
 ec_submit_write(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	uint64_t        stripe_idx;
 
 	/*
 	 * Entry routing: the write path mutates home-only state
@@ -1700,16 +1836,33 @@ ec_submit_write(struct ec_bdev_io *ec_io)
 	 * ec_submit_full_write / ec_submit_rmw_write. Route the entire
 	 * call to home if we're not already there. When the caller is
 	 * already on the home thread the inline branch runs.
-	 *
-	 * The bitmap consult below (ec_stripe_is_unmapped) uses
-	 * __ATOMIC_ACQUIRE per the release/acquire discipline that pairs
-	 * with the home-side mutators, so the outcome of the unmapped
-	 * check is reproducible on home after the hop.
 	 */
 	if (spdk_unlikely(spdk_get_thread() != ec->home_thread)) {
 		return spdk_thread_send_msg(ec->home_thread,
 					    ec_submit_write_on_home, ec_io);
 	}
+
+	/*
+	 * Park if the stripe is busy or earlier writes for it are already
+	 * parked (preserves per-stripe FIFO order).
+	 */
+	stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
+	if (ec_stripe_is_dirty(ec, stripe_idx) ||
+	    ec_stripe_waitq_contains(ec, stripe_idx)) {
+		ec_stripe_waitq_park(ec, ec_io);
+		return 0;
+	}
+
+	return ec_submit_write_dispatch(ec_io);
+}
+
+/* Path selection for a write that passed the stripe-conflict gate. */
+static int
+ec_submit_write_dispatch(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+
+	assert(spdk_get_thread() == ec->home_thread);
 
 	/*
 	 * Unmapped-bitmap consultation. A write that lands on an unmapped
@@ -1760,9 +1913,8 @@ ec_submit_write(struct ec_bdev_io *ec_io)
  * the top of ec_submit_write fast-paths to the body now that we are
  * on home. On sync failure, route the bdev_io completion back to the
  * submitter with the appropriate status (NOMEM for retryable errors,
- * FAILED for hard errors), mirroring ec_submit_request's status
- * mapping for the inline path. If even the completion hand-off fails,
- * the bdev_io stays in flight rather than being completed on the wrong
+ * FAILED for hard errors). If even the completion hand-off fails, the
+ * bdev_io stays in flight rather than being completed on the wrong
  * thread.
  */
 static void
@@ -1772,20 +1924,7 @@ ec_submit_write_on_home(void *ctx)
 	int                rc;
 
 	rc = ec_submit_write(ec_io);
-	if (rc == 0) {
-		return;
+	if (rc != 0) {
+		ec_write_complete_submit_rc(ec_io, rc);
 	}
-
-	if (rc == -EAGAIN || rc == -ENOMEM) {
-		ec_io->status = SPDK_BDEV_IO_STATUS_NOMEM;
-	} else {
-		struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
-
-		SPDK_ERRLOG("EC bdev %s: write submit failed hard (rc=%d %s) at "
-			    "offset %" PRIu64 " len %" PRIu64 "; completing FAILED\n",
-			    ec->bdev.name, rc, spdk_strerror(-rc),
-			    ec_io->offset_blocks, ec_io->num_blocks);
-		ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
-	}
-	ec_io_route_complete_to_submitter(ec_io, "submit failure");
 }

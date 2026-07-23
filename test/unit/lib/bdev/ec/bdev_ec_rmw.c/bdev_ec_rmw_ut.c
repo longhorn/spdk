@@ -47,6 +47,7 @@ DEFINE_STUB(ec_reconstruct_multi_data, int, (const struct ec_bdev *ec,
 		const uint32_t failed_data_slots[], uint32_t f, uint64_t chunk_len), 0);
 DEFINE_STUB_V(ec_encode_data, (int len, int k, int rows, unsigned char *g_tbls,
 			       unsigned char **data, unsigned char **coding));
+DEFINE_STUB_V(ec_stripe_waitq_kick, (struct ec_bdev *ec));
 
 /* ---- Fixture ---- */
 #define UT_N       6u

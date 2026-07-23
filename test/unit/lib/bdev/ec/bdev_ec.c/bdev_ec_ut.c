@@ -114,6 +114,11 @@ DEFINE_STUB_V(ec_bdev_io_init, (struct ec_bdev_io *ec_io, struct ec_io_channel *
 DEFINE_STUB(ec_submit_read, int, (struct ec_bdev_io *ec_io), 0);
 DEFINE_STUB(ec_submit_write, int, (struct ec_bdev_io *ec_io), 0);
 DEFINE_STUB(ec_submit_unmap, int, (struct ec_bdev_io *ec_io), 0);
+DEFINE_STUB_V(ec_stripe_waitq_kick, (struct ec_bdev *ec));
+DEFINE_STUB_V(ec_stripe_waitq_fail_all, (struct ec_bdev *ec,
+					 enum spdk_bdev_io_status status));
+DEFINE_STUB_V(ec_io_route_complete_to_submitter, (struct ec_bdev_io *ec_io,
+						  const char *what));
 
 /* Link-only stubs: bdev_ec_rebuild.c references these on paths the skip
  * tests never run, so a no-op definition is enough to link. */
