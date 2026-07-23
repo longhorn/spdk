@@ -811,6 +811,16 @@ struct ec_bdev {
 	uint64_t rmw_deferred_inflight;          /* [home] RMW EAGAIN: stripe already dirty */
 	uint64_t full_stripe_writes;             /* [home] full-stripe writes accepted      */
 	uint64_t full_stripe_writes_deferred;    /* [home] full-stripe EAGAIN: scrub guard  */
+	uint64_t full_stripe_deferred_claim;     /* [home] full-stripe EAGAIN: stripe busy  */
+	uint64_t full_stripe_deferred_wib;       /* [home] full-stripe EAGAIN: WIB persist
+						  * in flight */
+	/*
+	 * bdev_ios completed as NOMEM by ec_submit_request. Each NOMEM
+	 * stalls new submissions on that channel until in-flight IO
+	 * drains, so growth under load means the channel queue depth is
+	 * collapsing.
+	 */
+	uint64_t nomem_completions;              /* [shared] -EAGAIN/-ENOMEM -> NOMEM */
 	/*
 	 * UNMAP accounting. Each call to ec_submit_unmap that gets past the
 	 * cross-thread routing hop bumps unmaps_submitted exactly once and

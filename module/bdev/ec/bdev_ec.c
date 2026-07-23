@@ -2019,6 +2019,12 @@ ec_write_io_stats_json(struct spdk_json_write_ctx *w, const struct ec_bdev *ec)
 				     ec->full_stripe_writes);
 	spdk_json_write_named_uint64(w, "full_stripe_writes_deferred",
 				     ec->full_stripe_writes_deferred);
+	spdk_json_write_named_uint64(w, "full_stripe_deferred_claim",
+				     ec->full_stripe_deferred_claim);
+	spdk_json_write_named_uint64(w, "full_stripe_deferred_wib",
+				     ec->full_stripe_deferred_wib);
+	spdk_json_write_named_uint64(w, "nomem_completions",
+				     __atomic_load_n(&ec->nomem_completions, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmaps_submitted",
 				     __atomic_load_n(&ec->unmaps_submitted, __ATOMIC_RELAXED));
 	spdk_json_write_named_uint64(w, "unmaps_completed",
@@ -2207,6 +2213,8 @@ ec_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 		 * Other:   hard failure.
 		 */
 		if (rc == -EAGAIN || rc == -ENOMEM) {
+			__atomic_fetch_add(&ec->nomem_completions, 1,
+					   __ATOMIC_RELAXED);
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
 		} else {
 			SPDK_ERRLOG("EC bdev %s: I/O type %d submit failed hard "

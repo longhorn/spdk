@@ -1147,7 +1147,7 @@ ec_full_write_persist_and_dispatch(struct ec_bdev_io *ec_io, bool was_clean)
 	 */
 	if (ec->wib_persist_in_flight) {
 		ec->wib_repersist_needed = true;
-		ec->full_stripe_writes_deferred++;
+		ec->full_stripe_deferred_wib++;
 		return -EAGAIN;
 	}
 
@@ -1273,6 +1273,7 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	 * array. ec_child_io_complete releases the claim on final completion.
 	 */
 	if (!ec_stripe_try_claim(ec, ec_io)) {
+		ec->full_stripe_deferred_claim++;
 		return -EAGAIN;
 	}
 
