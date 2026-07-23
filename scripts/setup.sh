@@ -22,9 +22,6 @@ fi
 rootdir=$(readlink -f $(dirname $0))/..
 source "$rootdir/scripts/common.sh"
 
-# Path for persisted sysctl configuration (Linux only usage)
-SYSCTL_SPDK_CONF=/usr/local/lib/sysctl.d/99-spdk.conf
-
 function usage() {
 	if [[ $os == Linux ]]; then
 		options="[config|reset|status|disk-status|disk-driver|bind|unbind|cleanup|interactive|help]"
@@ -111,9 +108,6 @@ function usage() {
 	echo "FORCE_NIC_UIO_REBIND"
 	echo "                  When set to 'yes', an attempt to reload nic_uio will be made regardless"
 	echo "                  of the kernel environment. Applicable only under FreeBSD."
-	echo "PERSIST_HUGE      When set to 'yes', persist number of hugepages to $SYSCTL_SPDK_CONF"
-	echo "                  as vm.nr_hugepages. NUMA per-node persistence is not supported, and this option is ignored"
-	echo "                  when HUGENODE is set."
 	exit 0
 }
 
@@ -530,10 +524,7 @@ check_hugepages_alloc() {
 	fi
 }
 
-clear_hugepages() {
-	echo 0 > /proc/sys/vm/nr_hugepages
-	rm -f "$SYSCTL_SPDK_CONF"
-}
+clear_hugepages() { echo 0 > /proc/sys/vm/nr_hugepages; }
 
 configure_linux_hugepages() {
 	local node system_nodes
@@ -550,17 +541,6 @@ configure_linux_hugepages() {
 
 	if [[ -z $HUGENODE ]]; then
 		check_hugepages_alloc /proc/sys/vm/nr_hugepages
-
-		# Optionally persist number of hugepages
-		[[ $PERSIST_HUGE == yes ]] || return 0
-		local current_nr
-
-		current_nr=$(< /proc/sys/vm/nr_hugepages)
-		((current_nr > 0)) || return 0
-		echo "Trying to persist vm.nr_hugepages=$current_nr to $SYSCTL_SPDK_CONF"
-		mkdir -p "$(dirname $SYSCTL_SPDK_CONF)"
-		echo "vm.nr_hugepages=$current_nr" > "$SYSCTL_SPDK_CONF"
-
 		return 0
 	fi
 
