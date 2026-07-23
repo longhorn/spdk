@@ -810,7 +810,7 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		return -ENOMEM;
 	}
 
-	rc = setup_lvs_opts(&opts, o, total_clusters, lvs);
+	rc = setup_lvs_opts(&opts, &lvs_opts, total_clusters, lvs);
 	if (rc != 0) {
 		lvs_free(lvs);
 		return rc;
