@@ -835,11 +835,33 @@ static const struct spdk_json_object_decoder rpc_bdev_ec_resize_decoders[] = {
 	 spdk_json_decode_string},
 };
 
+/*
+ * Send the bdev_ec_resize success response. Shared by the actual-growth
+ * completion path (resized == true) and the idempotent no-op path
+ * (resized == false, new_blockcnt == old_blockcnt).
+ */
+static void
+rpc_bdev_ec_resize_send_result(struct rpc_bdev_ec_resize *req, bool resized)
+{
+	struct spdk_json_write_ctx *w;
+	struct ec_bdev             *ec;
+
+	ec = ec_bdev_find(req->ec_name);
+
+	w = spdk_jsonrpc_begin_result(req->request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "ec_name",      req->ec_name);
+	spdk_json_write_named_uint64(w, "old_blockcnt", req->old_blockcnt);
+	spdk_json_write_named_uint64(w, "new_blockcnt", ec ? ec->bdev.blockcnt : 0);
+	spdk_json_write_named_bool(w,   "resized",      resized);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(req->request, w);
+}
+
 static void
 rpc_bdev_ec_resize_cb(void *cb_arg, int rc)
 {
 	struct rpc_bdev_ec_resize   *req = cb_arg;
-	struct spdk_json_write_ctx  *w;
 	struct ec_bdev              *ec  = NULL;
 
 	if (rc != 0) {
@@ -856,13 +878,7 @@ rpc_bdev_ec_resize_cb(void *cb_arg, int rc)
 		       req->ec_name, req->old_blockcnt,
 		       ec ? ec->bdev.blockcnt : 0);
 
-	w = spdk_jsonrpc_begin_result(req->request);
-	spdk_json_write_object_begin(w);
-	spdk_json_write_named_string(w, "ec_name",      req->ec_name);
-	spdk_json_write_named_uint64(w, "old_blockcnt", req->old_blockcnt);
-	spdk_json_write_named_uint64(w, "new_blockcnt", ec ? ec->bdev.blockcnt : 0);
-	spdk_json_write_object_end(w);
-	spdk_jsonrpc_end_result(req->request, w);
+	rpc_bdev_ec_resize_send_result(req, true);
 
 out:
 	free_rpc_bdev_ec_resize(req);
@@ -907,13 +923,24 @@ rpc_bdev_ec_resize(struct spdk_jsonrpc_request *request,
 	 * The JSON response is sent from the callback.
 	 */
 	rc = ec_bdev_resize(req->ec_name, rpc_bdev_ec_resize_cb, req);
+	if (rc == -EALREADY) {
+		/*
+		 * Nothing to grow: the EC bdev already matches the base
+		 * bdevs. The request is declarative ("match the base bdevs"),
+		 * so the truthful answer is success, making naive retries of
+		 * a failed expand chain safe. The core has already logged a
+		 * NOTICELOG; "resized": false marks the no-op for callers.
+		 */
+		rpc_bdev_ec_resize_send_result(req, false);
+		free_rpc_bdev_ec_resize(req);
+		return;
+	}
 	if (rc != 0) {
 		const char *errmsg;
 		switch (-rc) {
 		case ENODEV:   errmsg = "EC bdev not found";             break;
 		case EBUSY:    errmsg = "Another operation in progress"; break;
 		case EIO:      errmsg = "EC bdev is offline";            break;
-		case EALREADY: errmsg = "Base bdevs have not grown";     break;
 		case ENOMEM:   errmsg = "Out of memory";                 break;
 		default:       errmsg = spdk_strerror(-rc);              break;
 		}

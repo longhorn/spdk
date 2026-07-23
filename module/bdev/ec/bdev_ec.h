@@ -259,6 +259,10 @@ int ec_bdev_get_unmap_status(const char *ec_name,
  * count, and the dirty bitmap.
  *
  * Returns: 0, -ENODEV, -EBUSY, -EIO, -EALREADY, -ENOMEM
+ *
+ * -EALREADY means nothing to grow (base bdevs unchanged); it is returned
+ * before quiesce and is side-effect free. The RPC layer reports it as an
+ * idempotent no-op success with "resized": false.
  */
 int ec_bdev_resize(const char *ec_name,
 		   ec_resize_cb_fn cb_fn, void *cb_arg);
