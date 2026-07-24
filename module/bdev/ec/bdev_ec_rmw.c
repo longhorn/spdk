@@ -1009,39 +1009,12 @@ ec_rmw_submit_core(struct ec_bdev_io *ec_io,
 	mctx->cb_arg                 = cb_arg;
 
 	/*
-	 * Cross-chunk policy split by I/O type:
-	 *
-	 *   WRITE: SPDK's _bdev_rw_split aligns at optimal_io_boundary
-	 *     (= strip_size) and never lets a sub-stripe WRITE cross a
-	 *     strip boundary. If we see a multi-chunk WRITE here it means
-	 *     either SPDK regressed or some path bypassed the splitter.
-	 *     Fail loudly -- this is the production canary, not a defensive
-	 *     paper cut.
-	 *
-	 *   WRITE_ZEROES: SPDK's bdev_write_zeroes_split (lib/bdev/bdev.c)
-	 *     only caps size at max_write_zeroes and does NOT align to
-	 *     optimal_io_boundary, so a sub-stripe WRITE_ZEROES can
-	 *     legitimately straddle a strip boundary within one stripe.
-	 *     The overlay/encode steps already handle stripe-wide
-	 *     modifications; ec_rmw_submit_writes writes back every chunk
-	 *     in [modified_chunk_first, modified_chunk_last] alongside parity.
-	 *
-	 *   UNMAP head/tail zero-fill segment: same shape as WRITE_ZEROES,
-	 *     ec_submit_rmw_zero_fill_range sets is_zero_fill = true.
+	 * A sub-stripe request (WRITE, WRITE_ZEROES, or UNMAP zero-fill
+	 * segment) can span multiple chunks within one stripe. The overlay
+	 * step applies the payload across the packed data chunks and
+	 * ec_rmw_submit_writes writes back every chunk in
+	 * [modified_chunk_first, modified_chunk_last] alongside parity.
 	 */
-	if (mctx->modified_chunk_last != mctx->modified_chunk_first &&
-	    !is_zero_fill) {
-		SPDK_ERRLOG("EC bdev %s: RMW payload spans chunks %u..%u "
-			    "(stripe_off=%" PRIu64 " num_blocks=%" PRIu64 " strip_size=%" PRIu64 "); "
-			    "split_on_optimal_io_boundary violated\n",
-			    ec->bdev.name,
-			    mctx->modified_chunk_first,
-			    mctx->modified_chunk_last,
-			    mctx->stripe_off_blocks,
-			    num_blocks, ec->strip_size);
-		free(mctx);
-		return -EINVAL;
-	}
 
 	/* Allocate DMA buffers for all n slots (data + parity) */
 	for (disk = 0; disk < ec->n; disk++) {
