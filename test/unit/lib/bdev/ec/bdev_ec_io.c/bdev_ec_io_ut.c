@@ -267,6 +267,91 @@ test_fail_all(void)
 	CU_ASSERT(b.ec_io.status == SPDK_BDEV_IO_STATUS_ABORTED);
 }
 
+/* ---- ec_iov_slice ---- */
+
+/* Slice inside one iov: single output entry with adjusted base. */
+static void
+test_iov_slice_within_one(void)
+{
+	uint8_t      buf[64];
+	struct iovec in  = { .iov_base = buf, .iov_len = sizeof(buf) };
+	struct iovec out[2];
+	int          cnt = -1;
+
+	CU_ASSERT(ec_iov_slice(&in, 1, 16, 32, out, 2, &cnt) == 0);
+	CU_ASSERT(cnt == 1);
+	CU_ASSERT(out[0].iov_base == buf + 16);
+	CU_ASSERT(out[0].iov_len == 32);
+}
+
+/* Slice spanning two iovs: tail of the first, head of the second. */
+static void
+test_iov_slice_across_boundary(void)
+{
+	uint8_t      buf0[32], buf1[32];
+	struct iovec in[2] = {
+		{ .iov_base = buf0, .iov_len = sizeof(buf0) },
+		{ .iov_base = buf1, .iov_len = sizeof(buf1) },
+	};
+	struct iovec out[2];
+	int          cnt = -1;
+
+	CU_ASSERT(ec_iov_slice(in, 2, 24, 16, out, 2, &cnt) == 0);
+	CU_ASSERT(cnt == 2);
+	CU_ASSERT(out[0].iov_base == buf0 + 24);
+	CU_ASSERT(out[0].iov_len == 8);
+	CU_ASSERT(out[1].iov_base == buf1);
+	CU_ASSERT(out[1].iov_len == 8);
+}
+
+/* Full-range slice reproduces the input layout. */
+static void
+test_iov_slice_full_range(void)
+{
+	uint8_t      buf0[32], buf1[32];
+	struct iovec in[2] = {
+		{ .iov_base = buf0, .iov_len = sizeof(buf0) },
+		{ .iov_base = buf1, .iov_len = sizeof(buf1) },
+	};
+	struct iovec out[2];
+	int          cnt = -1;
+
+	CU_ASSERT(ec_iov_slice(in, 2, 0, 64, out, 2, &cnt) == 0);
+	CU_ASSERT(cnt == 2);
+	CU_ASSERT(out[0].iov_base == buf0);
+	CU_ASSERT(out[0].iov_len == 32);
+	CU_ASSERT(out[1].iov_base == buf1);
+	CU_ASSERT(out[1].iov_len == 32);
+}
+
+/* Range past the payload end fails. */
+static void
+test_iov_slice_out_of_range(void)
+{
+	uint8_t      buf[32];
+	struct iovec in  = { .iov_base = buf, .iov_len = sizeof(buf) };
+	struct iovec out[2];
+	int          cnt = -1;
+
+	CU_ASSERT(ec_iov_slice(&in, 1, 16, 32, out, 2, &cnt) == -EINVAL);
+	CU_ASSERT(ec_iov_slice(&in, 1, 32, 1, out, 2, &cnt) == -EINVAL);
+}
+
+/* Output array too small fails. */
+static void
+test_iov_slice_out_too_small(void)
+{
+	uint8_t      buf0[32], buf1[32];
+	struct iovec in[2] = {
+		{ .iov_base = buf0, .iov_len = sizeof(buf0) },
+		{ .iov_base = buf1, .iov_len = sizeof(buf1) },
+	};
+	struct iovec out[1];
+	int          cnt = -1;
+
+	CU_ASSERT(ec_iov_slice(in, 2, 24, 16, out, 1, &cnt) == -EINVAL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -284,6 +369,11 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_drain_skips_busy_stripe);
 	CU_ADD_TEST(suite, test_drain_nomem_completion);
 	CU_ADD_TEST(suite, test_fail_all);
+	CU_ADD_TEST(suite, test_iov_slice_within_one);
+	CU_ADD_TEST(suite, test_iov_slice_across_boundary);
+	CU_ADD_TEST(suite, test_iov_slice_full_range);
+	CU_ADD_TEST(suite, test_iov_slice_out_of_range);
+	CU_ADD_TEST(suite, test_iov_slice_out_too_small);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
