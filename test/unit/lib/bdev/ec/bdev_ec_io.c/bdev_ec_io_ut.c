@@ -27,10 +27,6 @@ DEFINE_STUB(spdk_get_thread, struct spdk_thread *, (void), NULL);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *bdev_io));
 DEFINE_STUB_V(spdk_bdev_io_complete, (struct spdk_bdev_io *bdev_io,
 				      enum spdk_bdev_io_status status));
-DEFINE_STUB(spdk_bdev_readv_blocks, int, (struct spdk_bdev_desc *desc,
-		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
-		uint64_t offset_blocks, uint64_t num_blocks,
-		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 DEFINE_STUB(spdk_bdev_writev_blocks, int, (struct spdk_bdev_desc *desc,
 		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
 		uint64_t offset_blocks, uint64_t num_blocks,
@@ -47,6 +43,35 @@ DEFINE_STUB(ec_wib_persist, int, (struct ec_bdev *ec,
 DEFINE_STUB(ec_submit_bit_clear_async, int, (struct ec_bdev *ec,
 		uint64_t stripe_index, void (*cb_fn)(void *cb_arg, int rc),
 		void *cb_arg), 0);
+
+/* Read stub: records each child read so fan-out layout can be checked. */
+#define UT_MAX_READS 8
+struct ut_read {
+	struct spdk_bdev_desc *desc;
+	struct iovec          *iov;
+	int                    iovcnt;
+	uint64_t               offset_blocks;
+	uint64_t               num_blocks;
+};
+static struct ut_read g_reads[UT_MAX_READS];
+static int            g_read_calls;
+static int            g_read_rc;
+
+int
+spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+		       struct iovec *iov, int iovcnt,
+		       uint64_t offset_blocks, uint64_t num_blocks,
+		       spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	if (g_read_calls < UT_MAX_READS) {
+		g_reads[g_read_calls] = (struct ut_read) {
+			.desc = desc, .iov = iov, .iovcnt = iovcnt,
+			.offset_blocks = offset_blocks, .num_blocks = num_blocks,
+		};
+	}
+	g_read_calls++;
+	return g_read_rc;
+}
 
 /* RMW stub: claims the stripe like the real path so FIFO gating is testable. */
 static int g_rmw_rc;
@@ -83,9 +108,15 @@ ut_reset(void)
 	g_stripe_dirty[0] = 0;
 	g_rmw_rc          = 0;
 	g_rmw_calls       = 0;
+	g_read_rc         = 0;
+	g_read_calls      = 0;
+	memset(g_reads, 0, sizeof(g_reads));
 
 	g_ec.bdev.name        = "ut_ec";
 	g_ec.bdev.ctxt        = &g_ec;
+	g_ec.bdev.blocklen    = 512;
+	g_ec.k                = 2;
+	g_ec.strip_size       = UT_STRIPE_BLOCKS / 2;
 	g_ec.stripe_blocks    = UT_STRIPE_BLOCKS;
 	g_ec.stripe_dirty_map = g_stripe_dirty;
 	TAILQ_INIT(&g_ec.stripe_waitq);
@@ -112,6 +143,34 @@ static void
 ut_clear_dirty_raw(uint64_t stripe_index)
 {
 	g_stripe_dirty[0] &= ~(1ULL << stripe_index);
+}
+
+/* One-buffer read fixture: parent payload in a single iovec. */
+static struct ec_io_channel g_chan;
+static char                 g_read_buf[UT_STRIPE_BLOCKS * 512];
+static struct iovec         g_read_iov;
+
+static void
+ut_read_init(struct ut_io *io, uint64_t offset_blocks, uint64_t num_blocks)
+{
+	uint32_t i;
+
+	for (i = 0; i < g_ec.k; i++) {
+		g_ec.descs[i] = (struct spdk_bdev_desc *)(uintptr_t)(0x100 + i);
+	}
+	g_read_iov = (struct iovec) {
+		.iov_base = g_read_buf,
+		.iov_len = num_blocks * g_ec.bdev.blocklen,
+	};
+
+	memset(io, 0, sizeof(*io));
+	io->bdev_io.bdev        = &g_ec.bdev;
+	io->ec_io.bdev_io       = &io->bdev_io;
+	io->ec_io.ch            = &g_chan;
+	io->ec_io.offset_blocks = offset_blocks;
+	io->ec_io.num_blocks    = num_blocks;
+	io->ec_io.iovs          = &g_read_iov;
+	io->ec_io.iovcnt        = 1;
 }
 
 /* Clean stripe: write dispatches straight to RMW, nothing parks. */
@@ -352,6 +411,75 @@ test_iov_slice_out_too_small(void)
 	CU_ASSERT(ec_iov_slice(in, 2, 24, 16, out, 1, &cnt) == -EINVAL);
 }
 
+/* Read within one strip: one direct read using the parent iovs. */
+static void
+test_read_single_strip_direct(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_read_init(&a, 2, 4);
+
+	CU_ASSERT(ec_submit_read(&a.ec_io) == 0);
+	CU_ASSERT(g_read_calls == 1);
+	CU_ASSERT(g_reads[0].desc == g_ec.descs[0]);
+	CU_ASSERT(g_reads[0].iov == &g_read_iov);
+	CU_ASSERT(g_reads[0].offset_blocks == 2);
+	CU_ASSERT(g_reads[0].num_blocks == 4);
+	CU_ASSERT(a.ec_io.base_io_remaining == 1);
+	CU_ASSERT(a.ec_io.data_iovs == NULL);
+}
+
+/* Read crossing a strip boundary: one child read per strip, payload
+ * sliced at the boundary. */
+static void
+test_read_fanout_two_strips(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_read_init(&a, 4, 8);	/* blocks 4-11: 4 in strip 0, 4 in strip 1 */
+
+	CU_ASSERT(ec_submit_read(&a.ec_io) == 0);
+	CU_ASSERT(g_read_calls == 2);
+	CU_ASSERT(a.ec_io.base_io_remaining == 2);
+	SPDK_CU_ASSERT_FATAL(a.ec_io.data_iovs != NULL);
+
+	CU_ASSERT(g_reads[0].desc == g_ec.descs[0]);
+	CU_ASSERT(g_reads[0].offset_blocks == 4);
+	CU_ASSERT(g_reads[0].num_blocks == 4);
+	CU_ASSERT(g_reads[0].iovcnt == 1);
+	CU_ASSERT(g_reads[0].iov[0].iov_base == g_read_buf);
+	CU_ASSERT(g_reads[0].iov[0].iov_len == 4 * 512);
+
+	CU_ASSERT(g_reads[1].desc == g_ec.descs[1]);
+	CU_ASSERT(g_reads[1].offset_blocks == 0);
+	CU_ASSERT(g_reads[1].num_blocks == 4);
+	CU_ASSERT(g_reads[1].iovcnt == 1);
+	CU_ASSERT(g_reads[1].iov[0].iov_base == g_read_buf + 4 * 512);
+	CU_ASSERT(g_reads[1].iov[0].iov_len == 4 * 512);
+
+	free(a.ec_io.data_iovs);
+	a.ec_io.data_iovs = NULL;
+}
+
+/* Fan-out where every child submit fails: caller gets an error and the
+ * slice array is released. */
+static void
+test_read_fanout_all_submits_fail(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_read_init(&a, 4, 8);
+	g_read_rc = -ENOMEM;
+
+	CU_ASSERT(ec_submit_read(&a.ec_io) == -EIO);
+	CU_ASSERT(g_read_calls == 2);
+	CU_ASSERT(a.ec_io.data_iovs == NULL);
+	CU_ASSERT(a.ec_io.status == SPDK_BDEV_IO_STATUS_FAILED);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -374,6 +502,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_iov_slice_full_range);
 	CU_ADD_TEST(suite, test_iov_slice_out_of_range);
 	CU_ADD_TEST(suite, test_iov_slice_out_too_small);
+	CU_ADD_TEST(suite, test_read_single_strip_direct);
+	CU_ADD_TEST(suite, test_read_fanout_two_strips);
+	CU_ADD_TEST(suite, test_read_fanout_all_submits_fail);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
