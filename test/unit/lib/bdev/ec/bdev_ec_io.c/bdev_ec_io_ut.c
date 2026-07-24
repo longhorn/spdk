@@ -480,6 +480,39 @@ test_read_fanout_all_submits_fail(void)
 	CU_ASSERT(a.ec_io.status == SPDK_BDEV_IO_STATUS_FAILED);
 }
 
+/* Degraded array, but every chunk the read touches is readable: routes
+ * to the plain read path, no reconstruction. */
+static void
+test_degraded_read_readable_chunks_direct(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_read_init(&a, 2, 4);	/* chunk 0 only */
+	g_ec.failed_count    = 1;
+	g_ec.base_states[1]  = EC_BASE_STATE_FAILED;
+
+	CU_ASSERT(ec_submit_read(&a.ec_io) == 0);
+	CU_ASSERT(g_read_calls == 1);
+	CU_ASSERT(g_reads[0].desc == g_ec.descs[0]);
+	CU_ASSERT(g_reads[0].num_blocks == 4);
+}
+
+/* Sub-stripe write crossing a strip boundary: still one RMW dispatch. */
+static void
+test_write_cross_strip_routes_rmw(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_io_init(&a, 0);
+	a.ec_io.offset_blocks = 4;
+	a.ec_io.num_blocks    = 8;	/* strips 0 and 1, not a full stripe */
+
+	CU_ASSERT(ec_submit_write(&a.ec_io) == 0);
+	CU_ASSERT(g_rmw_calls == 1);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -505,6 +538,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_read_single_strip_direct);
 	CU_ADD_TEST(suite, test_read_fanout_two_strips);
 	CU_ADD_TEST(suite, test_read_fanout_all_submits_fail);
+	CU_ADD_TEST(suite, test_degraded_read_readable_chunks_direct);
+	CU_ADD_TEST(suite, test_write_cross_strip_routes_rmw);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

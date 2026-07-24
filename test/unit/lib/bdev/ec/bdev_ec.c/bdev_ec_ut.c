@@ -253,6 +253,13 @@ test_compute_geometry_basic(void)
 	CU_ASSERT(ec.stripe_blocks == stripe_blocks);
 
 	/*
+	 * The splitter boundary must be the full stripe so a stripe-sized
+	 * aligned write reaches the full-stripe path unsplit.
+	 */
+	CU_ASSERT(ec.bdev.optimal_io_boundary == stripe_blocks);
+	CU_ASSERT(ec.bdev.split_on_optimal_io_boundary == true);
+
+	/*
 	 * Bitmap, commit record, and WIB are all at the front.
 	 * data_offset_stripes = bitmap_reservation + commit strips + 2 (WIB
 	 * copy 0 + copy 1). No tail reservation.
