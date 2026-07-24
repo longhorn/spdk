@@ -34,9 +34,7 @@
 
 struct ec_degraded_read_ctx {
 	struct ec_bdev_io  *ec_io;
-	uint32_t            target_chunk;
 	uint64_t            chunk_blocks;
-	uint64_t            chunk_offset;
 	uint8_t            *chunk_bufs[EC_MAX_BASE_BDEVS];
 	struct iovec        chunk_iovs[EC_MAX_BASE_BDEVS];
 	uint32_t            reads_remaining;
@@ -681,48 +679,91 @@ ec_reconstruct_missing_chunk(const struct ec_bdev *ec,
 static void
 ec_degraded_read_complete(struct ec_degraded_read_ctx *dctx)
 {
-	struct ec_bdev_io *ec_io      = dctx->ec_io;
-	struct ec_bdev    *ec         = ec_from_bdev_io(ec_io->bdev_io);
-	uint32_t           target     = dctx->target_chunk;
-	uint64_t           chunk_bytes = dctx->chunk_blocks * ec->bdev.blocklen;
-	uint64_t           offset_bytes, copy_bytes;
+	struct ec_bdev_io *ec_io       = dctx->ec_io;
+	struct ec_bdev    *ec          = ec_from_bdev_io(ec_io->bdev_io);
+	uint32_t           blocklen    = ec->bdev.blocklen;
+	uint64_t           chunk_bytes = dctx->chunk_blocks * blocklen;
+	uint64_t           offset, remaining, done_bytes;
+	struct iovec      *dst_iovs;
 	int                rc;
 
 	if (dctx->status != SPDK_BDEV_IO_STATUS_SUCCESS) {
-		SPDK_ERRLOG("EC bdev %s: degraded read child I/O failed "
-			    "for chunk %u\n", ec->bdev.name, target);
+		SPDK_ERRLOG("EC bdev %s: degraded read child I/O failed\n",
+			    ec->bdev.name);
 		ec_free_degraded_read_ctx(dctx, ec);
 		spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
-	if (!ec_slot_is_readable(ec, target) && target < ec->k) {
-		rc = ec_reconstruct_missing_chunk(ec, dctx, target);
+	dst_iovs = calloc(ec_io->iovcnt, sizeof(struct iovec));
+	if (!dst_iovs) {
+		SPDK_ERRLOG("EC bdev %s: OOM for degraded read copy iovs\n",
+			    ec->bdev.name);
+		ec_free_degraded_read_ctx(dctx, ec);
+		spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	/*
+	 * Walk the read strip by strip: reconstruct each unreadable data
+	 * chunk the read touches, then copy its slice into the caller's
+	 * buffers.
+	 */
+	done_bytes = 0;
+	offset     = ec_io->offset_blocks;
+	remaining  = ec_io->num_blocks;
+	while (remaining > 0) {
+		uint64_t stripe_index, chunk_offset, base_lba;
+		uint32_t chunk_idx;
+		uint64_t seg;
+		uint64_t seg_bytes;
+		int      dst_cnt = 0;
+
+		ec_calc_mapping(ec, offset, &stripe_index, &chunk_idx,
+				&chunk_offset, &base_lba);
+		seg       = spdk_min(ec->strip_size - chunk_offset, remaining);
+		seg_bytes = seg * blocklen;
+
+		assert(chunk_offset * blocklen + seg_bytes <= chunk_bytes);
+
+		if (!ec_slot_is_readable(ec, chunk_idx)) {
+			rc = ec_reconstruct_missing_chunk(ec, dctx, chunk_idx);
+			if (rc != 0) {
+				SPDK_ERRLOG("EC bdev %s: reconstruction failed "
+					    "for chunk %u\n",
+					    ec->bdev.name, chunk_idx);
+				free(dst_iovs);
+				ec_free_degraded_read_ctx(dctx, ec);
+				spdk_bdev_io_complete(ec_io->bdev_io,
+						      SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
+		}
+
+		rc = ec_iov_slice(ec_io->iovs, ec_io->iovcnt,
+				  done_bytes, seg_bytes,
+				  dst_iovs, ec_io->iovcnt, &dst_cnt);
 		if (rc != 0) {
-			SPDK_ERRLOG("EC bdev %s: reconstruction failed for "
-				    "chunk %u\n", ec->bdev.name, target);
+			SPDK_ERRLOG("EC bdev %s: payload shorter than read "
+				    "range\n", ec->bdev.name);
+			free(dst_iovs);
 			ec_free_degraded_read_ctx(dctx, ec);
-			spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			spdk_bdev_io_complete(ec_io->bdev_io,
+					      SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
+
+		spdk_copy_buf_to_iovs(dst_iovs, dst_cnt,
+			(uint8_t *)dctx->chunk_bufs[chunk_idx] +
+			chunk_offset * blocklen,
+			seg_bytes);
+
+		done_bytes += seg_bytes;
+		offset     += seg;
+		remaining  -= seg;
 	}
 
-	offset_bytes = dctx->chunk_offset * ec->bdev.blocklen;
-	copy_bytes   = ec_io->num_blocks  * ec->bdev.blocklen;
-
-	if (offset_bytes + copy_bytes > chunk_bytes) {
-		SPDK_ERRLOG("EC bdev %s: copy range [%" PRIu64 "+%" PRIu64 "] exceeds "
-			    "chunk size %" PRIu64 "\n",
-			    ec->bdev.name, offset_bytes, copy_bytes, chunk_bytes);
-		ec_free_degraded_read_ctx(dctx, ec);
-		spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
-	}
-
-	spdk_copy_buf_to_iovs(ec_io->iovs, ec_io->iovcnt,
-		(uint8_t *)dctx->chunk_bufs[target] + offset_bytes,
-		copy_bytes);
-
+	free(dst_iovs);
 	ec_free_degraded_read_ctx(dctx, ec);
 	spdk_bdev_io_complete(ec_io->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 }
@@ -886,39 +927,43 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev              *ec = ec_from_bdev_io(ec_io->bdev_io);
 	uint64_t                     stripe_index, chunk_offset, base_lba;
-	uint32_t                     chunk_idx;
+	uint32_t                     chunk_idx, last_chunk, c;
 	struct ec_degraded_read_ctx *dctx;
 	uint64_t                     chunk_bytes;
 	uint32_t                     disk, reads_submitted;
 	uint64_t                     disk_lba;
+	bool                         all_readable = true;
 	int                          rc;
 
 	ec_calc_mapping(ec, ec_io->offset_blocks, &stripe_index, &chunk_idx,
 			&chunk_offset, &base_lba);
 
-	/* Case A: target chunk is readable -> direct read */
-	if (ec_slot_is_readable(ec, chunk_idx)) {
-		return ec_submit_direct_read(ec_io, chunk_idx, base_lba);
-	}
-
-	/* Case C: targeting a failed parity slot -- logic error */
-	if (chunk_idx >= ec->k) {
-		SPDK_ERRLOG("EC bdev %s: read targeting failed parity slot %u\n",
-			    ec->bdev.name, chunk_idx);
+	last_chunk = (uint32_t)((ec_io->offset_blocks % ec->stripe_blocks +
+				 ec_io->num_blocks - 1) / ec->strip_size);
+	if (last_chunk >= ec->k) {
+		SPDK_ERRLOG("EC bdev %s: read maps past the data chunks "
+			    "(chunk %u >= k=%u)\n",
+			    ec->bdev.name, last_chunk, ec->k);
 		return -EINVAL;
 	}
 
+	for (c = chunk_idx; c <= last_chunk; c++) {
+		if (!ec_slot_is_readable(ec, c)) {
+			all_readable = false;
+			break;
+		}
+	}
+
+	/* Every chunk the read touches is readable -> plain read path */
+	if (all_readable) {
+		return ec_submit_healthy_read(ec_io);
+	}
+
 	/*
-	 * Case B: target data chunk is unavailable -> ISA-L reconstruction.
-	 *
-	 * This path handles up to m simultaneous disk failures
-	 * (any combination of data and parity). We only need to reconstruct
-	 * the ONE target chunk -- we do not need to reconstruct the other failed
-	 * data slots. ec_reconstruct_data_chunk picks k readable rows from the
-	 * encode_matrix (which includes parity rows), inverts the kxk submatrix,
-	 * and extracts the decode vector for the target slot. The MDS property
-	 * of Reed-Solomon guarantees this inversion succeeds as long as at least
-	 * k readable disks remain (i.e. failed_count <= m <= n-k).
+	 * Reconstruction path: at least one data chunk the read touches is
+	 * unavailable. Read one strip from k readable disks, then decode the
+	 * missing chunks. Works for up to m failures (any mix of data and
+	 * parity).
 	 *
 	 * Dirty-region guard: if the target stripe's WIB region is still dirty
 	 * (either because the startup scrub is running and has not yet cleared
@@ -965,23 +1010,16 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 	}
 
 	dctx->ec_io        = ec_io;
-	dctx->target_chunk = chunk_idx;
-	dctx->chunk_offset = chunk_offset;
 	dctx->status       = SPDK_BDEV_IO_STATUS_SUCCESS;
 	dctx->chunk_blocks = ec->strip_size;
 	disk_lba           = ec_stripe_base_lba(ec, stripe_index);
 	chunk_bytes        = dctx->chunk_blocks * ec->bdev.blocklen;
 
 	/*
-	 * Allocate a buffer for every slot. Only the first k readable slots
-	 * (read sources) plus the target slot (reconstruction output / result
-	 * copied to the caller) are actually used, so m-1 buffers are over-
-	 * allocated per degraded read. Trimming them is deliberately not done:
-	 * it would interleave allocation with the first-k-readable selection in
-	 * the read loop below and hinge on the target-readable-beyond-k edge
-	 * case, adding failure-path complexity to save a page-aligned buffer in
-	 * degraded mode only. The simple allocate-all is obviously correct;
-	 * revisit with degraded-read test coverage if it ever matters.
+	 * Allocate a buffer for every slot. Only the k read sources and the
+	 * reconstructed slots are used; the rest are over-allocated. Kept
+	 * simple on purpose -- trimming would complicate the failure paths
+	 * to save a buffer in degraded mode only.
 	 */
 	for (disk = 0; disk < ec->n; disk++) {
 		dctx->chunk_bufs[disk] = spdk_dma_zmalloc(chunk_bytes,
