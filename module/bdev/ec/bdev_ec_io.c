@@ -767,6 +767,120 @@ ec_submit_direct_read(struct ec_bdev_io *ec_io, uint32_t chunk_idx, uint64_t bas
 		ec_child_io_complete, ec_io);
 }
 
+/*
+ * Read spanning more than one strip: split per strip and fan the payload
+ * slices out to the base bdevs. All slots the read touches must be
+ * readable; the caller checks that. Slice iovecs live in ec_io->data_iovs,
+ * freed by ec_io_release_state on completion.
+ */
+static int
+ec_submit_direct_read_fanout(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	uint32_t        blocklen = ec->bdev.blocklen;
+	uint64_t        offset, remaining, done_bytes;
+	uint32_t        nseg, iov_used, submitted;
+	int             iov_cap, rc;
+
+	nseg = 0;
+	offset = ec_io->offset_blocks;
+	remaining = ec_io->num_blocks;
+	while (remaining > 0) {
+		uint64_t seg = spdk_min(ec->strip_size - (offset % ec->strip_size),
+					remaining);
+
+		nseg++;
+		offset += seg;
+		remaining -= seg;
+	}
+
+	/* Each segment boundary can split one parent iov in two. */
+	iov_cap = ec_io->iovcnt + (int)nseg;
+	ec_io->data_iovs = calloc(iov_cap, sizeof(struct iovec));
+	if (!ec_io->data_iovs) {
+		return -ENOMEM;
+	}
+
+	ec_io->base_io_remaining = nseg;
+	ec_io->status = SPDK_BDEV_IO_STATUS_SUCCESS;
+
+	iov_used = 0;
+	submitted = 0;
+	done_bytes = 0;
+	offset = ec_io->offset_blocks;
+	remaining = ec_io->num_blocks;
+	while (remaining > 0) {
+		uint64_t stripe_index, chunk_offset, base_lba;
+		uint32_t chunk_idx;
+		uint64_t seg = spdk_min(ec->strip_size - (offset % ec->strip_size),
+					remaining);
+		struct iovec *seg_iovs = &ec_io->data_iovs[iov_used];
+		int           seg_iovcnt = 0;
+
+		ec_calc_mapping(ec, offset, &stripe_index, &chunk_idx,
+				&chunk_offset, &base_lba);
+
+		rc = ec_iov_slice(ec_io->iovs, ec_io->iovcnt,
+				  done_bytes, seg * blocklen,
+				  seg_iovs, iov_cap - (int)iov_used,
+				  &seg_iovcnt);
+		if (rc == 0) {
+			rc = spdk_bdev_readv_blocks(ec->descs[chunk_idx],
+				ec_io->ch->base_chans[chunk_idx],
+				seg_iovs, seg_iovcnt,
+				base_lba, seg,
+				ec_child_io_complete, ec_io);
+		}
+		if (rc != 0) {
+			uint64_t failures;
+
+			if (ec_slot_failure_should_log(ec, chunk_idx, &failures)) {
+				SPDK_ERRLOG("EC bdev %s: read fan-out submit failed "
+					    "(rc=%d %s) for slot %u at stripe %" PRIu64
+					    " (%" PRIu64 " failures on slot)\n",
+					    ec->bdev.name, rc, spdk_strerror(-rc),
+					    chunk_idx, stripe_index, failures);
+			}
+			ec_io->base_io_remaining--;
+			ec_io->status = SPDK_BDEV_IO_STATUS_FAILED;
+		} else {
+			iov_used += seg_iovcnt;
+			submitted++;
+		}
+
+		done_bytes += seg * blocklen;
+		offset += seg;
+		remaining -= seg;
+	}
+
+	if (submitted == 0) {
+		free(ec_io->data_iovs);
+		ec_io->data_iovs = NULL;
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * Healthy or parity-only-failed read: single strip goes straight to one
+ * base bdev, wider reads fan out per strip.
+ */
+static int
+ec_submit_healthy_read(struct ec_bdev_io *ec_io)
+{
+	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
+	uint64_t        stripe_index, chunk_offset, base_lba;
+	uint32_t        chunk_idx;
+
+	ec_calc_mapping(ec, ec_io->offset_blocks, &stripe_index, &chunk_idx,
+			&chunk_offset, &base_lba);
+
+	if (chunk_offset + ec_io->num_blocks <= ec->strip_size) {
+		return ec_submit_direct_read(ec_io, chunk_idx, base_lba);
+	}
+	return ec_submit_direct_read_fanout(ec_io);
+}
+
 static int
 ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 {
@@ -928,8 +1042,7 @@ int
 ec_submit_read(struct ec_bdev_io *ec_io)
 {
 	struct ec_bdev *ec = ec_from_bdev_io(ec_io->bdev_io);
-	uint64_t        stripe_index, chunk_offset, base_lba;
-	uint32_t        chunk_idx;
+	uint64_t        stripe_index;
 
 	/*
 	 * Dispatch invariant: reads use ec_io->ch->base_chans[], which are
@@ -983,9 +1096,7 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 
 	/* Parity-only failure -- all data disks healthy, direct read */
 	if (ec_only_parity_failed(ec)) {
-		ec_calc_mapping(ec, ec_io->offset_blocks, &stripe_index, &chunk_idx,
-				&chunk_offset, &base_lba);
-		return ec_submit_direct_read(ec_io, chunk_idx, base_lba);
+		return ec_submit_healthy_read(ec_io);
 	}
 
 	/* Data disk failed or REPLACING -- degraded read */
@@ -994,9 +1105,7 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 	}
 
 	/* Fast path: all disks healthy */
-	ec_calc_mapping(ec, ec_io->offset_blocks, &stripe_index, &chunk_idx,
-			&chunk_offset, &base_lba);
-	return ec_submit_direct_read(ec_io, chunk_idx, base_lba);
+	return ec_submit_healthy_read(ec_io);
 }
 
 /* =========================================================================
