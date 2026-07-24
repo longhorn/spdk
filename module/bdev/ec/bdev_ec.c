@@ -792,13 +792,15 @@ ec_compute_geometry(struct ec_bdev *ec)
 
 	/*
 	 * write_unit_size=1: allows sub-stripe writes (RMW path).
-	 * optimal_io_boundary=strip_size: SPDK splits cross-strip writes.
+	 * optimal_io_boundary=stripe_blocks: SPDK splits I/O at stripe
+	 * boundaries, so a stripe-sized aligned write arrives whole and can
+	 * take the full-stripe path instead of per-strip RMW.
 	 * max_write_zeroes=0: WRITE_ZEROES is left unset so the bdev layer
 	 * auto-emulates it as a buffer-backed WRITE that respects
 	 * optimal_io_boundary. See ec_io_type_supported for the full rationale.
 	 */
 	ec->bdev.write_unit_size              = 1;
-	ec->bdev.optimal_io_boundary          = ec->strip_size;
+	ec->bdev.optimal_io_boundary          = (uint32_t)ec->stripe_blocks;
 	ec->bdev.split_on_write_unit          = false;
 	ec->bdev.split_on_optimal_io_boundary = true;
 

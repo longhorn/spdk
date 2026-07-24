@@ -540,10 +540,8 @@ ec_rmw_persist_and_dispatch(struct ec_rmw_ctx *mctx, bool was_clean)
  * fan out unconditionally.
  *
  * Only the modified data chunks in [modified_chunk_first, modified_chunk_last]
- * are written back. For ordinary WRITE this is always a single chunk
- * (enforced by ec_submit_rmw_write's canary). For WRITE_ZEROES the range
- * can span multiple chunks within one stripe; the overlay step has already
- * filled the entire range with zeros.
+ * are written back. The range can span multiple chunks within one stripe;
+ * the overlay step has already applied the payload across them.
  *
  * All m writable parity chunks are always written (recomputed from all k
  * data chunks).
@@ -592,11 +590,9 @@ ec_rmw_submit_writes(struct ec_rmw_ctx *mctx)
 	mctx->writes_remaining = writable_count;
 
 	/*
-	 * Write every modified data chunk in the range. For a single-chunk
-	 * RMW (the common case for ordinary WRITE) the loop iterates once;
-	 * for a multi-chunk WRITE_ZEROES that straddles a strip boundary it
-	 * iterates over the affected chunks. All writes target the same
-	 * disk_lba on their respective base bdev -- they share one stripe.
+	 * Write every modified data chunk in the range. All writes target
+	 * the same disk_lba on their respective base bdev -- they share one
+	 * stripe.
 	 */
 	for (i = mctx->modified_chunk_first; i <= mctx->modified_chunk_last; i++) {
 		if (!ec_slot_is_writable(ec, i)) {

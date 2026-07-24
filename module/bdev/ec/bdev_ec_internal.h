@@ -1088,16 +1088,9 @@ struct ec_rmw_ctx {
 	 * Inclusive range of data chunks modified by this RMW (0..k-1).
 	 * Derived at context creation from stripe_off_blocks and num_blocks.
 	 *
-	 * For ordinary WRITE this range is always one chunk -- SPDK's WRITE
-	 * splitter is boundary-aware (split_on_optimal_io_boundary) and
-	 * never lets a sub-stripe WRITE cross a strip boundary. The
-	 * defensive check in ec_submit_rmw_write enforces that.
-	 *
-	 * For WRITE_ZEROES the range can span multiple chunks within one
-	 * stripe, because SPDK's WRITE_ZEROES splitter (bdev_write_zeroes_split
-	 * in lib/bdev/bdev.c) only caps size at max_write_zeroes and does
-	 * not align to optimal_io_boundary. Handled in ec_rmw_submit_writes
-	 * by writing back every chunk in [modified_chunk_first,
+	 * Any sub-stripe request (WRITE, WRITE_ZEROES, UNMAP zero-fill) can
+	 * span multiple chunks within one stripe. ec_rmw_submit_writes
+	 * writes back every chunk in [modified_chunk_first,
 	 * modified_chunk_last] alongside the parity chunks.
 	 */
 	uint32_t                 modified_chunk_first;

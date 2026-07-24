@@ -1092,10 +1092,10 @@ ec_submit_read(struct ec_bdev_io *ec_io)
 
 	/*
 	 * Unmapped-bitmap consultation. The EC bdev publishes
-	 * optimal_io_boundary = strip_size with split_on_optimal_io_boundary,
-	 * so every read arrives here within a single strip (and therefore
-	 * within a single stripe). Computing stripe_index from offset_blocks
-	 * alone is sufficient -- no per-stripe split needed.
+	 * optimal_io_boundary = stripe_blocks with
+	 * split_on_optimal_io_boundary, so every read arrives here within a
+	 * single stripe. Computing stripe_index from offset_blocks alone is
+	 * sufficient -- no per-stripe split needed.
 	 *
 	 * If the target stripe is marked unmapped, the read returns zeros
 	 * directly from the caller's iovs without touching any base bdev.
@@ -1474,8 +1474,8 @@ ec_submit_full_write(struct ec_bdev_io *ec_io)
 	 *
 	 * ec_submit_write only routes here when num_blocks is a non-zero
 	 * multiple of stripe_blocks and the offset is stripe-aligned. With
-	 * optimal_io_boundary = strip_size and split_on_optimal_io_boundary,
-	 * the upper layer never sends a write larger than one strip, so
+	 * optimal_io_boundary = stripe_blocks and split_on_optimal_io_boundary,
+	 * the upper layer never sends a write larger than one stripe, so
 	 * num_blocks == stripe_blocks is the only realistic case today.
 	 *
 	 * If that invariant is ever violated (e.g. a raw bdev caller bypasses
@@ -2080,11 +2080,10 @@ ec_submit_write_dispatch(struct ec_bdev_io *ec_io)
 	 * with no partial leading or trailing data.
 	 *
 	 * write_unit_size=1 means any size/offset is legal. With
-	 * split_on_optimal_io_boundary=true (boundary = strip_size) the
-	 * upper layer splits on strip boundaries, so in practice
-	 * num_blocks <= strip_size always. A write of exactly stripe_blocks
-	 * at a stripe-aligned offset is the only case that reaches here as a
-	 * full stripe; all other cases go to RMW.
+	 * split_on_optimal_io_boundary=true (boundary = stripe_blocks) the
+	 * upper layer splits on stripe boundaries, so a stripe-aligned
+	 * stripe-sized write arrives whole and takes this path; partial
+	 * stripes go to RMW.
 	 *
 	 * We keep the condition general (multiple of stripe_blocks, aligned)
 	 * in case the caller issues a larger aligned write without splitting.
