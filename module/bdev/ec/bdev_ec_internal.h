@@ -2166,6 +2166,17 @@ int  ec_submit_read(struct ec_bdev_io *ec_io);
 int  ec_submit_write(struct ec_bdev_io *ec_io);
 
 /*
+ * Build a zero-copy iovec view of the byte range [offset_bytes,
+ * offset_bytes + len_bytes) inside iovs. Writes at most max_out entries
+ * to out_iovs and stores the count in *out_cnt. Returns -EINVAL if the
+ * range exceeds the payload or out_iovs is too small. Defined in
+ * bdev_ec_io.c.
+ */
+int ec_iov_slice(const struct iovec *iovs, int iovcnt,
+		 uint64_t offset_bytes, uint64_t len_bytes,
+		 struct iovec *out_iovs, int max_out, int *out_cnt);
+
+/*
  * Native UNMAP entry point. Defined in bdev_ec_unmap.c. UNMAP is
  * unconditionally advertised by ec_io_type_supported because
  * correctness is internal to bdev_ec (the in-band unmapped bitmap

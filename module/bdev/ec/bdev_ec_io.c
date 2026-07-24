@@ -47,6 +47,48 @@ struct ec_degraded_read_ctx {
  * I/O buffer helpers
  * ========================================================================= */
 
+/*
+ * Build a zero-copy iovec view of the byte range [offset_bytes,
+ * offset_bytes + len_bytes) inside iovs. The multi-strip fan-out paths use
+ * this to hand each base bdev its slice of the parent payload without a
+ * bounce copy.
+ */
+int
+ec_iov_slice(const struct iovec *iovs, int iovcnt,
+	     uint64_t offset_bytes, uint64_t len_bytes,
+	     struct iovec *out_iovs, int max_out, int *out_cnt)
+{
+	int      i, cnt = 0;
+	uint64_t skip = offset_bytes;
+	uint64_t left = len_bytes;
+
+	for (i = 0; i < iovcnt && left > 0; i++) {
+		uint64_t iov_len = iovs[i].iov_len;
+		uint64_t take;
+
+		if (skip >= iov_len) {
+			skip -= iov_len;
+			continue;
+		}
+
+		take = spdk_min(iov_len - skip, left);
+		if (cnt >= max_out) {
+			return -EINVAL;
+		}
+		out_iovs[cnt].iov_base = (uint8_t *)iovs[i].iov_base + skip;
+		out_iovs[cnt].iov_len  = take;
+		cnt++;
+		skip  = 0;
+		left -= take;
+	}
+
+	if (left > 0) {
+		return -EINVAL;
+	}
+	*out_cnt = cnt;
+	return 0;
+}
+
 /* Forward declaration; defined near the full-stripe write path. */
 static void ec_io_release_state(struct ec_bdev_io *ec_io, struct ec_bdev *ec);
 
