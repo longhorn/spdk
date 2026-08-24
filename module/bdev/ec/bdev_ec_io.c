@@ -1927,6 +1927,7 @@ ec_stripe_waitq_contains(struct ec_bdev *ec, uint64_t stripe_index)
 static void
 ec_stripe_waitq_park(struct ec_bdev *ec, struct ec_bdev_io *ec_io)
 {
+	uint64_t stripe_idx = ec_io->offset_blocks / ec->stripe_blocks;
 	uint32_t depth;
 
 	assert(spdk_get_thread() == ec->home_thread);
@@ -1937,6 +1938,19 @@ ec_stripe_waitq_park(struct ec_bdev *ec, struct ec_bdev_io *ec_io)
 	ec->stripe_waitq_parked++;
 	if (depth > ec->stripe_waitq_max_depth) {
 		ec->stripe_waitq_max_depth = depth;
+	}
+
+	/*
+	 * The releasing write may have cleared this stripe between the
+	 * busy check in ec_submit_write and the insert above, reading the
+	 * old depth and skipping its kick. Re-check the stripe now that
+	 * the new depth is published and kick the drain if the stripe is
+	 * clean. The fence pairs with the one in ec_stripe_clear_dirty; a
+	 * double kick is harmless (longhorn/longhorn#13789).
+	 */
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (!ec_stripe_is_dirty(ec, stripe_idx)) {
+		ec_stripe_waitq_kick(ec);
 	}
 }
 
@@ -1981,7 +1995,8 @@ ec_stripe_waitq_drain_on_home(void *ctx)
 /*
  * Schedule a drain on the home thread. Safe from any thread; always a
  * send_msg so a release inside a completion path never re-enters the
- * dispatch inline.
+ * dispatch inline. If the send fails, the failure flag makes the WIB
+ * idle poller run the drain instead.
  */
 void
 ec_stripe_waitq_kick(struct ec_bdev *ec)
@@ -1990,11 +2005,34 @@ ec_stripe_waitq_kick(struct ec_bdev *ec)
 				      ec_stripe_waitq_drain_on_home, ec);
 
 	if (rc != 0) {
+		__atomic_store_n(&ec->stripe_waitq_kick_failed, true,
+				 __ATOMIC_RELEASE);
 		SPDK_ERRLOG("EC bdev %s: cannot schedule stripe waitq drain "
-			    "(rc=%d %s); parked writes wait for the next "
-			    "release\n",
+			    "(rc=%d %s); the WIB idle poller will retry\n",
 			    ec->bdev.name, rc, spdk_strerror(-rc));
 	}
+}
+
+/*
+ * Recover a failed kick. Runs from the WIB idle poller on the home
+ * thread, so the drain runs directly and the retry itself cannot fail.
+ */
+void
+ec_stripe_waitq_retry_kick(struct ec_bdev *ec)
+{
+	assert(spdk_get_thread() == ec->home_thread);
+
+	/*
+	 * Exchange, not load-then-store: a failure that lands between a
+	 * separate load and store would be erased and its parked write
+	 * missed. One that lands after the exchange leaves the flag set
+	 * for the next tick.
+	 */
+	if (spdk_likely(!__atomic_exchange_n(&ec->stripe_waitq_kick_failed,
+					     false, __ATOMIC_ACQUIRE))) {
+		return;
+	}
+	ec_stripe_waitq_drain_on_home(ec);
 }
 
 /* Complete every parked write with the given status. */

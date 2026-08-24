@@ -413,6 +413,9 @@ ec_wib_idle_poller_cb(void *arg)
 	uint32_t        region;
 	bool            any_cleared = false;
 
+	/* Recover stripe-waitq drain kicks whose send_msg failed. */
+	ec_stripe_waitq_retry_kick(ec);
+
 	/*
 	 * No resize interlock is required. Resize never touches wib_buf
 	 * (it's geometry-invariant -- one strip on every geometry), so a
