@@ -15,6 +15,9 @@
  * Tests the stripe-conflict wait queue: writes park when their stripe is
  * busy or earlier writes for it are parked, drain in FIFO order per stripe
  * when the stripe is released, and fail as a group on reset/destruct.
+ * The drain kick is covered from both callers: the release kicks when
+ * writes are parked, and the park recheck kicks when the release came
+ * first and saw an empty queue (longhorn/longhorn#13789).
  *
  * spdk_get_thread and home_thread are both NULL, so every routing check
  * takes the inline home-thread path. ec_submit_rmw_write is stubbed and
@@ -31,8 +34,6 @@ DEFINE_STUB(spdk_bdev_writev_blocks, int, (struct spdk_bdev_desc *desc,
 		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
 		uint64_t offset_blocks, uint64_t num_blocks,
 		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
-DEFINE_STUB(spdk_thread_send_msg, int, (const struct spdk_thread *thread,
-		spdk_msg_fn fn, void *ctx), 0);
 DEFINE_STUB(spdk_thread_get_name, const char *, (const struct spdk_thread *thread), "ut");
 DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), "ut_base");
 DEFINE_STUB(spdk_bdev_io_get_thread, struct spdk_thread *, (struct spdk_bdev_io *bdev_io), NULL);
@@ -73,6 +74,21 @@ spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 	return g_read_rc;
 }
 
+/* send_msg stub: records the call so tests can check a drain was scheduled. */
+static int         g_send_msg_calls;
+static int         g_send_msg_rc;
+static spdk_msg_fn g_send_msg_fn;
+static void       *g_send_msg_ctx;
+
+int
+spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx)
+{
+	g_send_msg_calls++;
+	g_send_msg_fn = fn;
+	g_send_msg_ctx = ctx;
+	return g_send_msg_rc;
+}
+
 /* RMW stub: claims the stripe like the real path so FIFO gating is testable. */
 static int g_rmw_rc;
 static int g_rmw_calls;
@@ -110,6 +126,10 @@ ut_reset(void)
 	g_rmw_calls       = 0;
 	g_read_rc         = 0;
 	g_read_calls      = 0;
+	g_send_msg_calls  = 0;
+	g_send_msg_rc     = 0;
+	g_send_msg_fn     = NULL;
+	g_send_msg_ctx    = NULL;
 	memset(g_reads, 0, sizeof(g_reads));
 
 	g_ec.bdev.name        = "ut_ec";
@@ -233,6 +253,103 @@ test_write_parks_behind_parked_same_stripe(void)
 	CU_ASSERT(g_rmw_calls == 1);
 	CU_ASSERT(g_ec.stripe_waitq_depth == 2);
 	CU_ASSERT(g_ec.stripe_waitq_max_depth == 2);
+}
+
+/*
+ * Regression for the lost wakeup (longhorn/longhorn#13789): the write saw
+ * the stripe busy, the release then cleared it while the queue depth was
+ * still zero and skipped its kick, and the write parked. The park recheck
+ * must see the clean stripe and schedule the drain itself.
+ */
+static void
+test_park_clean_stripe_schedules_drain(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_io_init(&a, 0);
+
+	ut_mark_dirty(0);
+	ut_clear_dirty_raw(0);
+
+	ec_stripe_waitq_park(&g_ec, &a.ec_io);
+	CU_ASSERT(g_ec.stripe_waitq_depth == 1);
+	CU_ASSERT(TAILQ_FIRST(&g_ec.stripe_waitq) == &a.ec_io);
+	CU_ASSERT(g_send_msg_calls == 1);
+	CU_ASSERT(g_send_msg_fn == ec_stripe_waitq_drain_on_home);
+	CU_ASSERT(g_send_msg_ctx == &g_ec);
+}
+
+/* Park with the stripe still busy: no drain scheduled, the release side
+ * kicks later. */
+static void
+test_park_busy_stripe_no_drain(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_io_init(&a, 0);
+	ut_mark_dirty(0);
+
+	ec_stripe_waitq_park(&g_ec, &a.ec_io);
+	CU_ASSERT(g_ec.stripe_waitq_depth == 1);
+	CU_ASSERT(g_send_msg_calls == 0);
+}
+
+/* Release side: clearing the stripe schedules a drain only when writes
+ * are parked. */
+static void
+test_release_schedules_drain_when_parked(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_io_init(&a, 0);
+
+	ut_mark_dirty(0);
+	ec_stripe_clear_dirty(&g_ec, 0);
+	CU_ASSERT(g_send_msg_calls == 0);
+
+	ut_mark_dirty(0);
+	CU_ASSERT(ec_submit_write(&a.ec_io) == 0);
+	ec_stripe_clear_dirty(&g_ec, 0);
+	CU_ASSERT(g_send_msg_calls == 1);
+	CU_ASSERT(g_send_msg_fn == ec_stripe_waitq_drain_on_home);
+	CU_ASSERT(g_send_msg_ctx == &g_ec);
+}
+
+/*
+ * A kick whose send_msg fails must not strand the parked write: the
+ * failure sets stripe_waitq_kick_failed, and ec_stripe_waitq_retry_kick
+ * (called from the WIB idle poller) runs the drain directly.
+ */
+static void
+test_kick_failure_recovered_by_retry(void)
+{
+	struct ut_io a;
+
+	ut_reset();
+	ut_io_init(&a, 0);
+
+	ut_mark_dirty(0);
+	ut_clear_dirty_raw(0);
+
+	g_send_msg_rc = -ENOMEM;
+	ec_stripe_waitq_park(&g_ec, &a.ec_io);
+	CU_ASSERT(g_send_msg_calls == 1);
+	CU_ASSERT(g_ec.stripe_waitq_depth == 1);
+	CU_ASSERT(g_ec.stripe_waitq_kick_failed == true);
+	CU_ASSERT(g_rmw_calls == 0);
+
+	ec_stripe_waitq_retry_kick(&g_ec);
+	CU_ASSERT(g_ec.stripe_waitq_kick_failed == false);
+	CU_ASSERT(g_rmw_calls == 1);
+	CU_ASSERT(g_ec.stripe_waitq_depth == 0);
+	CU_ASSERT(TAILQ_EMPTY(&g_ec.stripe_waitq));
+
+	/* No failure recorded: the retry is a no-op. */
+	ec_stripe_waitq_retry_kick(&g_ec);
+	CU_ASSERT(g_rmw_calls == 1);
 }
 
 /*
@@ -526,6 +643,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_write_clean_stripe_dispatches);
 	CU_ADD_TEST(suite, test_write_busy_stripe_parks);
 	CU_ADD_TEST(suite, test_write_parks_behind_parked_same_stripe);
+	CU_ADD_TEST(suite, test_park_clean_stripe_schedules_drain);
+	CU_ADD_TEST(suite, test_park_busy_stripe_no_drain);
+	CU_ADD_TEST(suite, test_release_schedules_drain_when_parked);
+	CU_ADD_TEST(suite, test_kick_failure_recovered_by_retry);
 	CU_ADD_TEST(suite, test_drain_resumes_fifo);
 	CU_ADD_TEST(suite, test_drain_skips_busy_stripe);
 	CU_ADD_TEST(suite, test_drain_nomem_completion);
