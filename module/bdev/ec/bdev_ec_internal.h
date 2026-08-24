@@ -699,9 +699,15 @@ struct ec_bdev {
 	 *
 	 * stripe_waitq_depth mirrors the queue length. Written on home;
 	 * read atomically by ec_stripe_clear_dirty on submitter threads.
+	 *
+	 * stripe_waitq_kick_failed is set when a kick cannot schedule its
+	 * drain message; the WIB idle poller then runs the drain through
+	 * ec_stripe_waitq_retry_kick. Written from any thread, cleared on
+	 * home.
 	 */
 	TAILQ_HEAD(, ec_bdev_io) stripe_waitq;
 	uint32_t                 stripe_waitq_depth;
+	bool                     stripe_waitq_kick_failed;
 
 	/*
 	 * In-band unmapped bitmap -- see the bitmap section earlier in this
@@ -1304,10 +1310,13 @@ ec_only_parity_failed(const struct ec_bdev *ec)
 
 /*
  * Stripe-conflict wait queue (bdev_ec_io.c). kick schedules a home-thread
- * drain of ec->stripe_waitq; fail_all completes every parked write with
- * the given status (home-thread only).
+ * drain of ec->stripe_waitq; retry_kick runs the drain for a kick whose
+ * message could not be scheduled (called from the WIB idle poller);
+ * fail_all completes every parked write with the given status
+ * (home-thread only).
  */
 void ec_stripe_waitq_kick(struct ec_bdev *ec);
+void ec_stripe_waitq_retry_kick(struct ec_bdev *ec);
 void ec_stripe_waitq_fail_all(struct ec_bdev *ec,
 			      enum spdk_bdev_io_status status);
 
@@ -1341,10 +1350,16 @@ ec_stripe_clear_dirty(struct ec_bdev *ec, uint64_t stripe_index)
 			   __ATOMIC_RELAXED);
 
 	/*
-	 * A release may unblock parked writes. Depth is read atomically
-	 * because clears also run on submitter threads.
+	 * A release may unblock parked writes. The fence orders the bit
+	 * clear before the depth read and pairs with the fence in
+	 * ec_stripe_waitq_park, so when a clear races with a park at
+	 * least one side sees the other and kicks the drain. Without it
+	 * both sides can miss and the parked write hangs forever
+	 * (longhorn/longhorn#13789).
 	 */
-	if (__atomic_load_n(&ec->stripe_waitq_depth, __ATOMIC_ACQUIRE) != 0) {
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	if (__atomic_load_n(&ec->stripe_waitq_depth, __ATOMIC_RELAXED) != 0) {
 		ec_stripe_waitq_kick(ec);
 	}
 }

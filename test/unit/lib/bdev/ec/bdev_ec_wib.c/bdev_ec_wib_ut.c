@@ -46,6 +46,7 @@ DEFINE_STUB_V(ec_drain_deferred_slot_releases, (struct ec_bdev *ec));
 DEFINE_STUB_V(ec_drain_deferred_unregister, (struct ec_bdev *ec));
 DEFINE_STUB_V(ec_rmw_complete, (struct ec_rmw_ctx *mctx));
 DEFINE_STUB_V(ec_rmw_dispatch_reads, (struct ec_rmw_ctx *mctx));
+DEFINE_STUB_V(ec_stripe_waitq_retry_kick, (struct ec_bdev *ec));
 
 /* ---- Fixture ---- */
 #define UT_WIB_BLOCKLEN 512u
