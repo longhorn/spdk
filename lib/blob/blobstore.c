@@ -4079,6 +4079,7 @@ spdk_bs_opts_init(struct spdk_bs_opts *opts, size_t opts_size)
 	SET_FIELD(force_recover, false);
 	SET_FIELD(esnap_bs_dev_create, NULL);
 	SET_FIELD(esnap_ctx, NULL);
+	SET_FIELD(recovery_qd, 16);
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -4128,6 +4129,7 @@ struct spdk_bs_load_ctx {
 	spdk_blob_id				blobid;
 
 	bool					force_recover;
+	uint32_t				recovery_qd;
 
 	/* These fields are used in the spdk_bs_dump path. */
 	bool					dumping;
@@ -4190,6 +4192,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	ctx->iter_cb_fn = opts->iter_cb_fn;
 	ctx->iter_cb_arg = opts->iter_cb_arg;
 	ctx->force_recover = opts->force_recover;
+	ctx->recovery_qd = opts->recovery_qd;
 
 	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
 				  SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
@@ -4728,12 +4731,25 @@ bs_load_read_used_pages(struct spdk_bs_load_ctx *ctx)
 			     bs_load_used_pages_cpl, ctx);
 }
 
+#ifdef SPDK_UNIT_TEST
+static uint32_t g_bs_recovery_parse_page_fail_after;
+static int g_bs_recovery_parse_page_fail_rc = -EINVAL;
+static uint32_t g_bs_recovery_batched_fallback_count;
+#endif
+
 static int
 bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_page *page)
 {
 	struct spdk_blob_store *bs = ctx->bs;
 	struct spdk_blob_md_descriptor *desc;
 	size_t	cur_desc = 0;
+
+#ifdef SPDK_UNIT_TEST
+	if (g_bs_recovery_parse_page_fail_after != 0 &&
+	    --g_bs_recovery_parse_page_fail_after == 0) {
+		return g_bs_recovery_parse_page_fail_rc;
+	}
+#endif
 
 	desc = (struct spdk_blob_md_descriptor *)page->descriptors;
 	while (cur_desc < sizeof(page->descriptors)) {
@@ -5151,6 +5167,1133 @@ bs_load_replay_md(struct spdk_bs_load_ctx *ctx)
 	bs_load_replay_cur_md_page(ctx);
 }
 
+/* Batched dirty recovery keeps replayed pages local until the serial commit phase. */
+struct bs_recovery_chain {
+	uint32_t			current_page;
+	uint32_t			*page_nums;
+	struct spdk_blob_md_page	*pages;
+	uint32_t			page_count;
+	uint32_t			page_cap;
+	bool			done;
+	bool			active;
+};
+
+struct bs_recovery_replay_slot {
+	uint32_t	chain_idx;
+	uint32_t	page_num;
+};
+
+struct bs_recovery_scan_slot {
+	uint32_t	start_page;
+	uint32_t	page_count;
+};
+
+struct bs_recovery_summary_slot {
+	uint32_t	chain_idx;
+	uint32_t	page_idx;
+	uint32_t	page_count;
+};
+
+struct bs_recovery_page_summary {
+	spdk_blob_id	id;
+	uint32_t	sequence_num;
+	uint32_t	next;
+	bool		valid;
+};
+
+/* Number of contiguous metadata pages to read per scan I/O. */
+#define BS_RECOVERY_SCAN_CHUNK_PAGES			256
+/* Initial root-page list capacity; grows as needed for blobstores with more blobs. */
+#define BS_RECOVERY_ROOT_PAGES_INITIAL_CAP		64
+/* Initial per-chain page capacity; most blob metadata chains are short. */
+#define BS_RECOVERY_CHAIN_PAGES_INITIAL_CAP		4
+
+struct bs_recovery_batched_ctx {
+	struct spdk_bs_load_ctx		*load_ctx;
+	uint32_t			scan_qd;
+	uint32_t			scan_pages_per_io;
+	uint32_t			replay_qd;
+
+	struct spdk_blob_md_page	*scan_pages;
+	struct bs_recovery_scan_slot *scan_slots;
+	struct bs_recovery_page_summary *page_summaries;
+	uint32_t			scan_io_count;
+	uint32_t			next_scan_page;
+	uint32_t			scan_retry_slot;
+	uint32_t			scan_retry_page_offset;
+
+	uint32_t			*root_pages;
+	uint32_t			root_count;
+	uint32_t			root_cap;
+
+	struct bs_recovery_chain	*chains;
+	uint32_t			chain_count;
+	uint32_t			next_chain_idx;
+	uint32_t			active_chains;
+
+	struct spdk_blob_md_page	*replay_pages;
+	struct bs_recovery_replay_slot *replay_slots;
+	uint32_t			replay_count;
+	struct bs_recovery_summary_slot *summary_slots;
+	uint32_t			summary_replay_chain_idx;
+	uint32_t			summary_replay_page_idx;
+	uint32_t			summary_replay_count;
+
+	uint32_t			commit_idx;
+};
+
+static void bs_recovery_batched_fallback(struct bs_recovery_batched_ctx *bctx,
+		const char *reason);
+static void bs_recovery_commit_next_chain(struct bs_recovery_batched_ctx *bctx);
+static void bs_recovery_scan_submit(struct bs_recovery_batched_ctx *bctx);
+static void bs_recovery_start_replay(struct bs_recovery_batched_ctx *bctx);
+
+static uint32_t
+bs_recovery_qd(uint32_t configured_qd, uint32_t item_count)
+{
+	assert(item_count > 0);
+
+	return spdk_min(configured_qd, item_count);
+}
+
+static void
+bs_recovery_batched_free(struct bs_recovery_batched_ctx *bctx)
+{
+	uint32_t i;
+
+	if (bctx == NULL) {
+		return;
+	}
+
+	if (bctx->chains != NULL) {
+		for (i = 0; i < bctx->chain_count; i++) {
+			free(bctx->chains[i].page_nums);
+			free(bctx->chains[i].pages);
+		}
+	}
+
+	free(bctx->chains);
+	free(bctx->root_pages);
+	free(bctx->page_summaries);
+	spdk_free(bctx->scan_pages);
+	free(bctx->scan_slots);
+	spdk_free(bctx->replay_pages);
+	free(bctx->replay_slots);
+	free(bctx->summary_slots);
+	free(bctx);
+}
+
+static struct spdk_blob_md_page *
+bs_recovery_page_at(void *pages, struct spdk_bs_load_ctx *ctx, uint32_t index)
+{
+	return (struct spdk_blob_md_page *)((uintptr_t)pages + (uint64_t)index * ctx->bs->md_page_size);
+}
+
+static bool
+bs_recovery_pages_size_valid(uint64_t page_count, uint32_t md_page_size)
+{
+	return md_page_size != 0 && page_count <= SIZE_MAX / md_page_size;
+}
+
+static bool
+bs_recovery_array_size_valid(uint32_t count, size_t elem_size)
+{
+	return elem_size != 0 && count <= SIZE_MAX / elem_size;
+}
+
+static bool
+bs_recovery_root_page_valid(struct spdk_blob_md_page *page, uint32_t page_num)
+{
+	uint32_t crc;
+
+	crc = blob_md_page_calc_crc(page);
+	if (crc != page->crc) {
+		return false;
+	}
+
+	if (page->sequence_num != 0) {
+		return false;
+	}
+
+	if (page->id != bs_page_to_blobid(page_num)) {
+		return false;
+	}
+
+	return bs_load_cur_extent_page_valid(page) == false;
+}
+
+static bool
+bs_recovery_chain_page_valid(struct bs_recovery_chain *chain, struct spdk_blob_md_page *page,
+			     uint32_t page_num)
+{
+	uint32_t crc;
+
+	crc = blob_md_page_calc_crc(page);
+	if (crc != page->crc) {
+		return false;
+	}
+
+	if (bs_load_cur_extent_page_valid(page)) {
+		return false;
+	}
+
+	if (page->sequence_num != chain->page_count) {
+		return false;
+	}
+
+	if (chain->page_count == 0 && page->id != bs_page_to_blobid(page_num)) {
+		return false;
+	}
+
+	if (chain->page_count != 0 && page->id != chain->pages[0].id) {
+		return false;
+	}
+
+	return true;
+}
+
+static int
+bs_recovery_add_root(struct bs_recovery_batched_ctx *bctx, uint32_t root_page)
+{
+	void *tmp;
+
+	if (bctx->root_count == bctx->root_cap) {
+		uint32_t new_cap;
+
+		if (bctx->root_cap > UINT32_MAX / 2) {
+			return -ENOMEM;
+		}
+		new_cap = bctx->root_cap == 0 ? BS_RECOVERY_ROOT_PAGES_INITIAL_CAP :
+			  bctx->root_cap * 2;
+		if (!bs_recovery_array_size_valid(new_cap, sizeof(*bctx->root_pages))) {
+			return -ENOMEM;
+		}
+
+		tmp = realloc(bctx->root_pages, new_cap * sizeof(*bctx->root_pages));
+		if (tmp == NULL) {
+			return -ENOMEM;
+		}
+		bctx->root_pages = tmp;
+		bctx->root_cap = new_cap;
+	}
+
+	bctx->root_pages[bctx->root_count++] = root_page;
+	return 0;
+}
+
+static int
+bs_recovery_chain_append_page(struct bs_recovery_chain *chain, struct spdk_blob_md_page *page,
+			      uint32_t page_num)
+{
+	uint32_t *new_page_nums;
+	struct spdk_blob_md_page *new_pages;
+
+	if (chain->page_count == chain->page_cap) {
+		uint32_t new_cap;
+
+		if (chain->page_cap > UINT32_MAX / 2) {
+			return -ENOMEM;
+		}
+		new_cap = chain->page_cap == 0 ? BS_RECOVERY_CHAIN_PAGES_INITIAL_CAP :
+			  chain->page_cap * 2;
+		if (!bs_recovery_array_size_valid(new_cap, sizeof(*chain->page_nums)) ||
+		    !bs_recovery_array_size_valid(new_cap, sizeof(*chain->pages))) {
+			return -ENOMEM;
+		}
+
+		new_page_nums = malloc(new_cap * sizeof(*new_page_nums));
+		if (new_page_nums == NULL) {
+			return -ENOMEM;
+		}
+
+		new_pages = malloc(new_cap * sizeof(*new_pages));
+		if (new_pages == NULL) {
+			free(new_page_nums);
+			return -ENOMEM;
+		}
+
+		if (chain->page_count != 0) {
+			memcpy(new_page_nums, chain->page_nums, chain->page_count * sizeof(*chain->page_nums));
+			memcpy(new_pages, chain->pages, chain->page_count * sizeof(*chain->pages));
+		}
+		free(chain->page_nums);
+		free(chain->pages);
+		chain->page_nums = new_page_nums;
+		chain->pages = new_pages;
+		chain->page_cap = new_cap;
+	}
+
+	chain->page_nums[chain->page_count] = page_num;
+	memcpy(&chain->pages[chain->page_count], page, sizeof(*page));
+	chain->page_count++;
+	return 0;
+}
+
+static void
+bs_recovery_batched_fallback(struct bs_recovery_batched_ctx *bctx, const char *reason)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+
+	SPDK_WARNLOG("Falling back to serial blobstore recovery: %s\n", reason);
+
+#ifdef SPDK_UNIT_TEST
+	g_bs_recovery_batched_fallback_count++;
+#endif
+
+	/* Batched recovery may have partially populated masks. Reset them before serial replay. */
+	spdk_bit_array_clear_mask(ctx->bs->used_md_pages);
+	spdk_bit_array_clear_mask(ctx->bs->used_blobids);
+	spdk_bit_array_clear_mask(ctx->used_clusters);
+	ctx->bs->num_free_clusters = ctx->bs->total_clusters;
+	ctx->num_extent_pages = 0;
+	free(ctx->extent_page_num);
+	ctx->extent_page_num = NULL;
+	spdk_free(ctx->extent_pages);
+	ctx->extent_pages = NULL;
+
+	bs_recovery_batched_free(bctx);
+	bs_load_replay_md(ctx);
+}
+
+static bool
+bs_recovery_scan_record_root(struct bs_recovery_batched_ctx *bctx,
+			     struct spdk_blob_md_page *page, uint32_t page_num)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	uint32_t crc;
+
+	crc = blob_md_page_calc_crc(page);
+	if (bctx->page_summaries != NULL && crc == page->crc &&
+	    !bs_load_cur_extent_page_valid(page)) {
+		bctx->page_summaries[page_num].id = page->id;
+		bctx->page_summaries[page_num].sequence_num = page->sequence_num;
+		bctx->page_summaries[page_num].next = page->next;
+		bctx->page_summaries[page_num].valid = true;
+	}
+
+	if (bs_recovery_root_page_valid(page, page_num)) {
+		if (bctx->root_count >= ctx->super->md_len) {
+			bs_recovery_batched_fallback(bctx, "excessive root pages detected");
+			return false;
+		}
+		if (bs_recovery_add_root(bctx, page_num) != 0) {
+			bs_recovery_batched_fallback(bctx, "failed to record root page");
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void
+bs_recovery_scan_continue(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+
+	if (bctx->next_scan_page >= ctx->super->md_len) {
+		SPDK_NOTICELOG("Batched blobstore recovery discovered %" PRIu32 " root pages\n",
+			       bctx->root_count);
+		bs_recovery_start_replay(bctx);
+		return;
+	}
+
+	bs_recovery_scan_submit(bctx);
+}
+
+static void
+bs_recovery_finish(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	uint64_t num_md_clusters;
+	uint64_t i;
+
+	/* Claim clusters backing the metadata region after all blob extents are replayed. */
+	num_md_clusters = spdk_divide_round_up(ctx->super->md_start + ctx->super->md_len,
+					      ctx->bs->pages_per_cluster);
+	for (i = 0; i < num_md_clusters; i++) {
+		if (spdk_bit_array_get(ctx->used_clusters, i)) {
+			bs_recovery_batched_fallback(bctx, "metadata cluster already claimed");
+			return;
+		}
+		spdk_bit_array_set(ctx->used_clusters, i);
+		if (ctx->bs->num_free_clusters == 0) {
+			bs_recovery_batched_fallback(bctx, "metadata cluster accounting underflow");
+			return;
+		}
+		ctx->bs->num_free_clusters--;
+	}
+
+	SPDK_NOTICELOG("Batched blobstore recovery completed: roots=%" PRIu32 "\n",
+		       bctx->root_count);
+	bs_recovery_batched_free(bctx);
+	bs_load_write_used_md(ctx);
+}
+
+static void
+bs_recovery_commit_extent_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_recovery_batched_ctx *bctx = cb_arg;
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	uint32_t page_num;
+	uint64_t i;
+
+	if (bserrno != 0) {
+		bs_recovery_batched_fallback(bctx, "extent page read failed");
+		return;
+	}
+
+	for (i = 0; i < ctx->num_extent_pages; i++) {
+		if (!bs_load_cur_extent_page_valid(&ctx->extent_pages[i])) {
+			bs_recovery_batched_fallback(bctx, "invalid extent page");
+			return;
+		}
+
+		page_num = ctx->extent_page_num[i];
+		if (page_num >= ctx->super->md_len ||
+		    spdk_bit_array_get(ctx->bs->used_md_pages, page_num)) {
+			bs_recovery_batched_fallback(bctx, "duplicate extent page");
+			return;
+		}
+		spdk_bit_array_set(ctx->bs->used_md_pages, page_num);
+		if (bs_load_replay_md_parse_page(ctx, &ctx->extent_pages[i])) {
+			bs_recovery_batched_fallback(bctx, "failed to parse extent page");
+			return;
+		}
+	}
+
+	spdk_free(ctx->extent_pages);
+	ctx->extent_pages = NULL;
+	free(ctx->extent_page_num);
+	ctx->extent_page_num = NULL;
+	ctx->num_extent_pages = 0;
+
+	bctx->commit_idx++;
+	bs_recovery_commit_next_chain(bctx);
+}
+
+static void
+bs_recovery_read_extent_pages(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	spdk_bs_batch_t *batch;
+	uint64_t i, lba;
+	uint32_t page;
+
+	for (i = 0; i < ctx->num_extent_pages; i++) {
+		page = ctx->extent_page_num[i];
+		if (page >= ctx->super->md_len) {
+			bs_recovery_batched_fallback(bctx, "extent page out of range");
+			return;
+		}
+	}
+
+	if (!bs_recovery_pages_size_valid(ctx->num_extent_pages, ctx->super->md_page_size)) {
+		bs_recovery_batched_fallback(bctx, "extent page buffer size overflow");
+		return;
+	}
+
+	ctx->extent_pages = spdk_zmalloc(ctx->super->md_page_size * ctx->num_extent_pages, 0,
+					NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+	if (ctx->extent_pages == NULL) {
+		bs_recovery_batched_fallback(bctx, "failed to allocate extent page buffer");
+		return;
+	}
+
+	batch = bs_sequence_to_batch(ctx->seq, bs_recovery_commit_extent_pages_cpl, bctx);
+	for (i = 0; i < ctx->num_extent_pages; i++) {
+		page = ctx->extent_page_num[i];
+		lba = bs_md_page_to_lba(ctx->bs, page);
+		bs_batch_read_dev(batch, bs_recovery_page_at(ctx->extent_pages, ctx, i), lba,
+				  bs_byte_to_lba(ctx->bs, ctx->super->md_page_size));
+	}
+	bs_batch_close(batch);
+}
+
+static void
+bs_recovery_commit_next_chain(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	struct bs_recovery_chain *chain;
+	uint32_t i, page_num, blob_page;
+
+	/* Commit is serial so global masks are updated in the same order as legacy recovery. */
+	while (bctx->commit_idx < bctx->chain_count) {
+		chain = &bctx->chains[bctx->commit_idx];
+		if (chain->page_count == 0) {
+			bctx->commit_idx++;
+			continue;
+		}
+
+		blob_page = bs_blobid_to_page(chain->pages[0].id);
+		if (blob_page >= ctx->super->md_len ||
+		    spdk_bit_array_get(ctx->bs->used_blobids, blob_page)) {
+			bs_recovery_batched_fallback(bctx, "duplicate blobid");
+			return;
+		}
+
+		for (i = 0; i < chain->page_count; i++) {
+			page_num = chain->page_nums[i];
+			if (page_num >= ctx->super->md_len ||
+			    spdk_bit_array_get(ctx->bs->used_md_pages, page_num)) {
+				bs_recovery_batched_fallback(bctx, "duplicate metadata page");
+				return;
+			}
+		}
+
+		spdk_spin_lock(&ctx->bs->used_lock);
+		for (i = 0; i < chain->page_count; i++) {
+			bs_claim_md_page(ctx->bs, chain->page_nums[i]);
+		}
+		spdk_spin_unlock(&ctx->bs->used_lock);
+		SPDK_NOTICELOG("Recover: blob 0x%" PRIx32 "\n", blob_page);
+		spdk_bit_array_set(ctx->bs->used_blobids, blob_page);
+
+		for (i = 0; i < chain->page_count; i++) {
+			if (bs_load_replay_md_parse_page(ctx, &chain->pages[i])) {
+				bs_recovery_batched_fallback(bctx, "failed to parse metadata chain");
+				return;
+			}
+		}
+
+		if (ctx->num_extent_pages != 0) {
+			bs_recovery_read_extent_pages(bctx);
+			return;
+		}
+
+		bctx->commit_idx++;
+	}
+
+	bs_recovery_finish(bctx);
+}
+
+static void
+bs_recovery_replay_submit(struct bs_recovery_batched_ctx *bctx);
+
+static void
+bs_recovery_chain_reset(struct bs_recovery_chain *chain)
+{
+	free(chain->page_nums);
+	free(chain->pages);
+	memset(chain, 0, sizeof(*chain));
+}
+
+static int
+bs_recovery_chain_append_page_num(struct bs_recovery_chain *chain, uint32_t page_num)
+{
+	uint32_t *new_page_nums;
+	uint32_t new_cap;
+
+	if (chain->page_count == chain->page_cap) {
+		if (chain->page_cap > UINT32_MAX / 2) {
+			return -ENOMEM;
+		}
+		new_cap = chain->page_cap == 0 ? BS_RECOVERY_CHAIN_PAGES_INITIAL_CAP :
+			  chain->page_cap * 2;
+		if (!bs_recovery_array_size_valid(new_cap, sizeof(*chain->page_nums))) {
+			return -ENOMEM;
+		}
+
+		new_page_nums = realloc(chain->page_nums, new_cap * sizeof(*new_page_nums));
+		if (new_page_nums == NULL) {
+			return -ENOMEM;
+		}
+		chain->page_nums = new_page_nums;
+		chain->page_cap = new_cap;
+	}
+
+	chain->page_nums[chain->page_count++] = page_num;
+	return 0;
+}
+
+static bool
+bs_recovery_build_chain_from_summary(struct bs_recovery_batched_ctx *bctx,
+				     struct bs_recovery_chain *chain, uint32_t root_page)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	struct bs_recovery_page_summary *summary;
+	spdk_blob_id root_id = SPDK_BLOBID_INVALID;
+	uint32_t page_num, sequence_num;
+
+	page_num = root_page;
+	sequence_num = 0;
+	while (page_num != SPDK_INVALID_MD_PAGE) {
+		if (page_num >= ctx->super->md_len || sequence_num >= ctx->super->md_len) {
+			return false;
+		}
+
+		summary = &bctx->page_summaries[page_num];
+		if (!summary->valid || summary->sequence_num != sequence_num) {
+			return false;
+		}
+
+		if (sequence_num == 0) {
+			if (summary->id != bs_page_to_blobid(page_num)) {
+				return false;
+			}
+			root_id = summary->id;
+		} else if (summary->id != root_id) {
+			return false;
+		}
+
+		if (bs_recovery_chain_append_page_num(chain, page_num) != 0) {
+			return false;
+		}
+
+		if (summary->next != SPDK_INVALID_MD_PAGE && summary->next >= ctx->super->md_len) {
+			return false;
+		}
+		page_num = summary->next;
+		sequence_num++;
+	}
+
+	if (chain->page_count == 0 ||
+	    !bs_recovery_pages_size_valid(chain->page_count, ctx->super->md_page_size)) {
+		return false;
+	}
+
+	chain->pages = calloc(chain->page_count, sizeof(*chain->pages));
+	if (chain->pages == NULL) {
+		return false;
+	}
+
+	return true;
+}
+
+static void
+bs_recovery_reset_chains_for_standard_replay(struct bs_recovery_batched_ctx *bctx)
+{
+	uint32_t i;
+
+	for (i = 0; i < bctx->chain_count; i++) {
+		bs_recovery_chain_reset(&bctx->chains[i]);
+		bctx->chains[i].current_page = bctx->root_pages[i];
+	}
+
+	bctx->next_chain_idx = 0;
+	bctx->active_chains = 0;
+	bctx->replay_count = 0;
+}
+
+static void
+bs_recovery_start_standard_replay(struct bs_recovery_batched_ctx *bctx)
+{
+	bctx->replay_qd = bs_recovery_qd(bctx->load_ctx->recovery_qd,
+					 bctx->chain_count);
+	SPDK_NOTICELOG("Batched blobstore recovery starting replay: chains=%" PRIu32
+		       " qd=%" PRIu32 "\n", bctx->chain_count, bctx->replay_qd);
+
+	if (!bs_recovery_pages_size_valid(bctx->replay_qd, bctx->load_ctx->super->md_page_size)) {
+		bs_recovery_batched_fallback(bctx, "replay buffer size overflow");
+		return;
+	}
+
+	bctx->replay_pages = spdk_zmalloc((uint64_t)bctx->replay_qd * bctx->load_ctx->super->md_page_size,
+					 0, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+	bctx->replay_slots = calloc(bctx->replay_qd, sizeof(*bctx->replay_slots));
+	if (bctx->replay_pages == NULL || bctx->replay_slots == NULL) {
+		bs_recovery_batched_fallback(bctx, "failed to allocate replay buffers");
+		return;
+	}
+
+	bs_recovery_replay_submit(bctx);
+}
+
+static bool
+bs_recovery_summary_page_valid(struct bs_recovery_chain *chain, struct spdk_blob_md_page *page,
+			       uint32_t page_idx)
+{
+	uint32_t page_num, next_page;
+	uint32_t crc;
+
+	page_num = chain->page_nums[page_idx];
+	crc = blob_md_page_calc_crc(page);
+	if (crc != page->crc || bs_load_cur_extent_page_valid(page)) {
+		return false;
+	}
+
+	if (page->sequence_num != page_idx) {
+		return false;
+	}
+
+	if (page_idx == 0) {
+		if (page->id != bs_page_to_blobid(page_num)) {
+			return false;
+		}
+	} else if (page->id != chain->pages[0].id) {
+		return false;
+	}
+
+	next_page = page_idx + 1 < chain->page_count ? chain->page_nums[page_idx + 1] :
+		    SPDK_INVALID_MD_PAGE;
+	return page->next == next_page;
+}
+
+static void bs_recovery_summary_replay_submit(struct bs_recovery_batched_ctx *bctx);
+
+static void
+bs_recovery_summary_replay_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_recovery_batched_ctx *bctx = cb_arg;
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	struct bs_recovery_chain *chain;
+	struct bs_recovery_summary_slot *slot;
+	struct spdk_blob_md_page *page;
+	uint32_t i, j, page_idx;
+
+	if (bserrno != 0) {
+		/* Summary replay has already committed to a summary-derived page list.
+		 * Runtime failure means the hint no longer matches what was read from disk,
+		 * so fall back to the legacy replay instead of adding another partial
+		 * batched replay reset path.
+		 */
+		bs_recovery_batched_fallback(bctx, "summary replay read failed");
+		return;
+	}
+
+	for (i = 0; i < bctx->summary_replay_count; i++) {
+		slot = &bctx->summary_slots[i];
+		chain = &bctx->chains[slot->chain_idx];
+		for (j = 0; j < slot->page_count; j++) {
+			page_idx = slot->page_idx + j;
+			page = bs_recovery_page_at(bctx->scan_pages, ctx,
+						   i * bctx->scan_pages_per_io + j);
+			if (!bs_recovery_summary_page_valid(chain, page, page_idx)) {
+				/* The summary is only a hint. Once the actual page read does not
+				 * validate against the summary-derived chain, use legacy recovery.
+				 */
+				bs_recovery_batched_fallback(bctx, "invalid summary replay page");
+				return;
+			}
+			memcpy(&chain->pages[page_idx], page, sizeof(*page));
+		}
+	}
+
+	bs_recovery_summary_replay_submit(bctx);
+}
+
+static void
+bs_recovery_summary_replay_submit(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	struct bs_recovery_chain *chain;
+	spdk_bs_batch_t *batch;
+	uint32_t page_idx, page_count, start_page;
+	uint64_t lba, byte_count;
+
+	while (bctx->summary_replay_chain_idx < bctx->chain_count) {
+		chain = &bctx->chains[bctx->summary_replay_chain_idx];
+		if (bctx->summary_replay_page_idx < chain->page_count) {
+			break;
+		}
+		bctx->summary_replay_chain_idx++;
+		bctx->summary_replay_page_idx = 0;
+	}
+
+	if (bctx->summary_replay_chain_idx >= bctx->chain_count) {
+		SPDK_NOTICELOG("Batched blobstore recovery summary replay completed: chains=%" PRIu32 "\n",
+			       bctx->chain_count);
+		bctx->commit_idx = 0;
+		bs_recovery_commit_next_chain(bctx);
+		return;
+	}
+
+	bctx->summary_replay_count = 0;
+	batch = bs_sequence_to_batch(ctx->seq, bs_recovery_summary_replay_cpl, bctx);
+	while (bctx->summary_replay_count < bctx->scan_qd &&
+	       bctx->summary_replay_chain_idx < bctx->chain_count) {
+		chain = &bctx->chains[bctx->summary_replay_chain_idx];
+		if (bctx->summary_replay_page_idx >= chain->page_count) {
+			bctx->summary_replay_chain_idx++;
+			bctx->summary_replay_page_idx = 0;
+			continue;
+		}
+
+		page_idx = bctx->summary_replay_page_idx;
+		start_page = chain->page_nums[page_idx];
+		page_count = 1;
+		while (page_idx + page_count < chain->page_count &&
+		       page_count < bctx->scan_pages_per_io &&
+		       chain->page_nums[page_idx + page_count] == start_page + page_count) {
+			page_count++;
+		}
+
+		bctx->summary_slots[bctx->summary_replay_count].chain_idx =
+			bctx->summary_replay_chain_idx;
+		bctx->summary_slots[bctx->summary_replay_count].page_idx = page_idx;
+		bctx->summary_slots[bctx->summary_replay_count].page_count = page_count;
+
+		lba = bs_md_page_to_lba(ctx->bs, start_page);
+		byte_count = (uint64_t)page_count * ctx->super->md_page_size;
+		/* Use fixed-size per-slot buffers. This may waste memory for 1-page ranges,
+		 * but keeps completion bookkeeping simple and bounded by the scan buffer size.
+		 */
+		bs_batch_read_dev(batch,
+				  bs_recovery_page_at(bctx->scan_pages, ctx,
+						      bctx->summary_replay_count *
+						      bctx->scan_pages_per_io),
+				  lba, bs_byte_to_lba(ctx->bs, byte_count));
+		bctx->summary_replay_page_idx += page_count;
+		bctx->summary_replay_count++;
+	}
+	assert(bctx->summary_replay_count > 0);
+
+	bs_batch_close(batch);
+}
+
+static bool
+bs_recovery_try_summary_replay(struct bs_recovery_batched_ctx *bctx)
+{
+	uint32_t i;
+
+	if (bctx->page_summaries == NULL) {
+		return false;
+	}
+
+	for (i = 0; i < bctx->chain_count; i++) {
+		if (!bs_recovery_build_chain_from_summary(bctx, &bctx->chains[i],
+							  bctx->root_pages[i])) {
+			/* Summary build happens before Phase 2 reads any chain data. If the
+			 * hint is incomplete, simply use the standard batched replay path.
+			 */
+			bs_recovery_reset_chains_for_standard_replay(bctx);
+			return false;
+		}
+	}
+
+	bctx->summary_slots = calloc(bctx->scan_qd, sizeof(*bctx->summary_slots));
+	if (bctx->summary_slots == NULL) {
+		bs_recovery_reset_chains_for_standard_replay(bctx);
+		return false;
+	}
+
+	SPDK_NOTICELOG("Batched blobstore recovery using summary replay: chains=%" PRIu32 "\n",
+		       bctx->chain_count);
+	bctx->summary_replay_chain_idx = 0;
+	bctx->summary_replay_page_idx = 0;
+	bctx->summary_replay_count = 0;
+	bs_recovery_summary_replay_submit(bctx);
+	return true;
+}
+
+static void
+bs_recovery_replay_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_recovery_batched_ctx *bctx = cb_arg;
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	struct bs_recovery_chain *chain;
+	struct spdk_blob_md_page *page;
+	uint32_t i;
+
+	if (bserrno != 0) {
+		bs_recovery_batched_fallback(bctx, "chain page read failed");
+		return;
+	}
+
+	for (i = 0; i < bctx->replay_count; i++) {
+		chain = &bctx->chains[bctx->replay_slots[i].chain_idx];
+		page = bs_recovery_page_at(bctx->replay_pages, ctx, i);
+		if (!bs_recovery_chain_page_valid(chain, page, bctx->replay_slots[i].page_num)) {
+			bs_recovery_batched_fallback(bctx, "invalid chain page");
+			return;
+		}
+		if (bs_recovery_chain_append_page(chain, page, bctx->replay_slots[i].page_num) != 0) {
+			bs_recovery_batched_fallback(bctx, "failed to append chain page");
+			return;
+		}
+		if (page->next == SPDK_INVALID_MD_PAGE) {
+			chain->done = true;
+			chain->active = false;
+			bctx->active_chains--;
+		} else if (page->next >= ctx->super->md_len) {
+			bs_recovery_batched_fallback(bctx, "next metadata page out of range");
+			return;
+		} else {
+			chain->current_page = page->next;
+		}
+	}
+
+	bs_recovery_replay_submit(bctx);
+}
+
+static void
+bs_recovery_replay_submit(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	spdk_bs_batch_t *batch;
+	uint32_t i;
+	uint64_t lba;
+
+	/* Keep at most replay_qd chains active, reading one metadata page per active chain. */
+	while (bctx->active_chains < bctx->replay_qd && bctx->next_chain_idx < bctx->chain_count) {
+		bctx->chains[bctx->next_chain_idx].active = true;
+		bctx->active_chains++;
+		bctx->next_chain_idx++;
+	}
+
+	if (bctx->active_chains == 0) {
+		SPDK_NOTICELOG("Batched blobstore recovery replay completed: chains=%" PRIu32 "\n",
+			       bctx->chain_count);
+		bctx->commit_idx = 0;
+		bs_recovery_commit_next_chain(bctx);
+		return;
+	}
+
+	bctx->replay_count = 0;
+	batch = bs_sequence_to_batch(ctx->seq, bs_recovery_replay_cpl, bctx);
+	for (i = 0; i < bctx->chain_count && bctx->replay_count < bctx->replay_qd; i++) {
+		if (!bctx->chains[i].active || bctx->chains[i].done) {
+			continue;
+		}
+		bctx->replay_slots[bctx->replay_count].chain_idx = i;
+		bctx->replay_slots[bctx->replay_count].page_num = bctx->chains[i].current_page;
+		lba = bs_md_page_to_lba(ctx->bs, bctx->chains[i].current_page);
+		bs_batch_read_dev(batch, bs_recovery_page_at(bctx->replay_pages, ctx, bctx->replay_count),
+				  lba, bs_byte_to_lba(ctx->bs, ctx->super->md_page_size));
+		bctx->replay_count++;
+	}
+	assert(bctx->replay_count > 0);
+	bs_batch_close(batch);
+}
+
+static void
+bs_recovery_start_replay(struct bs_recovery_batched_ctx *bctx)
+{
+	uint32_t i;
+
+	/* Phase 2: replay each discovered root chain with bounded concurrency. */
+	bctx->chain_count = bctx->root_count;
+	if (bctx->chain_count == 0) {
+		bs_recovery_finish(bctx);
+		return;
+	}
+
+	bctx->chains = calloc(bctx->chain_count, sizeof(*bctx->chains));
+	if (bctx->chains == NULL) {
+		bs_recovery_batched_fallback(bctx, "failed to allocate recovery chains");
+		return;
+	}
+
+	for (i = 0; i < bctx->chain_count; i++) {
+		bctx->chains[i].current_page = bctx->root_pages[i];
+	}
+
+	if (bs_recovery_try_summary_replay(bctx)) {
+		return;
+	}
+
+	bs_recovery_start_standard_replay(bctx);
+}
+
+static void bs_recovery_scan_retry_submit(struct bs_recovery_batched_ctx *bctx);
+
+static bool
+bs_recovery_scan_retry_advance(struct bs_recovery_batched_ctx *bctx)
+{
+	while (bctx->scan_retry_slot < bctx->scan_io_count) {
+		if (bctx->scan_retry_page_offset <
+		    bctx->scan_slots[bctx->scan_retry_slot].page_count) {
+			return true;
+		}
+
+		bctx->scan_retry_slot++;
+		bctx->scan_retry_page_offset = 0;
+	}
+
+	return false;
+}
+
+static void
+bs_recovery_scan_retry_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_recovery_batched_ctx *bctx = cb_arg;
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	struct spdk_blob_md_page *page;
+	uint32_t page_num, page_index;
+
+	if (bserrno != 0) {
+		bs_recovery_batched_fallback(bctx, "root discovery page retry failed");
+		return;
+	}
+
+	page_num = bctx->scan_slots[bctx->scan_retry_slot].start_page +
+		   bctx->scan_retry_page_offset;
+	page_index = bctx->scan_retry_slot * bctx->scan_pages_per_io +
+		     bctx->scan_retry_page_offset;
+	page = bs_recovery_page_at(bctx->scan_pages, ctx, page_index);
+	if (!bs_recovery_scan_record_root(bctx, page, page_num)) {
+		return;
+	}
+
+	bctx->scan_retry_page_offset++;
+	if (bs_recovery_scan_retry_advance(bctx)) {
+		bs_recovery_scan_retry_submit(bctx);
+		return;
+	}
+
+	bs_recovery_scan_continue(bctx);
+}
+
+static void
+bs_recovery_scan_retry_submit(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	uint32_t page_num, page_index;
+	uint64_t lba;
+
+	if (!bs_recovery_scan_retry_advance(bctx)) {
+		bs_recovery_scan_continue(bctx);
+		return;
+	}
+
+	page_num = bctx->scan_slots[bctx->scan_retry_slot].start_page +
+		   bctx->scan_retry_page_offset;
+	page_index = bctx->scan_retry_slot * bctx->scan_pages_per_io +
+		     bctx->scan_retry_page_offset;
+	lba = bs_md_page_to_lba(ctx->bs, page_num);
+	bs_sequence_read_dev(ctx->seq, bs_recovery_page_at(bctx->scan_pages, ctx, page_index), lba,
+			     bs_byte_to_lba(ctx->bs, ctx->super->md_page_size),
+			     bs_recovery_scan_retry_cpl, bctx);
+}
+
+static void
+bs_recovery_scan_retry_start(struct bs_recovery_batched_ctx *bctx)
+{
+	uint32_t i, pages;
+
+	pages = 0;
+	for (i = 0; i < bctx->scan_io_count; i++) {
+		pages += bctx->scan_slots[i].page_count;
+	}
+
+	SPDK_NOTICELOG("Batched blobstore recovery scan chunk read failed; retrying %" PRIu32
+		       " pages with single-page reads\n", pages);
+	bctx->scan_retry_slot = 0;
+	bctx->scan_retry_page_offset = 0;
+	bs_recovery_scan_retry_submit(bctx);
+}
+
+static void
+bs_recovery_scan_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_recovery_batched_ctx *bctx = cb_arg;
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	struct spdk_blob_md_page *page;
+	uint32_t i, j, page_num, page_index;
+
+	if (bserrno != 0) {
+		/* A failed chunk read does not invalidate the scan algorithm. Retry this
+		 * scan batch with single-page reads before falling back to serial recovery.
+		 */
+		bs_recovery_scan_retry_start(bctx);
+		return;
+	}
+
+	for (i = 0; i < bctx->scan_io_count; i++) {
+		for (j = 0; j < bctx->scan_slots[i].page_count; j++) {
+			page_num = bctx->scan_slots[i].start_page + j;
+			page_index = i * bctx->scan_pages_per_io + j;
+			page = bs_recovery_page_at(bctx->scan_pages, ctx, page_index);
+			if (!bs_recovery_scan_record_root(bctx, page, page_num)) {
+				return;
+			}
+		}
+	}
+
+	bs_recovery_scan_continue(bctx);
+}
+
+static void
+bs_recovery_scan_submit(struct bs_recovery_batched_ctx *bctx)
+{
+	struct spdk_bs_load_ctx *ctx = bctx->load_ctx;
+	spdk_bs_batch_t *batch;
+	uint32_t i, page_count, page_index;
+	uint64_t lba, byte_count;
+
+	/* The super block defines metadata as the contiguous range
+	 * [md_start, md_start + md_len). Phase 1 can read larger ranges and
+	 * validate individual metadata pages in memory.
+	 */
+	bctx->scan_io_count = 0;
+	batch = bs_sequence_to_batch(ctx->seq, bs_recovery_scan_cpl, bctx);
+	for (i = 0; i < bctx->scan_qd && bctx->next_scan_page < ctx->super->md_len; i++) {
+		page_count = spdk_min(bctx->scan_pages_per_io,
+				      ctx->super->md_len - bctx->next_scan_page);
+		bctx->scan_slots[i].start_page = bctx->next_scan_page;
+		bctx->scan_slots[i].page_count = page_count;
+		page_index = i * bctx->scan_pages_per_io;
+		lba = bs_md_page_to_lba(ctx->bs, bctx->next_scan_page);
+		byte_count = (uint64_t)page_count * ctx->super->md_page_size;
+		bs_batch_read_dev(batch, bs_recovery_page_at(bctx->scan_pages, ctx, page_index), lba,
+				  bs_byte_to_lba(ctx->bs, byte_count));
+		bctx->next_scan_page += page_count;
+		bctx->scan_io_count++;
+	}
+	assert(bctx->scan_io_count > 0);
+	bs_batch_close(batch);
+}
+
+static void
+bs_load_replay_md_batched(struct spdk_bs_load_ctx *ctx)
+{
+	struct bs_recovery_batched_ctx *bctx;
+
+	/* Dirty recovery fast path:
+	 * 1. Batch scan the metadata region to discover root pages.
+	 * 2. Replay root chains with bounded concurrency, keeping pages local.
+	 * 3. Serially commit parsed chains and reuse the existing used-mask write path.
+	 * Any uncertainty falls back to bs_load_replay_md().
+	 */
+	bctx = calloc(1, sizeof(*bctx));
+	if (bctx == NULL) {
+		bs_load_replay_md(ctx);
+		return;
+	}
+
+	bctx->load_ctx = ctx;
+	/* bs_recover() selects this path only when batched recovery is enabled. */
+	assert(ctx->recovery_qd > 1);
+	if (ctx->super->md_len == 0) {
+		bs_recovery_batched_free(bctx);
+		bs_load_replay_md(ctx);
+		return;
+	}
+
+	bctx->scan_pages_per_io = spdk_min((uint32_t)BS_RECOVERY_SCAN_CHUNK_PAGES,
+					   ctx->super->md_len);
+	bctx->scan_qd = bs_recovery_qd(ctx->recovery_qd,
+				       spdk_divide_round_up(ctx->super->md_len,
+							    bctx->scan_pages_per_io));
+
+	if (!bs_recovery_pages_size_valid((uint64_t)bctx->scan_qd * bctx->scan_pages_per_io,
+					  ctx->super->md_page_size)) {
+		bs_recovery_batched_free(bctx);
+		bs_load_replay_md(ctx);
+		return;
+	}
+	bctx->scan_pages = spdk_zmalloc((uint64_t)bctx->scan_qd * bctx->scan_pages_per_io *
+					ctx->super->md_page_size, 0, NULL, SPDK_ENV_NUMA_ID_ANY,
+					SPDK_MALLOC_DMA);
+	bctx->scan_slots = calloc(bctx->scan_qd, sizeof(*bctx->scan_slots));
+	if (bctx->scan_pages == NULL || bctx->scan_slots == NULL) {
+		bs_recovery_batched_free(bctx);
+		bs_load_replay_md(ctx);
+		return;
+	}
+	bctx->page_summaries = calloc(ctx->super->md_len, sizeof(*bctx->page_summaries));
+	if (bctx->page_summaries == NULL) {
+		SPDK_NOTICELOG("Batched blobstore recovery summary replay disabled: "
+			       "failed to allocate page summaries\n");
+	}
+
+	SPDK_NOTICELOG("Starting batched blobstore recovery: md_len=%" PRIu32
+		       " recovery_qd=%" PRIu32 " scan_qd=%" PRIu32
+		       " scan_pages_per_io=%" PRIu32 "\n",
+		       ctx->super->md_len, ctx->recovery_qd, bctx->scan_qd,
+		       bctx->scan_pages_per_io);
+	bs_recovery_scan_submit(bctx);
+}
+
 static void
 bs_recover(struct spdk_bs_load_ctx *ctx)
 {
@@ -5182,7 +6325,11 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 	}
 
 	ctx->bs->num_free_clusters = ctx->bs->total_clusters;
-	bs_load_replay_md(ctx);
+	if (ctx->recovery_qd > 1) {
+		bs_load_replay_md_batched(ctx);
+	} else {
+		bs_load_replay_md(ctx);
+	}
 }
 
 static int
@@ -5244,6 +6391,11 @@ bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
+	SPDK_NOTICELOG("Blobstore load recovery decision: clean=%" PRIu32
+		       " used_blobid_mask_len=%" PRIu32 " force_recover=%d recovery_qd=%" PRIu32 "\n",
+		       ctx->super->clean, ctx->super->used_blobid_mask_len,
+		       ctx->force_recover, ctx->recovery_qd);
+
 	if (ctx->super->used_blobid_mask_len == 0 || ctx->super->clean == 0 || ctx->force_recover) {
 		bs_recover(ctx);
 	} else {
@@ -5283,12 +6435,13 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 	SET_FIELD(force_recover);
 	SET_FIELD(esnap_bs_dev_create);
 	SET_FIELD(esnap_ctx);
+	SET_FIELD(recovery_qd);
 
 	dst->opts_size = src->opts_size;
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 88, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 92, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD
