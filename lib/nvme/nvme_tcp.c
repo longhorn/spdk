@@ -114,7 +114,8 @@ struct nvme_tcp_qpair {
 		uint16_t host_ddgst_enable: 1;
 		uint16_t icreq_send_ack: 1;
 		uint16_t icresp_received: 1;
-		uint16_t reserved: 12;
+		uint16_t pending_flush: 1;
+		uint16_t reserved: 11;
 	} flags;
 
 	/** Specifies the maximum number of PDU-Data bytes per H2C Data Transfer PDU */
@@ -504,6 +505,12 @@ nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	}
 }
 
+static void
+nvme_tcp_qpair_deferred_free(void *arg)
+{
+	free(arg);
+}
+
 static int
 nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
@@ -518,7 +525,16 @@ nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_q
 	if (!tqpair->shared_stats) {
 		free(tqpair->stats);
 	}
-	free(tqpair);
+	if (tqpair->flags.pending_flush) {
+		/* A flush message scheduled by _tcp_write_pdu() is still queued on this
+		 * thread. Thread messages are FIFO, so it runs before this deferred free;
+		 * the sock is already closed and NULLed by the disconnect path, so the
+		 * callback exits on -EBADF. Freeing synchronously here would hand it a
+		 * dangling pointer. */
+		spdk_thread_send_msg(spdk_get_thread(), nvme_tcp_qpair_deferred_free, tqpair);
+	} else {
+		free(tqpair);
+	}
 
 	return 0;
 }
@@ -614,6 +630,33 @@ pdu_seq_fail(struct nvme_tcp_pdu *pdu, int status)
 	nvme_tcp_req_complete(treq, treq->tqpair, &treq->rsp, true);
 }
 
+/* Deferred flush for qpairs that are not part of a poll group, scheduled by
+ * nvme_tcp_qpair_signal_tx(). */
+static void
+nvme_tcp_qpair_sock_flush_cb(void *arg)
+{
+	struct nvme_tcp_qpair *tqpair = arg;
+	int rc;
+
+	tqpair->flags.pending_flush = 0;
+
+	/* The qpair may have been disconnected between this message being queued and it
+	 * running. spdk_sock_flush() reports -EBADF for a closed or NULL sock, which is
+	 * the expected outcome in that case. */
+	rc = spdk_sock_flush(tqpair->sock);
+	if (rc == -EAGAIN) {
+		/* Partial flush, e.g. the kernel socket buffer is full. Retry on the next
+		 * message iteration, mirroring tcp_sock_flush_cb() in lib/nvmf/tcp.c. */
+		tqpair->flags.pending_flush = 1;
+		spdk_thread_send_msg(spdk_get_thread(), nvme_tcp_qpair_sock_flush_cb, tqpair);
+		return;
+	}
+
+	if (rc < 0 && rc != -EBADF) {
+		NVME_TQPAIR_ERRLOG(tqpair, "spdk_sock_flush() failed, rc %d: %s\n", rc, spdk_strerror(-rc));
+	}
+}
+
 /* Full interrupt mode: epoll notifies the reactor when a socket becomes readable or
  * writable, but not when the application queues new data into SPDK's internal TX queue.
  * Signal the qpair eventfd so the reactor wakes up and flushes the queued PDU to the
@@ -632,6 +675,16 @@ nvme_tcp_qpair_signal_tx(struct nvme_tcp_qpair *tqpair)
 	}
 
 	if (tqpair->interrupt_efd < 0) {
+		/* Qpairs outside a poll group - the adminq - have no eventfd: their queued
+		 * writes are flushed by nvme_tcp_qpair_process_completions() when the adminq
+		 * timer poller runs. Schedule a deferred flush so an admin PDU reaches the
+		 * wire immediately instead of waiting for the next tick, which lets that
+		 * poller run at a coarse interrupt-mode cadence. */
+		if (tqpair->qpair.poll_group == NULL && !tqpair->flags.pending_flush) {
+			tqpair->flags.pending_flush = 1;
+			spdk_thread_send_msg(spdk_get_thread(), nvme_tcp_qpair_sock_flush_cb, tqpair);
+		}
+
 		return;
 	}
 

@@ -2124,6 +2124,41 @@ test_nvme_tcp_interrupt_mode_tx_wakeup(void)
 	free(tctrlr);
 }
 
+/* The adminq is not part of a poll group, so it never gets a TX eventfd. Its queued
+ * writes are instead pushed out by a flush deferred onto the thread message queue,
+ * which is what lets bdev/nvme drop the adminq poller from 100us to the default
+ * cadence. Cover the callback that message runs: it must disarm the coalescing flag
+ * so the next write queues a fresh flush, and it must treat a disconnected qpair as
+ * the expected outcome rather than an error.
+ *
+ * The -EAGAIN re-arm and the queueing itself are not covered here: both need a live
+ * spdk_thread, which this suite does not set up.
+ */
+static void
+test_nvme_tcp_interrupt_mode_adminq_flush(void)
+{
+	struct nvme_tcp_qpair tqpair = {};
+
+	tqpair.interrupt_efd = -1;
+	tqpair.sock = (struct spdk_sock *)0xDEADBEEF;
+
+	/* A completed flush disarms, so the next queued PDU schedules a new one. */
+	tqpair.flags.pending_flush = 1;
+	MOCK_SET(spdk_sock_flush, 0);
+	nvme_tcp_qpair_sock_flush_cb(&tqpair);
+	CU_ASSERT(tqpair.flags.pending_flush == 0);
+
+	/* The qpair can be disconnected between the message being queued and run:
+	 * spdk_sock_flush() reports -EBADF for a closed or NULL sock and the callback
+	 * must accept that silently. */
+	tqpair.flags.pending_flush = 1;
+	MOCK_SET(spdk_sock_flush, -EBADF);
+	nvme_tcp_qpair_sock_flush_cb(&tqpair);
+	CU_ASSERT(tqpair.flags.pending_flush == 0);
+
+	MOCK_CLEAR(spdk_sock_flush);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2161,6 +2196,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_tcp_ctrlr_construct);
 	CU_ADD_TEST(suite, test_nvme_tcp_qpair_submit_request);
 	CU_ADD_TEST(suite, test_nvme_tcp_interrupt_mode_tx_wakeup);
+	CU_ADD_TEST(suite, test_nvme_tcp_interrupt_mode_adminq_flush);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
