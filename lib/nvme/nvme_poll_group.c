@@ -275,6 +275,11 @@ nvme_poll_group_add_qpair_fd(struct spdk_nvme_qpair *qpair)
 	}
 
 	fd = spdk_nvme_qpair_get_fd(qpair, &opts);
+	if (fd == -ENOTSUP) {
+		/* The transport does not expose per-qpair fds because it delivers events at
+		 * the poll-group level, e.g. TCP via its sock group's interrupt fd. */
+		return 0;
+	}
 	if (fd < 0) {
 		NVME_QPAIR_ERRLOG(qpair, "Cannot get fd for the qpair: %d\n", fd);
 		return -EINVAL;
@@ -296,6 +301,10 @@ nvme_poll_group_remove_qpair_fd(struct spdk_nvme_qpair *qpair)
 	}
 
 	fd = spdk_nvme_qpair_get_fd(qpair, NULL);
+	if (fd == -ENOTSUP) {
+		/* Never added by nvme_poll_group_add_qpair_fd(), nothing to remove. */
+		return;
+	}
 	if (fd < 0) {
 		NVME_QPAIR_ERRLOG(qpair, "Cannot get fd for the qpair: %d\n", fd);
 		assert(false);

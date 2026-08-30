@@ -1311,29 +1311,16 @@ nvme_tcp_qpair_reset(struct spdk_nvme_qpair *qpair)
 static int
 nvme_tcp_qpair_get_fd(struct spdk_nvme_qpair *qpair, struct spdk_event_handler_opts *opts)
 {
-	struct spdk_nvme_ctrlr *ctrlr = qpair->ctrlr;
-	struct nvme_tcp_qpair *tqpair;
-	int fd;
-
-	if (!ctrlr->opts.enable_interrupts) {
-		return -1;
-	}
-
-	if (!qpair) {
-        return -EINVAL;
-    }
-
-    tqpair = nvme_tcp_qpair(qpair);  // Convert generic qpair to TCP qpair
-    if (!tqpair || !tqpair->sock) {
-        return -EINVAL;
-    }
-
-	fd = spdk_get_sock_fd(tqpair->sock);
-	if (fd < 0) {
-		return -EINVAL;
-	}
-
-	return fd;
+	/* TCP qpairs deliver events at the poll-group level: every socket is a member of
+	 * the poll group's spdk_sock_group, whose interrupt fd is registered in the nvme
+	 * poll group's fd_group by nvme_tcp_qpair_add_interrupt(). Handing out the raw
+	 * socket fd here would register the same readiness a second time, with a handler
+	 * that drains the socket outside the sock group's machinery - the needs_poll
+	 * list, pending_recv tracking and group completion accounting - so report that
+	 * per-qpair fds are not supported. nvme_poll_group_add_qpair_fd() treats -ENOTSUP
+	 * as "this transport is handled at the group level".
+	 */
+	return -ENOTSUP;
 }
 
 static void

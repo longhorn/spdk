@@ -2159,6 +2159,28 @@ test_nvme_tcp_interrupt_mode_adminq_flush(void)
 	MOCK_CLEAR(spdk_sock_flush);
 }
 
+/* TCP delivers events at the poll-group level: the sock group's interrupt fd is what
+ * gets registered in the poll group's fd_group. Handing out a per-qpair socket fd
+ * would register the same readiness twice, with a handler that drains the socket
+ * outside the sock group's needs_poll and pending_recv bookkeeping.
+ */
+static void
+test_nvme_tcp_qpair_get_fd(void)
+{
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_tcp_qpair tqpair = {};
+	struct spdk_event_handler_opts opts = {};
+
+	tqpair.qpair.ctrlr = &ctrlr;
+	tqpair.sock = (struct spdk_sock *)0xDEADBEEF;
+
+	ctrlr.opts.enable_interrupts = true;
+	CU_ASSERT(nvme_tcp_qpair_get_fd(&tqpair.qpair, &opts) == -ENOTSUP);
+
+	ctrlr.opts.enable_interrupts = false;
+	CU_ASSERT(nvme_tcp_qpair_get_fd(&tqpair.qpair, NULL) == -ENOTSUP);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2195,6 +2217,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_tcp_poll_group_get_stats);
 	CU_ADD_TEST(suite, test_nvme_tcp_ctrlr_construct);
 	CU_ADD_TEST(suite, test_nvme_tcp_qpair_submit_request);
+	CU_ADD_TEST(suite, test_nvme_tcp_qpair_get_fd);
 	CU_ADD_TEST(suite, test_nvme_tcp_interrupt_mode_tx_wakeup);
 	CU_ADD_TEST(suite, test_nvme_tcp_interrupt_mode_adminq_flush);
 
