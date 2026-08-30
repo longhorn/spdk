@@ -176,6 +176,13 @@
 /* The NVMe Write Zeroes command NLB field is 16-bit (0..65535 => max 65536 blocks). */
 #define BDEV_NVME_WRITE_ZEROES_MAX_BLOCKS (UINT16_MAX + 1)
 
+/* Minimum adminq poll period for NVMe/TCP in interrupt mode while the controller is
+ * disconnecting or resetting. The TCP adminq has no hardware interrupt, and polling it
+ * fast during a disconnect is what guards the race where the IO queues detect socket
+ * closure before the adminq wakes up and a command is issued on a closed socket
+ * (EBADF, longhorn/longhorn#9834). */
+#define NVME_TCP_ADMINQ_INTERRUPT_MIN_POLL_PERIOD_US	(100)
+
 #define NSID_STR_LEN 10
 
 #define SPDK_CONTROLLER_NAME_MAX 512
@@ -1978,7 +1985,19 @@ static void
 bdev_nvme_change_adminq_poll_period(struct nvme_ctrlr *nvme_ctrlr, uint64_t new_period_us)
 {
 	if (spdk_interrupt_mode_is_enabled()) {
-		return;
+		if (nvme_ctrlr->active_path_id == NULL ||
+		    nvme_ctrlr->active_path_id->trid.trtype != SPDK_NVME_TRANSPORT_TCP) {
+			/* The adminq is interrupt-driven: its fd is registered in
+			 * nvme_ctrlr_create() and there is no timer period to change. */
+			return;
+		}
+
+		/* The NVMe/TCP adminq stays a timer poller in interrupt mode. Honor the
+		 * period change - the caller speeds polling up while disconnecting and
+		 * restores the default afterwards - but clamp it: a zero period would
+		 * busy-spin the interrupt-mode reactor. */
+		new_period_us = spdk_max(new_period_us,
+					 NVME_TCP_ADMINQ_INTERRUPT_MIN_POLL_PERIOD_US);
 	}
 
 	spdk_poller_unregister(&nvme_ctrlr->adminq_timer_poller);
@@ -6324,17 +6343,21 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
 
 	period = spdk_interrupt_mode_is_enabled() ? 0 : g_opts.nvme_adminq_poll_period_us;
 	/*
-	 * In interrupt mode, NVMe/TCP requires periodic polling of the admin queue
-	 * to ensure timely Keep Alive and disconnect handling. TCP transport does not
-	 * provide hardware interrupts for admin completions.
+	 * In interrupt mode, NVMe/TCP still requires periodic polling of the admin queue
+	 * for Keep Alive and disconnect handling: TCP provides no hardware interrupt for
+	 * admin completions. It no longer has to carry the admin TX flush, though - admin
+	 * PDU writes are pushed out by the deferred flush in lib/nvme/nvme_tcp.c - so an
+	 * idle adminq only needs the default coarse cadence instead of the 100us this
+	 * used to force. Polling that fast is the last high-frequency timer in the
+	 * interrupt-mode data path and by itself keeps the reactor from ever idling.
 	 *
-	 * To prevent a race condition where IOQs detect socket closure before adminq
-	 * wakes up (causing commands to be issued on a closed socket, EBADF), we force
-	 * a shorter admin queue poll period for NVMe/TCP in interrupt mode.
-	 *
-	 * This should ideally match or be shorter than nvme_ioq_poll_period_us.
+	 * The EBADF race the 100us guarded is handled by
+	 * bdev_nvme_change_adminq_poll_period(), which accelerates the TCP adminq for
+	 * the duration of a disconnect or reset.
 	 */
-	period = (spdk_interrupt_mode_is_enabled() && (nvme_ctrlr->active_path_id->trid.trtype != SPDK_NVME_TRANSPORT_TCP)) ? period : 100;
+	period = (spdk_interrupt_mode_is_enabled() &&
+		  (nvme_ctrlr->active_path_id->trid.trtype != SPDK_NVME_TRANSPORT_TCP)) ? period :
+		 g_opts.nvme_adminq_poll_period_us;
 
 	SPDK_DEBUGLOG(bdev_nvme, "Registering admin poller for controller with poll period %" PRIu64 "\n", period);
 	nvme_ctrlr->adminq_timer_poller = SPDK_POLLER_REGISTER(bdev_nvme_poll_adminq, nvme_ctrlr,
