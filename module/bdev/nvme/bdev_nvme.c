@@ -176,6 +176,10 @@
 /* The NVMe Write Zeroes command NLB field is 16-bit (0..65535 => max 65536 blocks). */
 #define BDEV_NVME_WRITE_ZEROES_MAX_BLOCKS (UINT16_MAX + 1)
 
+/* Interrupt mode only: coarse backstop poll period for the IO queues, so that a wakeup
+ * that is never delivered delays IO by this much instead of hanging it. */
+#define NVME_IOQ_INTERRUPT_SAFETY_POLL_PERIOD_US	(10 * 1000)
+
 /* Minimum adminq poll period for NVMe/TCP in interrupt mode while the controller is
  * disconnecting or resetting. The TCP adminq has no hardware interrupt, and polling it
  * fast during a disconnect is what guards the race where the IO queues detect socket
@@ -4039,6 +4043,19 @@ bdev_nvme_create_poll_group_cb(void *io_device, void *ctx_buf)
 			spdk_nvme_poll_group_destroy(group->group);
 			return -1;
 		}
+
+		/* Backstop: every path that queues TX now signals the reactor, but a wakeup
+		 * that is missed for any reason has nothing else to recover it once the
+		 * periodic poller is gone. Poll coarsely so such a miss costs latency rather
+		 * than a stalled queue. At 10ms this is three orders of magnitude cheaper
+		 * than the 100us poller it replaces. */
+		group->safety_poller = SPDK_POLLER_REGISTER(bdev_nvme_poll, group,
+				       NVME_IOQ_INTERRUPT_SAFETY_POLL_PERIOD_US);
+		if (group->safety_poller == NULL) {
+			spdk_interrupt_unregister(&group->intr);
+			spdk_nvme_poll_group_destroy(group->group);
+			return -1;
+		}
 	}
 
 	return 0;
@@ -4057,6 +4074,7 @@ bdev_nvme_destroy_poll_group_cb(void *io_device, void *ctx_buf)
 
 	if (spdk_interrupt_mode_is_enabled()) {
 		spdk_interrupt_unregister(&group->intr);
+		spdk_poller_unregister(&group->safety_poller);
 	}
 
 	spdk_poller_unregister(&group->poller);

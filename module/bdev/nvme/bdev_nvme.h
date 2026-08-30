@@ -261,6 +261,8 @@ struct nvme_poll_group {
 	struct spdk_nvme_poll_group		*group;
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_poller			*poller;
+	/* Interrupt mode only: coarse backstop for a wakeup that is never delivered. */
+	struct spdk_poller			*safety_poller;
 	bool					collect_spin_stat;
 	uint64_t				spin_ticks;
 	uint64_t				start_ticks;
