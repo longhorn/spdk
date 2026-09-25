@@ -28,7 +28,6 @@ DEFINE_STUB(spdk_sock_set_recvlowat, int, (struct spdk_sock *sock, int nbytes), 
 DEFINE_STUB(spdk_sock_set_recvbuf, int, (struct spdk_sock *sock, int sz), 0);
 DEFINE_STUB(spdk_sock_set_sendbuf, int, (struct spdk_sock *sock, int sz), 0);
 DEFINE_STUB_V(spdk_sock_writev_async, (struct spdk_sock *sock, struct spdk_sock_request *req));
-DEFINE_STUB(spdk_sock_flush, int, (struct spdk_sock *sock), 0);
 DEFINE_STUB(spdk_sock_is_ipv6, bool, (struct spdk_sock *sock), false);
 DEFINE_STUB(spdk_sock_is_ipv4, bool, (struct spdk_sock *sock), true);
 DEFINE_STUB(spdk_sock_is_connected, bool, (struct spdk_sock *sock), true);
@@ -44,6 +43,20 @@ DEFINE_STUB(spdk_sock_group_provide_buf, int, (struct spdk_sock_group *group, vo
 		void *ctx), 0);
 
 static uint8_t g_buf[0x1000] = {};
+
+int g_spdk_sock_flush_errno;
+uint32_t g_spdk_sock_flush_calls;
+
+DEFINE_RETURN_MOCK(spdk_sock_flush, int);
+int
+spdk_sock_flush(struct spdk_sock *sock)
+{
+	g_spdk_sock_flush_calls++;
+	errno = g_spdk_sock_flush_errno;
+	HANDLE_RETURN_MOCK(spdk_sock_flush);
+
+	return 0;
+}
 
 DEFINE_RETURN_MOCK(spdk_sock_recv_next, int);
 int

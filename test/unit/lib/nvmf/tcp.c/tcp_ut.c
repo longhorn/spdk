@@ -1637,6 +1637,104 @@ test_nvmf_tcp_get_request_resuse_flags(void)
 	SPDK_CU_ASSERT_FATAL(tcp_req->req.cmd_cb_fn == NULL);
 }
 
+static void
+test_nvmf_tcp_flush_retry(void)
+{
+	struct spdk_nvmf_tcp_qpair tqpair = {};
+	struct spdk_thread *thread;
+	int i;
+
+	thread = spdk_thread_create(NULL, NULL);
+	SPDK_CU_ASSERT_FATAL(thread != NULL);
+	spdk_set_thread(thread);
+
+	/* Keep the socket congested so that every flush asks to be retried. */
+	g_spdk_sock_flush_errno = EAGAIN;
+	MOCK_SET(spdk_sock_flush, -1);
+
+	tcp_sock_queue_flush(&tqpair);
+	CU_ASSERT(tqpair.pending_flush == true);
+
+	/* Concurrent PDU writes must not queue a second flush message. */
+	tcp_sock_queue_flush(&tqpair);
+	tcp_sock_queue_flush(&tqpair);
+
+	for (i = 0; i < 16; i++) {
+		g_spdk_sock_flush_calls = 0;
+		spdk_thread_poll(thread, 0, 0);
+		/* Accumulated retries would flush more than once per poll. */
+		CU_ASSERT(g_spdk_sock_flush_calls == 1);
+		CU_ASSERT(tqpair.pending_flush == true);
+		tcp_sock_queue_flush(&tqpair);
+	}
+
+	/* The retry loop stops once the socket drains. */
+	MOCK_SET(spdk_sock_flush, 0);
+	g_spdk_sock_flush_errno = 0;
+	g_spdk_sock_flush_calls = 0;
+	spdk_thread_poll(thread, 0, 0);
+	CU_ASSERT(g_spdk_sock_flush_calls == 1);
+	CU_ASSERT(tqpair.pending_flush == false);
+
+	g_spdk_sock_flush_calls = 0;
+	spdk_thread_poll(thread, 0, 0);
+	CU_ASSERT(g_spdk_sock_flush_calls == 0);
+
+	MOCK_CLEAR(spdk_sock_flush);
+	g_spdk_sock_flush_errno = 0;
+
+	spdk_thread_exit(thread);
+	while (!spdk_thread_is_exited(thread)) {
+		spdk_thread_poll(thread, 0, 0);
+	}
+	spdk_thread_destroy(thread);
+}
+
+static void
+test_nvmf_tcp_qpair_destroy_flush(void)
+{
+	struct spdk_nvmf_tcp_qpair *tqpair;
+	struct spdk_thread *thread;
+	int i;
+
+	thread = spdk_thread_create(NULL, NULL);
+	SPDK_CU_ASSERT_FATAL(thread != NULL);
+	spdk_set_thread(thread);
+
+	/* _nvmf_tcp_qpair_destroy() frees the qpair, so it cannot live on the stack. */
+	tqpair = calloc(1, sizeof(*tqpair));
+	SPDK_CU_ASSERT_FATAL(tqpair != NULL);
+	TAILQ_INIT(&tqpair->tcp_req_working_queue);
+	tqpair->state = NVMF_TCP_QPAIR_STATE_RUNNING;
+
+	/* Keep the socket congested so that every flush asks to be retried. */
+	g_spdk_sock_flush_errno = EAGAIN;
+	MOCK_SET(spdk_sock_flush, -1);
+
+	tcp_sock_queue_flush(tqpair);
+	CU_ASSERT(tqpair->pending_flush == true);
+
+	nvmf_tcp_qpair_destroy(tqpair);
+	CU_ASSERT(tqpair->state == NVMF_TCP_QPAIR_STATE_EXITED);
+
+	/* Teardown may only run the already queued flush; a retry would touch freed memory.
+	 * Poll repeatedly so the message batch size cannot hide such a retry. */
+	g_spdk_sock_flush_calls = 0;
+	for (i = 0; i < 4; i++) {
+		spdk_thread_poll(thread, 0, 0);
+	}
+	CU_ASSERT(g_spdk_sock_flush_calls == 1);
+
+	MOCK_CLEAR(spdk_sock_flush);
+	g_spdk_sock_flush_errno = 0;
+
+	spdk_thread_exit(thread);
+	while (!spdk_thread_is_exited(thread)) {
+		spdk_thread_poll(thread, 0, 0);
+	}
+	spdk_thread_destroy(thread);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1665,6 +1763,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_tcp_tls_generate_retained_psk);
 	CU_ADD_TEST(suite, test_nvmf_tcp_tls_generate_tls_psk);
 	CU_ADD_TEST(suite, test_nvmf_tcp_get_request_resuse_flags);
+	CU_ADD_TEST(suite, test_nvmf_tcp_flush_retry);
+	CU_ADD_TEST(suite, test_nvmf_tcp_qpair_destroy_flush);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

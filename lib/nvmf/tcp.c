@@ -415,6 +415,8 @@ static void nvmf_tcp_poll_group_destroy(struct spdk_nvmf_transport_poll_group *g
 static void _nvmf_tcp_send_c2h_data(struct spdk_nvmf_tcp_qpair *tqpair,
 				    struct spdk_nvmf_tcp_req *tcp_req);
 static void nvmf_tcp_qpair_process(struct spdk_nvmf_tcp_qpair *tqpair);
+static void nvmf_tcp_qpair_set_state(struct spdk_nvmf_tcp_qpair *tqpair,
+				     enum nvmf_tcp_qpair_state state);
 
 static inline void
 nvmf_tcp_req_set_state(struct spdk_nvmf_tcp_req *tcp_req,
@@ -667,6 +669,9 @@ _nvmf_tcp_qpair_destroy(void *_tqpair)
 static void
 nvmf_tcp_qpair_destroy(struct spdk_nvmf_tcp_qpair *tqpair)
 {
+	/* Stops tcp_sock_queue_flush() from queueing a message that would outlive the qpair. */
+	nvmf_tcp_qpair_set_state(tqpair, NVMF_TCP_QPAIR_STATE_EXITED);
+
 	/* Delay the destruction to make sure it isn't performed from the context of a sock
 	 * callback.  Otherwise, spdk_sock_close() might not abort pending requests, causing their
 	 * completions to be executed after the qpair is freed.  (Note: this fixed issue #2471.)
@@ -1204,6 +1209,37 @@ _pdu_write_done(struct nvme_tcp_pdu *pdu, int err)
 	pdu->sock_req.cb_fn(pdu->sock_req.cb_arg, err);
 }
 
+static void tcp_sock_flush_cb(void *arg);
+
+/*
+ * tcp_sock_queue_flush() queues a tcp_sock_flush_cb() message for the qpair:
+ * 1. If the qpair is EXITED, do not queue.
+ * 2. If a flush is already queued (pending_flush is true), do not queue.
+ * 3. Set pending_flush to true only after the message is queued successfully.
+ */
+static void
+tcp_sock_queue_flush(struct spdk_nvmf_tcp_qpair *tqpair)
+{
+	int rc;
+
+	/* A flush queued now would run after _nvmf_tcp_qpair_destroy() freed the qpair. */
+	if (tqpair->state >= NVMF_TCP_QPAIR_STATE_EXITED) {
+		return;
+	}
+
+	if (tqpair->pending_flush) {
+		return;
+	}
+
+	rc = spdk_thread_send_msg(spdk_get_thread(), tcp_sock_flush_cb, tqpair);
+	if (spdk_unlikely(rc != 0)) {
+		SPDK_ERRLOG("Failed to queue flush for tqpair=%p, rc=%d\n", tqpair, rc);
+		return;
+	}
+
+	tqpair->pending_flush = true;
+}
+
 static void
 tcp_sock_flush_cb(void *arg)
 {
@@ -1213,7 +1249,7 @@ tcp_sock_flush_cb(void *arg)
 	tqpair->pending_flush = false;
 	rc = spdk_sock_flush(tqpair->sock);
 	if (rc < 0 && errno == EAGAIN) {
-		spdk_thread_send_msg(spdk_get_thread(), tcp_sock_flush_cb, tqpair);
+		tcp_sock_queue_flush(tqpair);
 		return;
 	}
 
@@ -1235,10 +1271,7 @@ _tcp_write_pdu(struct nvme_tcp_pdu *pdu)
 	    pdu->hdr.common.pdu_type == SPDK_NVME_TCP_PDU_TYPE_C2H_TERM_REQ ||
 	    spdk_interrupt_mode_is_enabled()) {
 		/* Async writes must be flushed */
-		if (!tqpair->pending_flush) {
-			tqpair->pending_flush = true;
-			spdk_thread_send_msg(spdk_get_thread(), tcp_sock_flush_cb, tqpair);
-		}
+		tcp_sock_queue_flush(tqpair);
 	}
 }
 
@@ -3543,7 +3576,6 @@ nvmf_tcp_close_qpair(struct spdk_nvmf_qpair *qpair,
 	tqpair->fini_cb_fn = cb_fn;
 	tqpair->fini_cb_arg = cb_arg;
 
-	nvmf_tcp_qpair_set_state(tqpair, NVMF_TCP_QPAIR_STATE_EXITED);
 	nvmf_tcp_qpair_destroy(tqpair);
 }
 
