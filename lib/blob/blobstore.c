@@ -8719,6 +8719,13 @@ struct snapshot_checksum_ctx {
 	/* If true, compute both the whole checksum and clusters checksums */
 	bool compute_all;
 
+	/* Clusters checksums computed by this operation, published to the blob only on success */
+	uint64_t *clusters_checksums;
+
+	/* Clusters checksums the blob had before this operation, restored if md sync fails */
+	uint64_t *prev_clusters_checksums;
+	uint64_t prev_num_clusters_checksums;
+
 	/* Computed checksum */
 	uint64_t checksum;
 
@@ -8744,6 +8751,8 @@ bs_snapshot_checksum_cleanup_finish(void *cb_arg, int bserrno)
 	}
 
 	spdk_free(ctx->read_buff);
+	free(ctx->clusters_checksums);
+	free(ctx->prev_clusters_checksums);
 
 	cpl->u.blob_basic.cb_fn(cpl->u.blob_basic.cb_arg, ctx->bserrno);
 
@@ -8768,7 +8777,13 @@ bs_snapshot_checksum_md_synchronized(void *cb_arg, int bserrno)
 		SPDK_ERRLOG("blob 0x%" PRIx64 " snapshot checksum, blob md sync error %d\n", ctx->blob->id,
 			    bserrno);
 		ctx->bserrno = bserrno;
-		bs_snapshot_free_clusters_checksums(_blob);
+		if (ctx->compute_all) {
+			/* The metadata on disk most likely still holds the previous clusters checksums */
+			ctx->clusters_checksums = _blob->clusters_checksums;
+			_blob->clusters_checksums = ctx->prev_clusters_checksums;
+			_blob->num_clusters_checksums = ctx->prev_num_clusters_checksums;
+			ctx->prev_clusters_checksums = NULL;
+		}
 	}
 
 	_blob->locked_operation_in_progress = false;
@@ -8790,6 +8805,14 @@ bs_snapshot_checksum_store_xattr(struct snapshot_checksum_ctx *ctx)
 		return;
 	}
 
+	if (ctx->compute_all) {
+		ctx->prev_clusters_checksums = _blob->clusters_checksums;
+		ctx->prev_num_clusters_checksums = _blob->num_clusters_checksums;
+		_blob->clusters_checksums = ctx->clusters_checksums;
+		_blob->num_clusters_checksums = _blob->active.num_clusters;
+		ctx->clusters_checksums = NULL;
+	}
+
 	blob_sync_md(_blob, bs_snapshot_checksum_md_synchronized, ctx);
 }
 
@@ -8803,14 +8826,13 @@ bs_snapshot_checksum_blob_read_cpl(void *cb_arg, int bserrno)
 		SPDK_ERRLOG("blob 0x%" PRIx64 " snapshot checksum, blob read error %d\n", ctx->blob->id, bserrno);
 		ctx->bserrno = bserrno;
 		_blob->locked_operation_in_progress = false;
-		bs_snapshot_free_clusters_checksums(_blob);
 		spdk_thread_send_msg(spdk_get_thread(), bs_snapshot_checksum_close_blob, ctx);
 		return;
 	}
 
 	ctx->checksum = spdk_crc64_iso_refl(ctx->read_buff, _blob->bs->cluster_sz, ctx->checksum);
-	if (_blob->clusters_checksums) {
-		_blob->clusters_checksums[ctx->cluster] = spdk_crc64_iso_refl(ctx->read_buff, _blob->bs->cluster_sz,
+	if (ctx->clusters_checksums) {
+		ctx->clusters_checksums[ctx->cluster] = spdk_crc64_iso_refl(ctx->read_buff, _blob->bs->cluster_sz,
 				0);
 	}
 
@@ -8829,7 +8851,6 @@ bs_snapshot_checksum_cluster_find_next(void *cb_arg)
 		SPDK_WARNLOG("blob 0x%" PRIx64 " snapshot checksum, operation interrupted\n", ctx->blob->id);
 		ctx->bserrno = -EINTR;
 		_blob->locked_operation_in_progress = false;
-		bs_snapshot_free_clusters_checksums(_blob);
 		spdk_thread_send_msg(spdk_get_thread(), bs_snapshot_checksum_close_blob, ctx);
 		return;
 	}
@@ -8884,14 +8905,14 @@ bs_snapshot_checksum_blob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bs
 	_blob->locked_operation_in_progress = true;
 
 	/*
-	 * If ctx->compute_all, we are executing a range checksum, so we must allocate
-	 * clusters_checksums if not already allocated in a previous call. Otherwise, we are
-	 * computing only the whole checksum, which will be stored in blob's xattr, and so there's
-	 * no need to allocate this array.
+	 * If ctx->compute_all, we are executing a range checksum. The clusters checksums are
+	 * computed into a new array, so that the ones the blob already has stay valid until this
+	 * operation succeeds. Otherwise, we are computing only the whole checksum, which will be
+	 * stored in blob's xattr, and so there's no need to allocate this array.
 	 */
-	if (ctx->compute_all && _blob->clusters_checksums == NULL) {
-		_blob->clusters_checksums = calloc(_blob->active.num_clusters, sizeof(uint64_t));
-		if (!_blob->clusters_checksums) {
+	if (ctx->compute_all) {
+		ctx->clusters_checksums = calloc(_blob->active.num_clusters, sizeof(uint64_t));
+		if (!ctx->clusters_checksums) {
 			SPDK_ERRLOG("blob 0x%" PRIx64 " snapshot range checksum, error allocating clusters checksums\n",
 				    _blob->id);
 			_blob->locked_operation_in_progress = false;
@@ -8899,8 +8920,6 @@ bs_snapshot_checksum_blob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bs
 			spdk_blob_close(_blob, bs_snapshot_checksum_cleanup_finish, ctx);
 			return;
 		}
-		_blob->num_clusters_checksums = _blob->active.num_clusters;
-		_blob->state = SPDK_BLOB_STATE_DIRTY;
 	}
 
 	ctx->cluster = 0;
