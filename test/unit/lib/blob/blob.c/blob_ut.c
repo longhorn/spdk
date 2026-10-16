@@ -4313,6 +4313,49 @@ blob_dirty_shutdown(void)
 }
 
 static void
+blob_batch_result(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	int *result = cb_arg;
+
+	*result = bserrno;
+}
+
+static void
+blob_batch_read_error(void)
+{
+	struct spdk_bs_request_set set = {};
+	int result = -1;
+
+	bs_sequence_to_batch(&set, blob_batch_result, &result);
+	set.u.batch.outstanding_ops = 2;
+	bs_batch_close(&set);
+	bs_batch_completion(NULL, &set, -EIO);
+	CU_ASSERT(result == -1);
+	bs_batch_completion(NULL, &set, 0);
+	CU_ASSERT(result == -EIO);
+
+	/* A successful single-page retry clears the previous error. */
+	set.u.sequence.cb_fn = blob_batch_result;
+	set.u.sequence.cb_arg = &result;
+	bs_sequence_completion(NULL, &set, 0);
+	CU_ASSERT(set.bserrno == 0);
+	bs_sequence_to_batch(&set, blob_batch_result, &result);
+	set.u.batch.outstanding_ops = 2;
+	bs_batch_completion(NULL, &set, 0);
+	bs_batch_completion(NULL, &set, 0);
+	bs_batch_close(&set);
+	CU_ASSERT(result == 0);
+
+	/* Also preserve errors when all I/Os complete before batch_close(). */
+	bs_sequence_to_batch(&set, blob_batch_result, &result);
+	set.u.batch.outstanding_ops = 2;
+	bs_batch_completion(NULL, &set, -EIO);
+	bs_batch_completion(NULL, &set, 0);
+	bs_batch_close(&set);
+	CU_ASSERT(result == -EIO);
+}
+
+static void
 blob_flags(void)
 {
 	struct spdk_blob_store *bs = g_bs;
@@ -13459,6 +13502,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_serialize_checksums_test);
 		CU_ADD_TEST(suite_bs, blob_crc);
 		CU_ADD_TEST(suite, super_block_crc);
+		CU_ADD_TEST(suite, blob_batch_read_error);
 		CU_ADD_TEST(suite_blob, blob_dirty_shutdown);
 		CU_ADD_TEST(suite_bs, blob_flags);
 		CU_ADD_TEST(suite_bs, bs_version);

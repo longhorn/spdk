@@ -366,7 +366,8 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 	if (set->u.batch.outstanding_ops == 0 && set->u.batch.batch_closed) {
 		if (set->u.batch.cb_fn) {
 			set->cb_args.cb_fn = bs_sequence_completion;
-			set->u.batch.cb_fn((spdk_bs_sequence_t *)set, set->u.batch.cb_arg, bserrno);
+			/* A successful last I/O must not hide an earlier batch failure. */
+			set->u.batch.cb_fn((spdk_bs_sequence_t *)set, set->u.batch.cb_arg, set->bserrno);
 		} else {
 			bs_request_set_complete(set);
 		}
