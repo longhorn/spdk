@@ -173,6 +173,8 @@ spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 	cb_fn(cb_arg, 0);
 }
 
+static uint32_t g_bs_load_recovery_qd;
+
 void
 spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
@@ -180,6 +182,7 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 	struct lvol_ut_bs_dev *ut_dev = SPDK_CONTAINEROF(dev, struct lvol_ut_bs_dev, bs_dev);
 	struct spdk_blob_store *bs = NULL;
 
+	g_bs_load_recovery_qd = opts->recovery_qd;
 	if (ut_dev->load_status == 0) {
 		bs = ut_dev->bs;
 	}
@@ -1367,7 +1370,10 @@ test_lvs_load(void)
 	/* Fail on bs load */
 	dev.load_status = -1;
 	CU_ASSERT(TAILQ_EMPTY(&g_lvol_stores));
+	g_bs_load_recovery_qd = 0;
 	spdk_lvs_load(&dev.bs_dev, lvol_store_op_with_handle_complete, req);
+	/* lvstores are loaded with batched dirty recovery enabled. */
+	CU_ASSERT(g_bs_load_recovery_qd == SPDK_LVOL_BLOB_OPTS_RECOVERY_QD);
 	CU_ASSERT(g_lvserrno != 0);
 	CU_ASSERT(g_lvol_store == NULL);
 	CU_ASSERT(TAILQ_EMPTY(&g_lvol_stores));
