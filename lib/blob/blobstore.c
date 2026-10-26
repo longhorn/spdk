@@ -63,6 +63,8 @@ struct blob_esnap_channel {
 	RB_ENTRY(blob_esnap_channel)	node;
 	spdk_blob_id			blob_id;
 	struct spdk_io_channel		*channel;
+	/* The bs_dev that created channel and must be used to destroy it. */
+	struct spdk_bs_dev		*bs_dev;
 };
 
 static int blob_esnap_channel_compare(struct blob_esnap_channel *c1, struct blob_esnap_channel *c2);
@@ -10543,7 +10545,10 @@ struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs)
 void
 spdk_bs_free_io_channel(struct spdk_io_channel *channel)
 {
-	blob_esnap_destroy_bs_channel(spdk_io_channel_get_ctx(channel));
+	/*
+	 * The bs_channel is shared by every user on this thread, so its esnap channels may still
+	 * be in use. They are released when the bs_channel is destroyed or the blob is closed.
+	 */
 	spdk_put_io_channel(channel);
 }
 
@@ -11458,6 +11463,8 @@ blob_esnap_get_io_channel(struct spdk_io_channel *ch, struct spdk_blob *blob)
 	find.blob_id = blob->id;
 	esnap_channel = RB_FIND(blob_esnap_channel_tree, &bs_channel->esnap_channels, &find);
 	if (spdk_likely(esnap_channel != NULL)) {
+		/* A cached channel must belong to the current esnap device. */
+		assert(esnap_channel->bs_dev == bs_dev);
 		SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": using cached channel on thread %s\n",
 			      blob->id, spdk_thread_get_name(spdk_get_thread()));
 		return esnap_channel->channel;
@@ -11479,6 +11486,7 @@ blob_esnap_get_io_channel(struct spdk_io_channel *ch, struct spdk_blob *blob)
 		return NULL;
 	}
 	esnap_channel->blob_id = find.blob_id;
+	esnap_channel->bs_dev = bs_dev;
 	existing = RB_INSERT(blob_esnap_channel_tree, &bs_channel->esnap_channels, esnap_channel);
 	if (spdk_unlikely(existing != NULL)) {
 		/*
@@ -11550,6 +11558,7 @@ blob_esnap_destroy_one_channel(struct spdk_io_channel_iter *i)
 		SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": destroying channel on thread %s\n",
 			      blob->id, spdk_thread_get_name(spdk_get_thread()));
 		RB_REMOVE(blob_esnap_channel_tree, &bs_channel->esnap_channels, esnap_channel);
+		assert(esnap_channel->bs_dev == bs_dev);
 
 		if (ctx->abort_io) {
 			spdk_bs_user_op_t *op, *tmp;
@@ -11646,7 +11655,7 @@ blob_esnap_destroy_bs_channel(struct spdk_bs_channel *ch)
 			      ": destroying one channel in thread %s\n",
 			      esnap_channel->blob_id, spdk_thread_get_name(spdk_get_thread()));
 		RB_REMOVE(blob_esnap_channel_tree, &ch->esnap_channels, esnap_channel);
-		spdk_put_io_channel(esnap_channel->channel);
+		esnap_channel->bs_dev->destroy_channel(esnap_channel->bs_dev, esnap_channel->channel);
 		free(esnap_channel);
 	}
 	SPDK_DEBUGLOG(blob_esnap, "done destroying channels on thread %s\n",

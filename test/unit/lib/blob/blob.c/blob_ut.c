@@ -9639,26 +9639,136 @@ blob_esnap_thread_add_remove(void)
 	CU_ASSERT(ut_ch1 != NULL);
 	CU_ASSERT(ut_ch1->blocks_read == 4);
 
-	/* Close the channel on thread 0 and verify the bs_dev channel is also gone. */
+	/*
+	 * Release ch0 on thread 0. The blobstore's md_channel still holds the bs_channel on this
+	 * thread, so the esnap channel must stay alive for the other users of the bs_channel.
+	 */
 	set_thread(0);
+	SPDK_CU_ASSERT_FATAL(bs->md_channel == ch0);
 	spdk_bs_free_io_channel(ch0);
 	poll_threads();
-	CU_ASSERT(ut_dev->num_channels == 1);
+	CU_ASSERT(ut_dev->num_channels == 2);
+	CU_ASSERT(ut_esnap_get_io_channel(bs->md_channel, blobid) == ut_ch0);
 
-	/* Close the blob. There is no outstanding IO so it should close right away. */
+	/*
+	 * Close the blob. There is no outstanding IO so it should close right away and the esnap
+	 * channels on every thread are released through the bs_dev.
+	 */
 	g_bserrno = 0xbad;
 	spdk_blob_close(blob, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(destroyed);
 
-	/* The esnap channel for the blob should be gone now too. */
+	/* The esnap channels for the blob should be gone now too. */
 	ut_ch1 = ut_esnap_get_io_channel(ch1, blobid);
 	CU_ASSERT(ut_ch1 == NULL);
+	CU_ASSERT(ut_esnap_get_io_channel(bs->md_channel, blobid) == NULL);
 
 	/* Clean up */
 	set_thread(1);
 	spdk_bs_free_io_channel(ch1);
+	set_thread(start_thread);
+}
+
+/*
+ * spdk_bs_alloc_io_channel() returns the same refcounted bs_channel to every caller on a thread.
+ * Releasing one reference must not tear down esnap channels that other users of the bs_channel
+ * are still using; they are released through the bs_dev once the bs_channel is destroyed.
+ */
+static void
+blob_esnap_shared_bs_channel_free(void)
+{
+	struct spdk_blob_store	*bs = g_bs;
+	struct spdk_blob_opts	opts;
+	struct ut_esnap_opts	ut_esnap_opts;
+	struct spdk_blob	*blob;
+	struct ut_esnap_dev	*ut_dev;
+	spdk_blob_id		blobid;
+	uint64_t		start_thread = g_ut_thread_id;
+	bool			destroyed = false;
+	struct spdk_io_channel	*ch_a, *ch_b;
+	struct ut_esnap_channel	*ut_ch;
+	const uint32_t		blocklen = bs->io_unit_size;
+	char			buf[blocklen * 4];
+
+	SPDK_CU_ASSERT_FATAL(g_ut_num_threads > 1);
+	set_thread(0);
+
+	ut_esnap_opts_init(blocklen, 2048, "shared_bs_channel", &destroyed, &ut_esnap_opts);
+	ut_spdk_blob_opts_init(&opts);
+	opts.esnap_id = &ut_esnap_opts;
+	opts.esnap_id_len = sizeof(ut_esnap_opts);
+	opts.num_clusters = 10;
+	spdk_bs_create_blob_ext(bs, &opts, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
+	blobid = g_blobid;
+
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	ut_dev = (struct ut_esnap_dev *)blob->back_bs_dev;
+	SPDK_CU_ASSERT_FATAL(ut_dev != NULL);
+
+	/* Thread 1 holds no md_channel, so ch_a and ch_b are the only bs_channel references. */
+	set_thread(1);
+	ch_a = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch_a != NULL);
+	spdk_blob_io_read(blob, ch_a, buf, 0, 1, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(ut_dev->num_channels == 1);
+	ut_ch = ut_esnap_get_io_channel(ch_a, blobid);
+	SPDK_CU_ASSERT_FATAL(ut_ch != NULL);
+	CU_ASSERT(ut_ch->blocks_read == 1);
+
+	/* A second user on the same thread, e.g. a shallow copy, shares the bs_channel. */
+	ch_b = spdk_bs_alloc_io_channel(bs);
+	CU_ASSERT(ch_b == ch_a);
+
+	/* The first user has a read in flight on the esnap channel. */
+	ut_dev->defer_read = true;
+	g_bserrno = 0xbad;
+	spdk_blob_io_read(blob, ch_a, buf, 0, 4, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0xbad);
+	CU_ASSERT(ut_ch->outstanding_reads == 1);
+
+	/*
+	 * The second user finishes. The esnap channel used by the first user must survive, or it
+	 * would be destroyed with the read still in flight.
+	 */
+	spdk_bs_free_io_channel(ch_b);
+	poll_threads();
+	CU_ASSERT(ut_dev->num_channels == 1);
+	CU_ASSERT(ut_dev->num_destroy_channel_calls == 0);
+	CU_ASSERT(ut_esnap_get_io_channel(ch_a, blobid) == ut_ch);
+
+	ut_esnap_complete_deferred_read(ut_dev);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(ut_esnap_get_io_channel(ch_a, blobid) == ut_ch);
+	CU_ASSERT(ut_ch->outstanding_reads == 0);
+	CU_ASSERT(ut_ch->blocks_read == 5);
+	CU_ASSERT(ut_dev->num_channels == 1);
+
+	/* Dropping the last reference destroys the bs_channel and its esnap channel via the bs_dev. */
+	spdk_bs_free_io_channel(ch_a);
+	poll_threads();
+	CU_ASSERT(ut_dev->num_channels == 0);
+	CU_ASSERT(ut_dev->num_destroy_channel_calls == 1);
+
+	set_thread(0);
+	g_bserrno = 0xbad;
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(destroyed);
+
 	set_thread(start_thread);
 }
 
@@ -12134,6 +12244,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_esnap_io_4096_512);
 		CU_ADD_TEST(suite, blob_esnap_io_512_4096);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_thread_add_remove);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_shared_bs_channel_free);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_snapshot);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_inflate);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_decouple);

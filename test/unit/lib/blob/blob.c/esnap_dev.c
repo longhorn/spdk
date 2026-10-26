@@ -79,17 +79,28 @@ struct ut_esnap_opts {
 	char		name[32];
 };
 
+struct ut_esnap_channel;
+
 struct ut_esnap_dev {
 	struct spdk_bs_dev	bs_dev;
 	struct ut_esnap_opts	ut_opts;
 	spdk_blob_id		blob_id;
 	uint32_t		num_channels;
+	uint32_t		num_destroy_channel_calls;
+	/*
+	 * When set, the next read is held until ut_esnap_complete_deferred_read() is called, like
+	 * an IO that is still in flight on the back device.
+	 */
+	bool			defer_read;
+	struct ut_esnap_channel	*deferred_ch;
+	struct spdk_bs_dev_cb_args *deferred_cb_args;
 };
 
 struct ut_esnap_channel {
 	struct ut_esnap_dev	*dev;
 	struct spdk_thread	*thread;
 	uint64_t		blocks_read;
+	uint32_t		outstanding_reads;
 };
 
 static void
@@ -120,6 +131,9 @@ ut_esnap_create_channel(struct spdk_bs_dev *dev)
 static void
 ut_esnap_destroy_channel(struct spdk_bs_dev *dev, struct spdk_io_channel *channel)
 {
+	struct ut_esnap_dev *ut_dev = (struct ut_esnap_dev *)dev;
+
+	ut_dev->num_destroy_channel_calls++;
 	spdk_put_io_channel(channel);
 }
 
@@ -178,6 +192,31 @@ ut_esnap_read(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel, void 
 		ut_memset8(payload + cur * block_size, word.num, block_size);
 	}
 	ut_ch->blocks_read += lba_count;
+
+	if (ut_dev->defer_read) {
+		CU_ASSERT(ut_dev->deferred_cb_args == NULL);
+		ut_dev->defer_read = false;
+		ut_dev->deferred_ch = ut_ch;
+		ut_dev->deferred_cb_args = cb_args;
+		ut_ch->outstanding_reads++;
+		return;
+	}
+
+	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+}
+
+static void
+ut_esnap_complete_deferred_read(struct ut_esnap_dev *ut_dev)
+{
+	struct spdk_bs_dev_cb_args *cb_args = ut_dev->deferred_cb_args;
+
+	SPDK_CU_ASSERT_FATAL(cb_args != NULL);
+	ut_dev->deferred_cb_args = NULL;
+	/* NULL if the channel was destroyed while the read was outstanding. */
+	if (ut_dev->deferred_ch != NULL) {
+		ut_dev->deferred_ch->outstanding_reads--;
+		ut_dev->deferred_ch = NULL;
+	}
 
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
 }
@@ -251,6 +290,7 @@ ut_esnap_io_channel_create(void *io_device, void *ctx)
 	ut_ch->dev = ut_dev;
 	ut_ch->thread = spdk_get_thread();
 	ut_ch->blocks_read = 0;
+	ut_ch->outstanding_reads = 0;
 
 	ut_dev->num_channels++;
 
@@ -264,6 +304,12 @@ ut_esnap_io_channel_destroy(void *io_device, void *ctx)
 	struct ut_esnap_channel	*ut_ch = ctx;
 
 	CU_ASSERT(ut_ch->thread == spdk_get_thread());
+
+	/* Like bdev_channel_destroy_resource(), a channel must not go away with IO in flight. */
+	CU_ASSERT(ut_ch->outstanding_reads == 0);
+	if (ut_dev->deferred_ch == ut_ch) {
+		ut_dev->deferred_ch = NULL;
+	}
 
 	CU_ASSERT(ut_dev->num_channels > 0);
 	ut_dev->num_channels--;
