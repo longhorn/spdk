@@ -10012,6 +10012,12 @@ _blob_esnap_clone_hydrate(enum blob_inflate_type allocate_type)
 	} else {
 		CU_ASSERT(g_bserrno == 0);
 		UT_ASSERT_IS_NOT_ESNAP_CLONE(blob);
+		/*
+		 * The esnap channel cached while copying must be released along with the esnap
+		 * device, even though the bs_channel is still held by channel and md_channel.
+		 */
+		CU_ASSERT(ut_esnap_get_io_channel(channel, blobid) == NULL);
+		CU_ASSERT(destroyed);
 		CU_ASSERT(blob_esnap_verify_contents(blob, channel, 0, esnap_sz, esnap_sz, "read"));
 	}
 	ut_blob_close_and_delete(bs, blob);
@@ -10042,6 +10048,117 @@ static void
 blob_esnap_clone_detach(void)
 {
 	_blob_esnap_clone_hydrate(BLOB_INFLATE_ALLOCATE_NONE);
+}
+
+/*
+ * Inflating or decoupling an esnap clone on one thread must release the esnap channels cached on
+ * every thread before the esnap device is destroyed, even while those bs_channels stay alive.
+ */
+static void
+_blob_esnap_clone_hydrate_multithread(enum blob_inflate_type allocate_type)
+{
+	struct spdk_blob_store	*bs = g_bs;
+	struct spdk_blob_opts	opts;
+	struct ut_esnap_opts	esnap_opts;
+	struct ut_esnap_dev	*ut_dev;
+	struct spdk_blob	*blob;
+	spdk_blob_id		blobid;
+	struct spdk_io_channel	*ch0, *ch1;
+	bool			destroyed = false;
+	const uint32_t		blocklen = spdk_bs_get_io_unit_size(bs);
+	const uint32_t		cluster_sz = spdk_bs_get_cluster_size(bs);
+	const uint64_t		esnap_num_clusters = 4;
+	const uint32_t		esnap_sz = cluster_sz * esnap_num_clusters;
+	const uint64_t		esnap_num_blocks = esnap_sz / blocklen;
+	uint64_t		start_thread = g_ut_thread_id;
+	char			buf[blocklen];
+
+	SPDK_CU_ASSERT_FATAL(g_ut_num_threads > 1);
+	set_thread(0);
+
+	ut_spdk_blob_opts_init(&opts);
+	ut_esnap_opts_init(blocklen, esnap_num_blocks, __func__, &destroyed, &esnap_opts);
+	opts.esnap_id = &esnap_opts;
+	opts.esnap_id_len = sizeof(esnap_opts);
+	opts.num_clusters = esnap_num_clusters;
+	spdk_bs_create_blob_ext(bs, &opts, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
+	blobid = g_blobid;
+
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	ut_dev = (struct ut_esnap_dev *)blob->back_bs_dev;
+	SPDK_CU_ASSERT_FATAL(ut_dev != NULL);
+
+	/* Cache an esnap channel on thread 1. */
+	set_thread(1);
+	ch1 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+	spdk_blob_io_read(blob, ch1, buf, 0, 1, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(ut_esnap_get_io_channel(ch1, blobid) != NULL);
+	CU_ASSERT(ut_dev->num_channels == 1);
+
+	/* Hydrate from thread 0 while thread 1 still holds its bs_channel. */
+	set_thread(0);
+	ch0 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch0 != NULL);
+	g_bserrno = 0xbad;
+	if (allocate_type == BLOB_INFLATE_ALLOCATE_ALL) {
+		spdk_bs_inflate_blob(bs, ch0, blobid, blob_op_complete, NULL);
+	} else {
+		spdk_bs_blob_decouple_parent(bs, ch0, blobid, blob_op_complete, NULL);
+	}
+
+	/*
+	 * Thread 1 has not released its esnap channel yet, so the operation must not complete and
+	 * the esnap device must not be destroyed.
+	 */
+	poll_thread(0);
+	CU_ASSERT(g_bserrno == 0xbad);
+	CU_ASSERT(!destroyed);
+	CU_ASSERT(ut_esnap_get_io_channel(ch1, blobid) != NULL);
+
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	UT_ASSERT_IS_NOT_ESNAP_CLONE(blob);
+
+	/* ut_esnap_destroy() also asserts that no channels were left when the device was freed. */
+	CU_ASSERT(destroyed);
+	CU_ASSERT(ut_esnap_get_io_channel(ch0, blobid) == NULL);
+	CU_ASSERT(ut_esnap_get_io_channel(ch1, blobid) == NULL);
+
+	/* IO on thread 1 must no longer create an esnap channel. */
+	set_thread(1);
+	CU_ASSERT(blob_esnap_verify_contents(blob, ch1, 0, esnap_sz, esnap_sz, "read"));
+	CU_ASSERT(ut_esnap_get_io_channel(ch1, blobid) == NULL);
+	spdk_bs_free_io_channel(ch1);
+	poll_threads();
+
+	set_thread(0);
+	spdk_bs_free_io_channel(ch0);
+	poll_threads();
+	ut_blob_close_and_delete(bs, blob);
+
+	set_thread(start_thread);
+}
+
+static void
+blob_esnap_clone_inflate_multithread(void)
+{
+	_blob_esnap_clone_hydrate_multithread(BLOB_INFLATE_ALLOCATE_ALL);
+}
+
+static void
+blob_esnap_clone_decouple_multithread(void)
+{
+	_blob_esnap_clone_hydrate_multithread(BLOB_INFLATE_ALLOCATE_UNALLOCATED);
 }
 
 static void
@@ -12021,6 +12138,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_inflate);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_decouple);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_detach);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_inflate_multithread);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_decouple_multithread);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_reload);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug);
 		CU_ADD_TEST(suite_blob, blob_is_degraded);

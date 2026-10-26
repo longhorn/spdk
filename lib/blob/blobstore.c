@@ -68,6 +68,11 @@ struct blob_esnap_channel {
 static int blob_esnap_channel_compare(struct blob_esnap_channel *c1, struct blob_esnap_channel *c2);
 static void blob_esnap_destroy_bs_dev_channels(struct spdk_blob *blob, bool abort_io,
 		spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+struct blob_esnap_destroy_ctx;
+static struct blob_esnap_destroy_ctx *blob_esnap_destroy_ctx_alloc(void);
+static void blob_esnap_destroy_channels(struct blob_esnap_destroy_ctx *ctx, struct spdk_blob *blob,
+					struct spdk_bs_dev *bs_dev, bool abort_io,
+					spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 static void blob_esnap_destroy_bs_channel(struct spdk_bs_channel *ch);
 static void blob_set_back_bs_dev_frozen(void *_ctx, int bserrno);
 RB_GENERATE_STATIC(blob_esnap_channel_tree, blob_esnap_channel, node, blob_esnap_channel_compare)
@@ -574,18 +579,18 @@ blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg
 	spdk_for_each_channel(blob->bs, blob_io_sync, ctx, blob_io_cpl);
 }
 
-static void
-blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+static struct freeze_io_ctx *
+blob_unfreeze_io_ctx_alloc(void)
 {
-	struct freeze_io_ctx *ctx;
+	return calloc(1, sizeof(struct freeze_io_ctx));
+}
 
+/* Unfreeze IO with a context from blob_unfreeze_io_ctx_alloc(), so that it cannot fail. */
+static void
+blob_unfreeze_io_with_ctx(struct spdk_blob *blob, struct freeze_io_ctx *ctx,
+			  spdk_blob_op_complete cb_fn, void *cb_arg)
+{
 	blob_verify_md_op(blob);
-
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
 
 	ctx->cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
 	ctx->cpl.u.blob_basic.cb_fn = cb_fn;
@@ -597,6 +602,22 @@ blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_a
 	blob->frozen_refcnt--;
 
 	spdk_for_each_channel(blob->bs, blob_execute_queued_io, ctx, blob_io_cpl);
+}
+
+static void
+blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct freeze_io_ctx *ctx;
+
+	blob_verify_md_op(blob);
+
+	ctx = blob_unfreeze_io_ctx_alloc();
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	blob_unfreeze_io_with_ctx(blob, ctx, cb_fn, cb_arg);
 }
 
 static int
@@ -6793,6 +6814,11 @@ struct spdk_clone_snapshot_ctx {
 		struct spdk_blob *blob;
 	} new;
 
+	/* External snapshot device detached from the original blob while inflating it. */
+	struct spdk_bs_dev *esnap_back_bs_dev;
+	struct blob_esnap_destroy_ctx *esnap_destroy_ctx;
+	struct freeze_io_ctx *esnap_unfreeze_ctx;
+
 	/* xattrs specified for snapshot/clones only. They have no impact on
 	 * the original blobs xattrs. */
 	const struct spdk_blob_xattr_opts *xattrs;
@@ -7380,23 +7406,134 @@ bs_inflate_blob_set_parent_cpl(void *cb_arg, struct spdk_blob *_parent, int bser
 }
 
 static void
+bs_inflate_blob_finish(struct spdk_clone_snapshot_ctx *ctx)
+{
+	struct spdk_blob *_blob = ctx->original.blob;
+
+	/* If blob data has changed, I remove clusters checksums */
+	if (ctx->allocate_type != BLOB_INFLATE_ALLOCATE_NONE) {
+		bs_snapshot_free_clusters_checksums(_blob);
+	}
+
+	/* Temporarily override md_ro flag for MD modification */
+	_blob->md_ro = false;
+	blob_remove_xattr(_blob, BLOB_SNAPSHOT, true);
+	_blob->state = SPDK_BLOB_STATE_DIRTY;
+
+	spdk_blob_sync_md(_blob, bs_clone_snapshot_origblob_cleanup, ctx);
+}
+
+static void
+bs_inflate_blob_esnap_unfrozen(void *cb_arg, int bserrno)
+{
+	struct spdk_clone_snapshot_ctx *ctx = cb_arg;
+
+	/* The unfreeze uses a preallocated context, so it cannot fail. */
+	assert(bserrno == 0);
+	bs_inflate_blob_finish(ctx);
+}
+
+static void
+bs_inflate_blob_esnap_channels_destroyed(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	struct spdk_clone_snapshot_ctx *ctx = cb_arg;
+	struct spdk_bs_dev *back_bs_dev = ctx->esnap_back_bs_dev;
+	struct freeze_io_ctx *unfreeze_ctx = ctx->esnap_unfreeze_ctx;
+
+	ctx->esnap_back_bs_dev = NULL;
+	ctx->esnap_unfreeze_ctx = NULL;
+	if (bserrno != 0) {
+		/* Channels may still reference the esnap device, so leak it rather than free it. */
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": failed to destroy esnap channels: %d\n",
+			    blob->id, bserrno);
+		assert(false);
+	} else {
+		back_bs_dev->destroy(back_bs_dev);
+	}
+
+	blob_unfreeze_io_with_ctx(blob, unfreeze_ctx, bs_inflate_blob_esnap_unfrozen, ctx);
+}
+
+/* Remove the parent of a blob inflated with BLOB_INFLATE_ALLOCATE_ALL. */
+static void
+bs_inflate_blob_remove_parent(struct spdk_clone_snapshot_ctx *ctx)
+{
+	struct spdk_blob *_blob = ctx->original.blob;
+
+	/* remove thin provisioning */
+	bs_blob_list_remove(_blob);
+	if (blob_is_esnap_clone(_blob)) {
+		/*
+		 * Stop being an esnap clone so that IO no longer creates esnap channels. The
+		 * caller releases the cached ones before destroying the esnap device.
+		 */
+		ctx->esnap_back_bs_dev = _blob->back_bs_dev;
+		_blob->back_bs_dev = NULL;
+		blob_remove_xattr(_blob, BLOB_EXTERNAL_SNAPSHOT_ID, true);
+		_blob->invalid_flags &= ~SPDK_BLOB_EXTERNAL_SNAPSHOT;
+	} else {
+		blob_remove_xattr(_blob, BLOB_SNAPSHOT, true);
+		blob_back_bs_destroy(_blob);
+	}
+	_blob->invalid_flags = _blob->invalid_flags & ~SPDK_BLOB_THIN_PROV;
+	_blob->parent_id = SPDK_BLOBID_INVALID;
+}
+
+static void
+bs_inflate_blob_esnap_frozen(void *cb_arg, int bserrno)
+{
+	struct spdk_clone_snapshot_ctx *ctx = cb_arg;
+	struct spdk_blob *_blob = ctx->original.blob;
+	struct blob_esnap_destroy_ctx *destroy_ctx = ctx->esnap_destroy_ctx;
+
+	ctx->esnap_destroy_ctx = NULL;
+	if (bserrno != 0) {
+		free(destroy_ctx);
+		free(ctx->esnap_unfreeze_ctx);
+		ctx->esnap_unfreeze_ctx = NULL;
+		bs_clone_snapshot_origblob_cleanup(ctx, bserrno);
+		return;
+	}
+
+	bs_inflate_blob_remove_parent(ctx);
+	blob_esnap_destroy_channels(destroy_ctx, _blob, ctx->esnap_back_bs_dev, false,
+				    bs_inflate_blob_esnap_channels_destroyed, ctx);
+}
+
+static void
 bs_inflate_blob_done(struct spdk_clone_snapshot_ctx *ctx)
 {
 	struct spdk_blob *_blob = ctx->original.blob;
 	struct spdk_blob *_parent;
 
 	if (ctx->allocate_type == BLOB_INFLATE_ALLOCATE_ALL) {
-		/* remove thin provisioning */
-		bs_blob_list_remove(_blob);
-		if (_blob->parent_id == SPDK_BLOBID_EXTERNAL_SNAPSHOT) {
-			blob_remove_xattr(_blob, BLOB_EXTERNAL_SNAPSHOT_ID, true);
-			_blob->invalid_flags &= ~SPDK_BLOB_EXTERNAL_SNAPSHOT;
-		} else {
-			blob_remove_xattr(_blob, BLOB_SNAPSHOT, true);
+		if (blob_is_esnap_clone(_blob) && _blob->back_bs_dev != NULL) {
+			/*
+			 * Allocate before changing anything so that a failure leaves the blob intact,
+			 * and so that the blob cannot be left frozen if an allocation fails later.
+			 */
+			ctx->esnap_destroy_ctx = blob_esnap_destroy_ctx_alloc();
+			ctx->esnap_unfreeze_ctx = blob_unfreeze_io_ctx_alloc();
+			if (ctx->esnap_destroy_ctx == NULL || ctx->esnap_unfreeze_ctx == NULL) {
+				free(ctx->esnap_destroy_ctx);
+				free(ctx->esnap_unfreeze_ctx);
+				ctx->esnap_destroy_ctx = NULL;
+				ctx->esnap_unfreeze_ctx = NULL;
+				bs_clone_snapshot_origblob_cleanup(ctx, -ENOMEM);
+				return;
+			}
+
+			/*
+			 * Inflating does not freeze IO, but other threads read the esnap state of
+			 * the blob when they submit IO. Freeze it while the esnap device is detached
+			 * so that no thread sees an esnap clone without its device, or creates a
+			 * channel for the device after its channels were released.
+			 */
+			blob_freeze_io(_blob, bs_inflate_blob_esnap_frozen, ctx);
+			return;
 		}
-		_blob->invalid_flags = _blob->invalid_flags & ~SPDK_BLOB_THIN_PROV;
-		blob_back_bs_destroy(_blob);
-		_blob->parent_id = SPDK_BLOBID_INVALID;
+
+		bs_inflate_blob_remove_parent(ctx);
 	} else {
 		/* For now, esnap clones always have BLOB_INFLATE_ALLOCATE_ALL set. */
 		assert(!blob_is_esnap_clone(_blob));
@@ -7415,17 +7552,7 @@ bs_inflate_blob_done(struct spdk_clone_snapshot_ctx *ctx)
 		_blob->back_bs_dev = bs_create_zeroes_dev();
 	}
 
-	/* If blob data has changed, I remove clusters checksums */
-	if (ctx->allocate_type != BLOB_INFLATE_ALLOCATE_NONE) {
-		bs_snapshot_free_clusters_checksums(_blob);
-	}
-
-	/* Temporarily override md_ro flag for MD modification */
-	_blob->md_ro = false;
-	blob_remove_xattr(_blob, BLOB_SNAPSHOT, true);
-	_blob->state = SPDK_BLOB_STATE_DIRTY;
-
-	spdk_blob_sync_md(_blob, bs_clone_snapshot_origblob_cleanup, ctx);
+	bs_inflate_blob_finish(ctx);
 }
 
 /* Check if cluster needs allocation */
@@ -11442,9 +11569,39 @@ blob_esnap_destroy_one_channel(struct spdk_io_channel_iter *i)
 	spdk_for_each_channel_continue(i, 0);
 }
 
+static struct blob_esnap_destroy_ctx *
+blob_esnap_destroy_ctx_alloc(void)
+{
+	return calloc(1, sizeof(struct blob_esnap_destroy_ctx));
+}
+
+/*
+ * Destroy the channels that bs_dev created for a specific blob on each thread with a blobstore
+ * channel, using a ctx from blob_esnap_destroy_ctx_alloc(). The caller must keep bs_dev alive
+ * until cb_fn is called.
+ */
+static void
+blob_esnap_destroy_channels(struct blob_esnap_destroy_ctx *ctx, struct spdk_blob *blob,
+			    struct spdk_bs_dev *bs_dev, bool abort_io,
+			    spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->blob = blob;
+	ctx->back_bs_dev = bs_dev;
+	ctx->abort_io = abort_io;
+
+	SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": destroying channels for this blob\n",
+		      blob->id);
+
+	blob->bs->esnap_channels_unloading++;
+	spdk_for_each_channel(blob->bs, blob_esnap_destroy_one_channel, ctx,
+			      blob_esnap_destroy_channels_done);
+}
+
 /*
  * Destroy the channels for a specific blob on each thread with a blobstore channel. This should be
- * used when closing an esnap clone blob and after decoupling from the parent.
+ * used when closing an esnap clone blob.
  */
 static void
 blob_esnap_destroy_bs_dev_channels(struct spdk_blob *blob, bool abort_io,
@@ -11459,25 +11616,15 @@ blob_esnap_destroy_bs_dev_channels(struct spdk_blob *blob, bool abort_io,
 		return;
 	}
 
-	ctx = calloc(1, sizeof(*ctx));
+	ctx = blob_esnap_destroy_ctx_alloc();
 	if (ctx == NULL) {
 		if (cb_fn != NULL) {
 			cb_fn(cb_arg, blob, -ENOMEM);
 		}
 		return;
 	}
-	ctx->cb_fn = cb_fn;
-	ctx->cb_arg = cb_arg;
-	ctx->blob = blob;
-	ctx->back_bs_dev = blob->back_bs_dev;
-	ctx->abort_io = abort_io;
 
-	SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": destroying channels for this blob\n",
-		      blob->id);
-
-	blob->bs->esnap_channels_unloading++;
-	spdk_for_each_channel(blob->bs, blob_esnap_destroy_one_channel, ctx,
-			      blob_esnap_destroy_channels_done);
+	blob_esnap_destroy_channels(ctx, blob, blob->back_bs_dev, abort_io, cb_fn, cb_arg);
 }
 
 /*
