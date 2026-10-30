@@ -484,8 +484,12 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super 
 
 struct spdk_bs_dev *bs_create_zeroes_dev(void);
 struct spdk_bs_dev *bs_create_blob_bs_dev(struct spdk_blob *blob);
-struct spdk_io_channel *blob_esnap_get_io_channel(struct spdk_io_channel *ch,
+struct blob_esnap_channel;
+struct blob_esnap_channel *blob_esnap_get_channel(struct spdk_io_channel *ch,
 		struct spdk_blob *blob);
+struct spdk_io_channel *blob_esnap_channel_io_channel(struct blob_esnap_channel *esnap_channel);
+void blob_esnap_channel_io_start(struct blob_esnap_channel *esnap_channel);
+bool blob_esnap_channel_io_done(struct blob_esnap_channel *esnap_channel, uint32_t count);
 bool blob_backed_with_zeroes_dev(struct spdk_blob *blob);
 
 /* Unit Conversions
