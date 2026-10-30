@@ -10497,6 +10497,1553 @@ blob_delete_snapshot_resized_clone(void)
 	g_phys_blocklen = saved_phys_blocklen;
 }
 
+#define UT_LARGE_XATTR_LEN 3000
+
+static void
+ut_get_large_xattr_value(void *arg, const char *name, const void **value, size_t *value_len)
+{
+	*value = arg;
+	*value_len = UT_LARGE_XATTR_LEN;
+}
+
+/* Make the blobstore device fail write-like I/O with -EIO, as armed by ut_arm_io_failure(). */
+#define UT_MAX_IO_FAILURES 2
+
+static struct ut_io_failure {
+	uint64_t lba;		/* UINT64_MAX: any LBA */
+	uint32_t nth;
+	uint32_t count;
+} g_ut_io_failures[UT_MAX_IO_FAILURES];
+static uint32_t g_ut_num_io_failures;
+static bool g_ut_io_failed;
+
+static void
+ut_fail_io_complete(void *arg)
+{
+	struct spdk_bs_dev_cb_args *cb_args = arg;
+
+	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EIO);
+}
+
+static bool
+ut_fail_io(uint64_t lba, struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct ut_io_failure *f;
+	bool fail = false;
+	uint32_t i;
+
+	for (i = 0; i < g_ut_num_io_failures; i++) {
+		f = &g_ut_io_failures[i];
+		if ((f->lba == UINT64_MAX || f->lba == lba) && ++f->count == f->nth) {
+			fail = true;
+		}
+	}
+	if (!fail) {
+		return false;
+	}
+
+	g_ut_io_failed = true;
+	spdk_thread_send_msg(spdk_get_thread(), ut_fail_io_complete, cb_args);
+	return true;
+}
+
+static void
+ut_failing_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_write(dev, channel, payload, lba, lba_count, cb_args);
+	}
+}
+
+static void
+ut_failing_dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		      struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
+		      struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_writev(dev, channel, iov, iovcnt, lba, lba_count, cb_args);
+	}
+}
+
+static void
+ut_failing_dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			    uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_write_zeroes(dev, channel, lba, lba_count, cb_args);
+	}
+}
+
+static void
+ut_failing_dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		     uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_unmap(dev, channel, lba, lba_count, cb_args);
+	}
+}
+
+/* Fail the nth write-like I/O to lba, or to any LBA if lba is UINT64_MAX, counting from now.
+ * Further failures can be armed until ut_disarm_io_failure(). */
+static void
+ut_arm_io_failure(struct spdk_bs_dev *dev, uint64_t lba, uint32_t nth)
+{
+	SPDK_CU_ASSERT_FATAL(g_ut_num_io_failures < UT_MAX_IO_FAILURES);
+	SPDK_CU_ASSERT_FATAL(nth > 0);
+	if (g_ut_num_io_failures == 0) {
+		g_ut_io_failed = false;
+	}
+	g_ut_io_failures[g_ut_num_io_failures].lba = lba;
+	g_ut_io_failures[g_ut_num_io_failures].nth = nth;
+	g_ut_io_failures[g_ut_num_io_failures].count = 0;
+	g_ut_num_io_failures++;
+	dev->write = ut_failing_dev_write;
+	dev->writev = ut_failing_dev_writev;
+	dev->write_zeroes = ut_failing_dev_write_zeroes;
+	dev->unmap = ut_failing_dev_unmap;
+}
+
+static void
+ut_disarm_io_failure(struct spdk_bs_dev *dev)
+{
+	g_ut_num_io_failures = 0;
+	if (dev == NULL) {
+		return;
+	}
+	dev->write = dev_write;
+	dev->writev = dev_writev;
+	dev->write_zeroes = dev_write_zeroes;
+	dev->unmap = dev_unmap;
+}
+
+/* Claim all the free metadata pages of the blobstore, recording them in pages. */
+static uint32_t
+ut_claim_free_md_pages(struct spdk_blob_store *bs, uint32_t *pages, uint32_t max_pages)
+{
+	uint32_t page, num_pages = 0;
+
+	spdk_spin_lock(&bs->used_lock);
+	while ((page = spdk_bit_array_find_first_clear(bs->used_md_pages, 0)) != UINT32_MAX) {
+		SPDK_CU_ASSERT_FATAL(num_pages < max_pages);
+		bs_claim_md_page(bs, page);
+		pages[num_pages++] = page;
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	return num_pages;
+}
+
+static void
+ut_release_md_pages(struct spdk_blob_store *bs, uint32_t *pages, uint32_t num_pages)
+{
+	spdk_spin_lock(&bs->used_lock);
+	while (num_pages > 0) {
+		bs_release_md_page(bs, pages[--num_pages]);
+	}
+	spdk_spin_unlock(&bs->used_lock);
+}
+
+static struct spdk_blob *
+ut_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid)
+{
+	g_blob = NULL;
+	g_bserrno = -1;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+
+	return g_blob;
+}
+
+static void
+blob_persist_error(void)
+{
+	/* A failed persist of a blob's metadata must be reported to its caller. Each time the
+	 * metadata of a blob that spans two pages is persisted, a new metadata page is claimed
+	 * for its second page: without any free metadata page, syncing the blob's metadata
+	 * fails. Closing the blob then releases it, and reports no error: callers such as the
+	 * lvol library take a failed close for one that kept the blob open. Persists queued
+	 * behind the one in progress complete together, and must all report the failure of the
+	 * persist done for them. */
+	struct spdk_blob_xattr_opts xattrs;
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	char *xattr_names[] = {"large0", "large1"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t filled[64];
+	uint32_t num_filled;
+	const void *value;
+	size_t value_len;
+	int rc, rc1, rc2, rc3;
+
+	g_phys_blocklen = 4096;
+	dev = init_dev();
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.num_md_pages = SPDK_COUNTOF(filled);
+	spdk_bs_init(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	xattrs.count = SPDK_COUNTOF(xattr_names);
+	xattrs.names = xattr_names;
+	xattrs.ctx = xattr_value;
+	xattrs.get_value = ut_get_large_xattr_value;
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.xattrs = xattrs;
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	blobid = spdk_blob_get_id(blob);
+	SPDK_CU_ASSERT_FATAL(blob->active.num_pages == 2);
+
+	/* Syncing fails without free metadata pages, and succeeds once there are. */
+	rc = spdk_blob_set_xattr(blob, "kept", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+	g_bserrno = 0;
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+	ut_release_md_pages(bs, filled, num_filled);
+
+	g_bserrno = -1;
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Closing without free metadata pages releases the blob, without reporting an error. */
+	rc = spdk_blob_set_xattr(blob, "lost", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+	g_bserrno = -1;
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	ut_release_md_pages(bs, filled, num_filled);
+
+	ut_bs_reload(&bs, &bs_opts);
+	blob = ut_open_blob(bs, blobid);
+	rc = spdk_blob_get_xattr_value(blob, "kept", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(value_len == sizeof("value"));
+	rc = spdk_blob_get_xattr_value(blob, "lost", &value, &value_len);
+	CU_ASSERT(rc == -ENOENT);
+
+	/* Mark the blobstore dirty, so that the persists below do not write its super block. */
+	rc = spdk_blob_set_xattr(blob, "first", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	g_bserrno = -1;
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* The first sync writes the blob's second page, its first page, and zeroes its old
+	 * second page. Fail the next write, the first one of the persist done for the two
+	 * syncs queued behind the first one. */
+	ut_arm_io_failure(bs->dev, UINT64_MAX, 4);
+	rc1 = rc2 = rc3 = 1;
+	rc = spdk_blob_set_xattr(blob, "second", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	spdk_blob_sync_md(blob, blob_op_complete, &rc1);
+	rc = spdk_blob_set_xattr(blob, "third", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	spdk_blob_sync_md(blob, blob_op_complete, &rc2);
+	rc = spdk_blob_set_xattr(blob, "fourth", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	spdk_blob_sync_md(blob, blob_op_complete, &rc3);
+	poll_threads();
+	CU_ASSERT(g_ut_io_failed);
+	ut_disarm_io_failure(bs->dev);
+	CU_ASSERT(rc1 == 0);
+	CU_ASSERT(rc2 == -EIO);
+	CU_ASSERT(rc3 == -EIO);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
+blob_delete_snapshot_resized_clone_enomem(void)
+{
+	/* When deleting a snapshot whose clone was resized larger, the clone needs a freshly
+	 * allocated extent page for the slot that is no longer the snapshot's last one. If that
+	 * allocation fails, the deletion must abort cleanly: keep the snapshot, restore the
+	 * clone's copy-on-write mapping and leave the clone readable. */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob, *clone;
+	spdk_blob_id blobid, snapid;
+	struct spdk_io_channel *channel;
+	uint64_t pages_per_cluster;
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint8_t payload_write[DEV_BUFFER_BLOCKLEN];
+	uint8_t payload_read[DEV_BUFFER_BLOCKLEN];
+	uint8_t payload_overwrite[DEV_BUFFER_BLOCKLEN];
+	struct spdk_blob *snapshot_blob;
+	uint32_t filled[256];
+	uint32_t num_filled = 0;
+	uint32_t page;
+	const uint64_t probe_cluster = 550;
+	const uint64_t snap_clusters = 600;
+	const uint64_t clone_clusters = 2048;
+
+	g_phys_blocklen = 4096;
+	dev = init_dev();
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.cluster_sz = 4096;
+	bs_opts.num_md_pages = 256;
+	spdk_bs_init(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	pages_per_cluster = spdk_bs_get_cluster_size(bs) / spdk_bs_get_page_size(bs);
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.num_clusters = snap_clusters;
+	blob_opts.thin_provision = false;
+	blob_opts.use_extent_table = true;
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	blobid = spdk_blob_get_id(blob);
+
+	memset(payload_write, 0xA5, sizeof(payload_write));
+	g_bserrno = -1;
+	spdk_blob_io_write(blob, channel, payload_write, probe_cluster * pages_per_cluster, 1,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapid = g_blobid;
+	g_blobid = SPDK_BLOBID_INVALID;
+	clone = blob;
+
+	g_bserrno = -1;
+	spdk_blob_resize(clone, clone_clusters, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bserrno = -1;
+	spdk_blob_sync_md(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Exhaust the metadata pages so the deletion's extent-page allocation fails. */
+	spdk_spin_lock(&bs->used_lock);
+	while ((page = spdk_bit_array_find_first_clear(bs->used_md_pages, 0)) != UINT32_MAX) {
+		SPDK_CU_ASSERT_FATAL(num_filled < SPDK_COUNTOF(filled));
+		bs_claim_md_page(bs, page);
+		filled[num_filled++] = page;
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	/* Delete the snapshot: the extent-page allocation fails and the deletion aborts. */
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+
+	/* Give the metadata pages back. */
+	spdk_spin_lock(&bs->used_lock);
+	while (num_filled > 0) {
+		bs_release_md_page(bs, filled[--num_filled]);
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	/* The snapshot must still exist, and the clone must keep its resized size. */
+	CU_ASSERT(spdk_blob_get_num_clusters(clone) == clone_clusters);
+
+	/* The clone still reads its data, served from the retained snapshot by copy-on-write. */
+	memset(payload_read, 0, sizeof(payload_read));
+	g_bserrno = -1;
+	spdk_blob_io_read(clone, channel, payload_read, probe_cluster * pages_per_cluster, 1,
+			  blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(payload_write, payload_read, sizeof(payload_read)) == 0);
+
+	/* Overwriting an inherited cluster on the clone must go through copy-on-write. If the
+	 * aborted deletion had left the clone's cluster map merged with the snapshot's, this
+	 * write would land on the snapshot's cluster and corrupt it. */
+	memset(payload_overwrite, 0x5C, sizeof(payload_overwrite));
+	g_bserrno = -1;
+	spdk_blob_io_write(clone, channel, payload_overwrite, probe_cluster * pages_per_cluster, 1,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* The snapshot is still openable and its data is intact. */
+	g_bserrno = -1;
+	spdk_bs_open_blob(bs, snapid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot_blob = g_blob;
+	memset(payload_read, 0, sizeof(payload_read));
+	g_bserrno = -1;
+	spdk_blob_io_read(snapshot_blob, channel, payload_read, probe_cluster * pages_per_cluster, 1,
+			  blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(payload_write, payload_read, sizeof(payload_read)) == 0);
+	spdk_blob_close(snapshot_blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* With the metadata pages back, the deletion now succeeds. */
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_clusters(clone) == clone_clusters);
+
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+/* Write the given byte pattern to the first io_unit of a cluster. */
+static void
+ut_cluster_write(struct spdk_blob *blob, struct spdk_io_channel *channel, uint64_t cluster,
+		 uint8_t pattern)
+{
+	uint64_t io_units_per_cluster = spdk_bs_get_cluster_size(blob->bs) /
+					spdk_bs_get_io_unit_size(blob->bs);
+	uint8_t payload[DEV_BUFFER_BLOCKLEN];
+
+	SPDK_CU_ASSERT_FATAL(spdk_bs_get_io_unit_size(blob->bs) <= sizeof(payload));
+	memset(payload, pattern, sizeof(payload));
+	g_bserrno = -1;
+	spdk_blob_io_write(blob, channel, payload, cluster * io_units_per_cluster, 1,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+/* Check that the first io_unit of a cluster holds the given byte pattern. */
+static bool
+ut_cluster_check(struct spdk_blob *blob, struct spdk_io_channel *channel, uint64_t cluster,
+		 uint8_t pattern)
+{
+	uint64_t io_unit_size = spdk_bs_get_io_unit_size(blob->bs);
+	uint64_t io_units_per_cluster = spdk_bs_get_cluster_size(blob->bs) / io_unit_size;
+	uint8_t payload[DEV_BUFFER_BLOCKLEN];
+	uint8_t expected[DEV_BUFFER_BLOCKLEN];
+
+	SPDK_CU_ASSERT_FATAL(io_unit_size <= sizeof(payload));
+	memset(expected, pattern, sizeof(expected));
+	memset(payload, ~pattern, sizeof(payload));
+	g_bserrno = -1;
+	spdk_blob_io_read(blob, channel, payload, cluster * io_units_per_cluster, 1,
+			  blob_op_complete, NULL);
+	poll_threads();
+
+	return g_bserrno == 0 && memcmp(payload, expected, io_unit_size) == 0;
+}
+
+/* Build the scenario of the tests below on a fresh blobstore with 4 KiB clusters, where an
+ * extent page maps SPDK_EXTENTS_PER_EP (512) clusters:
+ *  - a thick 600-cluster blob (extent slot 0 full, slot 1 holding 88 clusters) gets 0xB6 in
+ *    cluster 20 (slot 0) and 0xA5 in cluster 550 (slot 1) and is snapshotted;
+ *  - the clone writes 0xC7 to cluster 10, so it owns an extent page for slot 0;
+ *  - the clone is resized to 2048 clusters, so slot 1 is no longer its last slot.
+ * clone_xattrs and snap_xattrs, if not NULL, are set on the clone and on the snapshot. The
+ * clone is closed on return. *base_md_pages is the number of metadata pages in use before
+ * any blob was created. */
+static struct spdk_blob_store *
+ut_resized_clone_scenario(struct spdk_bs_opts *bs_opts, struct spdk_blob_xattr_opts *clone_xattrs,
+			  struct spdk_blob_xattr_opts *snap_xattrs, spdk_blob_id *blobid,
+			  spdk_blob_id *snapid, uint32_t *base_md_pages)
+{
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+
+	dev = init_dev();
+	spdk_bs_opts_init(bs_opts, sizeof(*bs_opts));
+	bs_opts->cluster_sz = 4096;
+	bs_opts->num_md_pages = 256;
+	spdk_bs_init(dev, bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+	*base_md_pages = spdk_bit_array_count_set(bs->used_md_pages);
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.num_clusters = 600;
+	blob_opts.thin_provision = false;
+	blob_opts.use_extent_table = true;
+	if (clone_xattrs != NULL) {
+		blob_opts.xattrs = *clone_xattrs;
+	}
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	*blobid = spdk_blob_get_id(blob);
+
+	ut_cluster_write(blob, channel, 20, 0xB6);
+	ut_cluster_write(blob, channel, 550, 0xA5);
+
+	spdk_bs_create_snapshot(bs, *blobid, snap_xattrs, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	*snapid = g_blobid;
+	g_blobid = SPDK_BLOBID_INVALID;
+
+	ut_cluster_write(blob, channel, 10, 0xC7);
+	SPDK_CU_ASSERT_FATAL(blob->active.extent_pages[0] != 0);
+
+	g_bserrno = -1;
+	spdk_blob_resize(blob, 2048, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bserrno = -1;
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	return bs;
+}
+
+static void
+blob_delete_snapshot_resized_clone_own_ep_enomem(void)
+{
+	/* The clone owns the extent page of slot 0 and needs a new extent page for slot 1.
+	 * With a single free metadata page, the deletion can update slot 0 but not slot 1 and
+	 * has to abort. The aborted deletion must not have modified any page the clone's
+	 * on-disk metadata references: reopened from disk, the clone must still read the
+	 * snapshot's clusters by copy-on-write, so writing one of them leaves the retained
+	 * snapshot intact. */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone, *snapshot;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t filled[256];
+	uint32_t num_filled = 0;
+	uint32_t page, used_md_pages, base_md_pages;
+	const void *value;
+	size_t value_len;
+
+	g_phys_blocklen = 4096;
+	bs = ut_resized_clone_scenario(&bs_opts, NULL, NULL, &blobid, &snapid, &base_md_pages);
+
+	/* Leave a single free metadata page that can back an extent page. */
+	used_md_pages = spdk_bit_array_count_set(bs->used_md_pages);
+	spdk_spin_lock(&bs->used_lock);
+	while ((page = spdk_bit_array_find_first_clear(bs->used_md_pages, 1)) != UINT32_MAX) {
+		SPDK_CU_ASSERT_FATAL(num_filled < SPDK_COUNTOF(filled));
+		bs_claim_md_page(bs, page);
+		filled[num_filled++] = page;
+	}
+	SPDK_CU_ASSERT_FATAL(num_filled > 0);
+	bs_release_md_page(bs, filled[--num_filled]);
+	spdk_spin_unlock(&bs->used_lock);
+
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+
+	/* Give the metadata pages back. The aborted deletion released the page it allocated. */
+	spdk_spin_lock(&bs->used_lock);
+	while (num_filled > 0) {
+		bs_release_md_page(bs, filled[--num_filled]);
+	}
+	spdk_spin_unlock(&bs->used_lock);
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == used_md_pages);
+
+	/* The snapshot is retained and no longer marked for removal. */
+	spdk_bs_open_blob(bs, snapid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+	CU_ASSERT(blob_get_xattr_value(snapshot, SNAPSHOT_PENDING_REMOVAL, &value, &value_len,
+				       true) != 0);
+
+	/* Reopen the clone from disk. */
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	clone = g_blob;
+	CU_ASSERT(spdk_blob_get_num_clusters(clone) == 2048);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapid);
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	/* Cluster 20 still belongs to the snapshot: overwriting it in the clone goes through
+	 * copy-on-write and leaves the snapshot's data intact. */
+	ut_cluster_write(clone, channel, 20, 0x5C);
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(snapshot, channel, 20, 0xB6));
+
+	spdk_blob_close(snapshot, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* With metadata pages available again, the deletion succeeds. */
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == SPDK_BLOBID_INVALID);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+/* Load the blobstore left behind by the resized-clone scenario after a power failure, check
+ * that the clone kept its data and that a retained snapshot is still protected by
+ * copy-on-write, then delete everything, check that no metadata page leaked, and unload. */
+static void
+ut_resized_clone_check_recovered(struct spdk_bs_opts *bs_opts, spdk_blob_id blobid,
+				 spdk_blob_id snapid, uint32_t base_md_pages)
+{
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob *clone, *snapshot;
+	struct spdk_io_channel *channel;
+	const void *value;
+	size_t value_len;
+	int snapshot_rc;
+
+	dev = init_dev();
+	g_bs = NULL;
+	spdk_bs_load(dev, bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	clone = g_blob;
+	CU_ASSERT(spdk_blob_get_num_clusters(clone) == 2048);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	/* The snapshot is either retained, deleted, or (-EINVAL) left half-deleted by a power
+	 * failure during its deletion: the root page of a blob is cleared after the rest of its
+	 * metadata, so it can remain while the rest of the chain is already cleared. */
+	spdk_bs_open_blob(bs, snapid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	snapshot_rc = g_bserrno;
+	CU_ASSERT(snapshot_rc == 0 || snapshot_rc == -ENOENT || snapshot_rc == -EINVAL);
+	if (snapshot_rc == 0) {
+		SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+		snapshot = g_blob;
+		CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapid);
+		CU_ASSERT(blob_get_xattr_value(snapshot, SNAPSHOT_PENDING_REMOVAL, &value,
+					       &value_len, true) != 0);
+
+		ut_cluster_write(clone, channel, 20, 0x5C);
+		CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+		CU_ASSERT(ut_cluster_check(snapshot, channel, 20, 0xB6));
+
+		spdk_blob_close(snapshot, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+
+		g_bserrno = -1;
+		spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == SPDK_BLOBID_INVALID);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	/* No metadata page leaked, except the root page of a half-deleted snapshot. */
+	if (snapshot_rc != -EINVAL) {
+		CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+	}
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+}
+
+/* Device writes recorded while a blobstore recovers, so that prefixes of them can be replayed
+ * as the states a power failure during the recovery leaves behind. */
+struct ut_dev_write {
+	uint64_t offset;
+	uint64_t length;
+	uint8_t *data;	/* NULL if the range was zeroed */
+};
+
+#define UT_MAX_DEV_WRITES 256
+
+static struct ut_dev_write g_ut_dev_writes[UT_MAX_DEV_WRITES];
+static uint32_t g_ut_num_dev_writes;
+
+static uint8_t *
+ut_record_dev_write(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count, bool zeroes)
+{
+	struct ut_dev_write *w;
+
+	SPDK_CU_ASSERT_FATAL(g_ut_num_dev_writes < UT_MAX_DEV_WRITES);
+	w = &g_ut_dev_writes[g_ut_num_dev_writes++];
+	w->offset = lba * dev->blocklen;
+	w->length = lba_count * dev->blocklen;
+	w->data = NULL;
+	if (!zeroes) {
+		w->data = malloc(w->length);
+		SPDK_CU_ASSERT_FATAL(w->data != NULL);
+	}
+
+	return w->data;
+}
+
+static void
+ut_recording_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		       uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	memcpy(ut_record_dev_write(dev, lba, lba_count, false), payload, lba_count * dev->blocklen);
+	dev_write(dev, channel, payload, lba, lba_count, cb_args);
+}
+
+static void
+ut_recording_dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
+			struct spdk_bs_dev_cb_args *cb_args)
+{
+	uint8_t *data = ut_record_dev_write(dev, lba, lba_count, false);
+	int i;
+
+	for (i = 0; i < iovcnt; i++) {
+		memcpy(data, iov[i].iov_base, iov[i].iov_len);
+		data += iov[i].iov_len;
+	}
+	dev_writev(dev, channel, iov, iovcnt, lba, lba_count, cb_args);
+}
+
+static void
+ut_recording_dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			      uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	ut_record_dev_write(dev, lba, lba_count, true);
+	dev_write_zeroes(dev, channel, lba, lba_count, cb_args);
+}
+
+static void
+ut_recording_dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		       uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	ut_record_dev_write(dev, lba, lba_count, true);
+	dev_unmap(dev, channel, lba, lba_count, cb_args);
+}
+
+static void
+ut_replay_dev_writes(uint32_t count)
+{
+	struct ut_dev_write *w;
+	uint32_t i;
+
+	for (i = 0; i < count; i++) {
+		w = &g_ut_dev_writes[i];
+		if (w->data != NULL) {
+			memcpy(&g_dev_buffer[w->offset], w->data, w->length);
+		} else {
+			memset(&g_dev_buffer[w->offset], 0, w->length);
+		}
+	}
+}
+
+static void
+ut_free_dev_writes(void)
+{
+	while (g_ut_num_dev_writes > 0) {
+		free(g_ut_dev_writes[--g_ut_num_dev_writes].data);
+	}
+}
+
+/* Run the resized-clone scenario and interrupt the deletion of its snapshot by a power failure,
+ * as set by thresholds. Save the metadata and the data clusters in use, which the next load
+ * recovers from, in *saved_dev, to recover from the same state several times. Returns the
+ * result of the deletion. */
+static int
+ut_resized_clone_interrupted_delete(struct spdk_power_failure_thresholds thresholds,
+				    struct spdk_bs_opts *bs_opts,
+				    struct spdk_blob_xattr_opts *snap_xattrs, spdk_blob_id *blobid,
+				    spdk_blob_id *snapid, uint32_t *base_md_pages,
+				    uint8_t **saved_dev, size_t *saved_len)
+{
+	struct spdk_blob_store *bs;
+	int delete_rc;
+
+	bs = ut_resized_clone_scenario(bs_opts, NULL, snap_xattrs, blobid, snapid, base_md_pages);
+
+	dev_set_power_failure_thresholds(thresholds);
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, *snapid, blob_op_complete, NULL);
+	poll_threads();
+	delete_rc = g_bserrno;
+	dev_reset_power_failure_event();
+
+	/* Power failure: drop the blobstore without unloading it. */
+	*saved_len = (FIRST_DATA_CLUSTER(bs) + 1024) * spdk_bs_get_cluster_size(bs);
+	SPDK_CU_ASSERT_FATAL(*saved_len <= DEV_BUFFER_SIZE);
+	bs_free(bs);
+	g_bs = NULL;
+	*saved_dev = malloc(*saved_len);
+	SPDK_CU_ASSERT_FATAL(*saved_dev != NULL);
+	memcpy(*saved_dev, g_dev_buffer, *saved_len);
+
+	return delete_rc;
+}
+
+static void
+blob_delete_snapshot_resized_clone_power_failure(void)
+{
+	/* Interrupt the deletion of the snapshot of a resized clone at every I/O. For each of
+	 * those states, also interrupt the recovery done by the next load after every write
+	 * it makes, by replaying a prefix of the writes of a complete recovery. After a final
+	 * recovery the blobstore must load, the clone must keep its data, a retained snapshot
+	 * must still be protected by copy-on-write, and no metadata page may leak. The snapshot
+	 * gets large xattrs so that its metadata spans two pages: rewriting it during recovery
+	 * claims a new metadata page, which must not be one of the extent pages the snapshot's
+	 * on-disk metadata still references. */
+	struct spdk_power_failure_thresholds thresholds = {};
+	struct spdk_blob_xattr_opts snap_xattrs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_bs_dev *dev;
+	struct ut_dev_write *w;
+	spdk_blob_id blobid, snapid;
+	char *xattr_names[] = {"large0", "large1"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t base_md_pages, num_writes, i;
+	uint8_t *saved_dev;
+	size_t saved_len;
+	bool deleted = false;
+	int delete_rc;
+
+	g_phys_blocklen = 4096;
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	snap_xattrs.count = SPDK_COUNTOF(xattr_names);
+	snap_xattrs.names = xattr_names;
+	snap_xattrs.ctx = xattr_value;
+	snap_xattrs.get_value = ut_get_large_xattr_value;
+
+	for (thresholds.general_threshold = 1; !deleted; thresholds.general_threshold++) {
+		delete_rc = ut_resized_clone_interrupted_delete(thresholds, &bs_opts, &snap_xattrs,
+				&blobid, &snapid, &base_md_pages, &saved_dev, &saved_len);
+
+		/* Recover once, recording the writes, and drop the result. */
+		dev = init_dev();
+		dev->write = ut_recording_dev_write;
+		dev->writev = ut_recording_dev_writev;
+		dev->writev_ext = NULL;
+		dev->write_zeroes = ut_recording_dev_write_zeroes;
+		dev->unmap = ut_recording_dev_unmap;
+		dev->copy = NULL;
+		g_bs = NULL;
+		spdk_bs_load(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+		bs_free(g_bs);
+		g_bs = NULL;
+		num_writes = g_ut_num_dev_writes;
+		for (i = 0; i < num_writes; i++) {
+			w = &g_ut_dev_writes[i];
+			SPDK_CU_ASSERT_FATAL(w->offset + w->length <= saved_len);
+		}
+
+		/* Power failure after each write of the recovery, then a complete recovery. */
+		for (i = 0; i <= num_writes; i++) {
+			memcpy(g_dev_buffer, saved_dev, saved_len);
+			ut_replay_dev_writes(i);
+			ut_resized_clone_check_recovered(&bs_opts, blobid, snapid, base_md_pages);
+		}
+
+		ut_free_dev_writes();
+		free(saved_dev);
+		deleted = delete_rc == 0;
+	}
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+/* Check that the snapshot of the resized-clone scenario is retained, not marked for removal,
+ * still the clone's parent, and protected by copy-on-write: overwriting cluster 20 in the
+ * clone must leave the snapshot's data intact. */
+static void
+ut_resized_clone_check_snapshot_kept(struct spdk_blob_store *bs, struct spdk_blob *clone,
+				     struct spdk_io_channel *channel, spdk_blob_id snapid)
+{
+	struct spdk_blob *snapshot;
+	const void *value;
+	size_t value_len;
+
+	snapshot = ut_open_blob(bs, snapid);
+	CU_ASSERT(blob_get_xattr_value(snapshot, SNAPSHOT_PENDING_REMOVAL, &value,
+				       &value_len, true) != 0);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, spdk_blob_get_id(clone)) == snapid);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+	ut_cluster_write(clone, channel, 20, 0x5C);
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(snapshot, channel, 20, 0xB6));
+
+	spdk_blob_close(snapshot, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+static void
+blob_delete_snapshot_resized_clone_low_space(void)
+{
+	/* The clone's metadata spans two pages, so committing it needs a new metadata page
+	 * besides the extent pages allocated for the clone. With only enough free metadata
+	 * pages left for those extent pages, the deletion must fail cleanly instead of failing
+	 * half-way through committing the clone's metadata. */
+	struct spdk_blob_xattr_opts clone_xattrs;
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	char *xattr_names[] = {"large0", "large1"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t filled[256];
+	uint32_t num_filled;
+	uint32_t used_md_pages, base_md_pages;
+
+	g_phys_blocklen = 4096;
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	clone_xattrs.count = SPDK_COUNTOF(xattr_names);
+	clone_xattrs.names = xattr_names;
+	clone_xattrs.ctx = xattr_value;
+	clone_xattrs.get_value = ut_get_large_xattr_value;
+	bs = ut_resized_clone_scenario(&bs_opts, &clone_xattrs, NULL, &blobid, &snapid,
+				       &base_md_pages);
+
+	/* Leave two free metadata pages, for the clone's extent pages of slots 0 and 1. */
+	used_md_pages = spdk_bit_array_count_set(bs->used_md_pages);
+	num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+	SPDK_CU_ASSERT_FATAL(num_filled >= 2);
+	num_filled -= 2;
+	ut_release_md_pages(bs, &filled[num_filled], 2);
+
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+
+	ut_release_md_pages(bs, filled, num_filled);
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == used_md_pages);
+
+	/* Reopened from disk, the clone still reads through the retained snapshot. */
+	clone = ut_open_blob(bs, blobid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	CU_ASSERT(spdk_blob_get_num_clusters(clone) == 2048);
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+	ut_resized_clone_check_snapshot_kept(bs, clone, channel, snapid);
+
+	/* With metadata pages available again, the deletion succeeds. */
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == SPDK_BLOBID_INVALID);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
+blob_delete_snapshot_resized_clone_commit_error(void)
+{
+	/* Fail the write of the clone's root metadata page when the deletion commits the
+	 * clone's new metadata, while the clone is open. The deletion must revert the clone,
+	 * persist its original metadata again and keep the snapshot: the clone is not left
+	 * frozen, still reads the snapshot's clusters by copy-on-write, and no metadata page
+	 * leaks, both before and after reloading the blobstore. The clone's metadata spans two
+	 * pages, so that the failed commit claimed a new page for its second page, which must
+	 * be released once the clone's original metadata is persisted again. */
+	struct spdk_blob_xattr_opts clone_xattrs;
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	char *xattr_names[] = {"large0", "large1"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t used_md_pages, base_md_pages;
+
+	g_phys_blocklen = 4096;
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	clone_xattrs.count = SPDK_COUNTOF(xattr_names);
+	clone_xattrs.names = xattr_names;
+	clone_xattrs.ctx = xattr_value;
+	clone_xattrs.get_value = ut_get_large_xattr_value;
+	bs = ut_resized_clone_scenario(&bs_opts, &clone_xattrs, NULL, &blobid, &snapid,
+				       &base_md_pages);
+	clone = ut_open_blob(bs, blobid);
+	SPDK_CU_ASSERT_FATAL(clone->active.num_pages >= 2);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	used_md_pages = spdk_bit_array_count_set(bs->used_md_pages);
+
+	ut_arm_io_failure(bs->dev, bs_md_page_to_lba(bs, bs_blobid_to_page(blobid)), 1);
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_ut_io_failed);
+	ut_disarm_io_failure(bs->dev);
+
+	/* The extent pages allocated for the clone and the metadata page the failed commit
+	 * claimed were released. */
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == used_md_pages);
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+	ut_resized_clone_check_snapshot_kept(bs, clone, channel, snapid);
+
+	spdk_blob_close(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	/* The clone's metadata on disk is its original one. */
+	ut_bs_reload(&bs, &bs_opts);
+	clone = ut_open_blob(bs, blobid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapid);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
+blob_delete_snapshot_resized_clone_chain_commit_error(void)
+{
+	/* As in blob_delete_snapshot_resized_clone_commit_error(), in a chain of snapshots: the
+	 * resized clone is snapshotted as well. Fail the write of the root metadata page of the
+	 * snapshot's clone when deleting the first snapshot, whose clone is then the read-only
+	 * second snapshot, and when deleting the second snapshot, which has a parent snapshot to
+	 * switch the clone to. Each time the deletion must revert the clone and persist its
+	 * original metadata again, keep the snapshot, and leave the clone as it was. */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *blob, *snapshot2, *snapshot;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid, snapid2;
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t used_md_pages, base_md_pages;
+	const void *value;
+	size_t value_len;
+
+	g_phys_blocklen = 4096;
+	bs = ut_resized_clone_scenario(&bs_opts, NULL, NULL, &blobid, &snapid, &base_md_pages);
+
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapid2 = g_blobid;
+	g_blobid = SPDK_BLOBID_INVALID;
+
+	blob = ut_open_blob(bs, blobid);
+	snapshot2 = ut_open_blob(bs, snapid2);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	used_md_pages = spdk_bit_array_count_set(bs->used_md_pages);
+
+	/* Delete the first snapshot: its clone is the second, read-only, snapshot. */
+	ut_arm_io_failure(bs->dev, bs_md_page_to_lba(bs, bs_blobid_to_page(snapid2)), 1);
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_ut_io_failed);
+	ut_disarm_io_failure(bs->dev);
+
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == used_md_pages);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, snapid2) == snapid);
+	CU_ASSERT(snapshot2->md_ro);
+	CU_ASSERT(snapshot2->state == SPDK_BLOB_STATE_CLEAN);
+	snapshot = ut_open_blob(bs, snapid);
+	CU_ASSERT(blob_get_xattr_value(snapshot, SNAPSHOT_PENDING_REMOVAL, &value,
+				       &value_len, true) != 0);
+	spdk_blob_close(snapshot, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(snapshot2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Delete the second snapshot: its clone is switched to the first snapshot. */
+	ut_arm_io_failure(bs->dev, bs_md_page_to_lba(bs, bs_blobid_to_page(blobid)), 1);
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_ut_io_failed);
+	ut_disarm_io_failure(bs->dev);
+
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == used_md_pages);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapid2);
+	CU_ASSERT(blob->parent_id == snapid2);
+	CU_ASSERT(blob->state == SPDK_BLOB_STATE_CLEAN);
+	snapshot2 = ut_open_blob(bs, snapid2);
+	CU_ASSERT(blob_get_xattr_value(snapshot2, SNAPSHOT_PENDING_REMOVAL, &value,
+				       &value_len, true) != 0);
+	CU_ASSERT(ut_cluster_check(blob, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(blob, channel, 20, 0xB6));
+	CU_ASSERT(ut_cluster_check(blob, channel, 550, 0xA5));
+	ut_cluster_write(blob, channel, 20, 0x5C);
+	CU_ASSERT(ut_cluster_check(blob, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(snapshot2, channel, 20, 0xB6));
+
+	spdk_blob_close(snapshot2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	/* The metadata of the clones on disk is their original one. */
+	ut_bs_reload(&bs, &bs_opts);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, snapid2) == snapid);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapid2);
+
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, snapid2) == SPDK_BLOBID_INVALID);
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == SPDK_BLOBID_INVALID);
+
+	blob = ut_open_blob(bs, blobid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	CU_ASSERT(spdk_blob_get_num_clusters(blob) == 2048);
+	CU_ASSERT(ut_cluster_check(blob, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(blob, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(blob, channel, 550, 0xA5));
+
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
+blob_delete_snapshot_resized_clone_restore_error(void)
+{
+	/* Commit the clone's new metadata, whose second page lets the commit fail after writing
+	 * its root page: fail zeroing the clone's old second page. The deletion then reverts the
+	 * clone, but persisting the clone's original metadata again fails too. The clone's
+	 * metadata on disk is then its new one, while the clone holds its original one in memory,
+	 * which closing the clone does not persist again, as a failed persist leaves it marked
+	 * clean. Until the clone is opened again, writes to it must be refused, as a mapping they
+	 * change would be lost on reload. The next load must recover the deletion. */
+	struct spdk_blob_xattr_opts clone_xattrs;
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	char *xattr_names[] = {"large0", "large1"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint8_t payload[DEV_BUFFER_BLOCKLEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t base_md_pages;
+	uint64_t clone_lba;
+
+	g_phys_blocklen = 4096;
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	clone_xattrs.count = SPDK_COUNTOF(xattr_names);
+	clone_xattrs.names = xattr_names;
+	clone_xattrs.ctx = xattr_value;
+	clone_xattrs.get_value = ut_get_large_xattr_value;
+	bs = ut_resized_clone_scenario(&bs_opts, &clone_xattrs, NULL, &blobid, &snapid,
+				       &base_md_pages);
+	clone = ut_open_blob(bs, blobid);
+	SPDK_CU_ASSERT_FATAL(clone->clean.num_pages >= 2);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	/* The clone's root page is written by the commit, then by the restore. */
+	clone_lba = bs_md_page_to_lba(bs, bs_blobid_to_page(blobid));
+	ut_arm_io_failure(bs->dev, bs_md_page_to_lba(bs, clone->clean.pages[1]), 1);
+	ut_arm_io_failure(bs->dev, clone_lba, 2);
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_ut_io_failed);
+
+	/* The clone still reads its data, through the retained snapshot, but refuses writes. */
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+	memset(payload, 0x5C, sizeof(payload));
+	g_bserrno = 0;
+	spdk_blob_io_write(clone, channel, payload, 20 * spdk_bs_get_cluster_size(bs) /
+			   spdk_bs_get_io_unit_size(bs), 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EPERM);
+
+	spdk_blob_close(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	ut_disarm_io_failure(bs->dev);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	/* Power failure, then recovery. */
+	bs_free(bs);
+	g_bs = NULL;
+	ut_resized_clone_check_recovered(&bs_opts, blobid, snapid, base_md_pages);
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
+blob_delete_snapshot_resized_clone_retry(void)
+{
+	/* Commit the clone's new metadata, but fail persisting the snapshot's afterwards: the
+	 * snapshot's metadata on disk still references the clusters and extent pages it shared
+	 * with the clone, which the clone now owns and no longer reads through the snapshot.
+	 * Retrying the deletion, here without free metadata pages, must remove the snapshot
+	 * without changing the clone's mappings. */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t filled[256];
+	uint32_t num_filled, base_md_pages;
+	uint64_t snap_lba;
+
+	g_phys_blocklen = 4096;
+	bs = ut_resized_clone_scenario(&bs_opts, NULL, NULL, &blobid, &snapid, &base_md_pages);
+	clone = ut_open_blob(bs, blobid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	/* The snapshot's root page is written to mark it for removal, then to drop the references
+	 * it shares with the clone. */
+	snap_lba = bs_md_page_to_lba(bs, bs_blobid_to_page(snapid));
+	ut_arm_io_failure(bs->dev, snap_lba, 2);
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_ut_io_failed);
+	ut_disarm_io_failure(bs->dev);
+
+	CU_ASSERT(clone->parent_id == SPDK_BLOBID_INVALID);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+
+	num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	ut_release_md_pages(bs, filled, num_filled);
+
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == SPDK_BLOBID_INVALID);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+	ut_cluster_write(clone, channel, 20, 0x5C);
+
+	spdk_blob_close(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	/* The clusters and extent pages only the snapshot used are reclaimed by a load after a
+	 * power failure. */
+	bs_free(bs);
+	g_bs = NULL;
+	dev = init_dev();
+	spdk_bs_load(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	clone = ut_open_blob(bs, blobid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
+blob_delete_snapshot_resized_clone_io_error(void)
+{
+	/* Fail each write of the deletion, once, while the clone is open. Whatever the
+	 * outcome, the clone must not be left frozen and must keep its data, and the blobstore
+	 * must then recover to a consistent state. */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t base_md_pages, nth;
+	bool failed = true;
+	int delete_rc;
+
+	g_phys_blocklen = 4096;
+	for (nth = 1; failed; nth++) {
+		bs = ut_resized_clone_scenario(&bs_opts, NULL, NULL, &blobid, &snapid,
+					       &base_md_pages);
+		clone = ut_open_blob(bs, blobid);
+		channel = spdk_bs_alloc_io_channel(bs);
+		SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+		ut_arm_io_failure(bs->dev, UINT64_MAX, nth);
+		g_bserrno = -1;
+		spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+		poll_threads();
+		delete_rc = g_bserrno;
+		failed = g_ut_io_failed;
+		ut_disarm_io_failure(bs->dev);
+		CU_ASSERT(failed || delete_rc == 0);
+
+		/* The clone accepts I/O and kept its data. */
+		CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+		CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+		CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+		ut_cluster_write(clone, channel, 30, 0xD8);
+		CU_ASSERT(ut_cluster_check(clone, channel, 30, 0xD8));
+
+		spdk_blob_close(clone, blob_op_complete, NULL);
+		poll_threads();
+		spdk_bs_free_io_channel(channel);
+		poll_threads();
+
+		/* Recover from what is on disk. */
+		bs_free(bs);
+		g_bs = NULL;
+		ut_resized_clone_check_recovered(&bs_opts, blobid, snapid, base_md_pages);
+	}
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
+blob_delete_snapshot_resized_clone_recovery_error(void)
+{
+	/* Interrupt the deletion of the snapshot of a resized clone at every I/O. For each of
+	 * those states, fail each write of the recovery done by the next load, once. The load
+	 * must not crash, and if it succeeds, the clone must keep its data: in particular, a
+	 * snapshot whose metadata could not be persisted without the extent pages and clusters
+	 * it shares with the clone must not be deleted. The next load must then complete the
+	 * recovery. */
+	struct spdk_power_failure_thresholds thresholds = {};
+	struct spdk_blob_xattr_opts snap_xattrs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob *clone;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	char *xattr_names[] = {"large0", "large1"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t base_md_pages, nth;
+	uint8_t *saved_dev;
+	size_t saved_len;
+	bool deleted = false, failed;
+	int delete_rc;
+
+	g_phys_blocklen = 4096;
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	snap_xattrs.count = SPDK_COUNTOF(xattr_names);
+	snap_xattrs.names = xattr_names;
+	snap_xattrs.ctx = xattr_value;
+	snap_xattrs.get_value = ut_get_large_xattr_value;
+
+	for (thresholds.general_threshold = 1; !deleted; thresholds.general_threshold++) {
+		delete_rc = ut_resized_clone_interrupted_delete(thresholds, &bs_opts, &snap_xattrs,
+				&blobid, &snapid, &base_md_pages, &saved_dev, &saved_len);
+
+		for (nth = 1, failed = true; failed; nth++) {
+			memcpy(g_dev_buffer, saved_dev, saved_len);
+			dev = init_dev();
+			ut_arm_io_failure(dev, UINT64_MAX, nth);
+			g_bs = NULL;
+			spdk_bs_load(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+			poll_threads();
+			failed = g_ut_io_failed;
+			/* A failed load destroyed the device. */
+			ut_disarm_io_failure(g_bs != NULL ? g_bs->dev : NULL);
+
+			if (g_bs != NULL) {
+				bs = g_bs;
+				clone = ut_open_blob(bs, blobid);
+				channel = spdk_bs_alloc_io_channel(bs);
+				SPDK_CU_ASSERT_FATAL(channel != NULL);
+				CU_ASSERT(spdk_blob_get_num_clusters(clone) == 2048);
+				CU_ASSERT(ut_cluster_check(clone, channel, 10, 0xC7));
+				CU_ASSERT(ut_cluster_check(clone, channel, 20, 0xB6));
+				CU_ASSERT(ut_cluster_check(clone, channel, 550, 0xA5));
+				spdk_blob_close(clone, blob_op_complete, NULL);
+				poll_threads();
+				CU_ASSERT(g_bserrno == 0);
+				spdk_bs_free_io_channel(channel);
+				poll_threads();
+
+				/* Power failure */
+				bs_free(bs);
+				g_bs = NULL;
+			}
+
+			ut_resized_clone_check_recovered(&bs_opts, blobid, snapid, base_md_pages);
+		}
+
+		free(saved_dev);
+		deleted = delete_rc == 0;
+	}
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
 static void
 blob_esnap_clone_resize(void)
 {
@@ -12026,6 +13573,17 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_blob, blob_is_degraded);
 		CU_ADD_TEST(suite_bs, blob_clone_resize);
 		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_enomem);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_own_ep_enomem);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_power_failure);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_low_space);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_commit_error);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_chain_commit_error);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_restore_error);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_retry);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_io_error);
+		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_recovery_error);
+		CU_ADD_TEST(suite, blob_persist_error);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_deep_copy);
