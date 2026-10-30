@@ -10357,6 +10357,539 @@ blob_esnap_hotplug(void)
 	CU_ASSERT(g_bserrno == 0);
 }
 
+static void
+esnap_inflight_io_complete(void *cb_arg, int bserrno)
+{
+	int *done = cb_arg;
+
+	CU_ASSERT(bserrno == 0);
+	(*done)++;
+}
+
+/*
+ * Replacing the parent of an esnap clone must not destroy a channel of the old external snapshot
+ * while reads from it are still in flight, as the back device asserts that. This is done through
+ * spdk_blob_set_esnap_bs_dev() (hotplug), or through spdk_bs_blob_set_parent() with a snapshot,
+ * which is how a rebuilt replica swaps its external snapshot for a local one.
+ *
+ * Reads via spdk_blob_io_read() go through a batch. Writes to an unallocated cluster read the
+ * cluster through a sequence for the copy on write.
+ */
+static void
+_blob_esnap_replace_parent_inflight_io(bool write, bool set_parent)
+{
+	struct spdk_blob_store	*bs = g_bs;
+	struct ut_esnap_opts	esnap1_opts, esnap2_opts;
+	struct spdk_blob_opts	opts;
+	struct spdk_blob	*blob, *base = NULL;
+	struct spdk_bs_dev	*bs_dev = NULL;
+	struct ut_esnap_dev	*esnap_dev;
+	spdk_blob_id		blobid, baseid = SPDK_BLOBID_INVALID, snapshotid = SPDK_BLOBID_INVALID;
+	uint32_t		cluster_sz = spdk_bs_get_cluster_size(bs);
+	uint32_t		block_sz = spdk_bs_get_io_unit_size(bs);
+	const uint32_t		esnap_num_clusters = 4;
+	uint64_t		esnap_num_blocks = cluster_sz * esnap_num_clusters / block_sz;
+	bool			destroyed1 = false, destroyed2 = false;
+	uint64_t		start_thread = g_ut_thread_id;
+	struct spdk_thread	*thread0, *thread1;
+	struct spdk_io_channel	*ch0, *ch1;
+	int			done = 0;
+	char			buf[block_sz];
+
+	ut_spdk_blob_opts_init(&opts);
+	ut_esnap_opts_init(block_sz, esnap_num_blocks, "esnap1", &destroyed1, &esnap1_opts);
+	opts.esnap_id = &esnap1_opts;
+	opts.esnap_id_len = sizeof(esnap1_opts);
+	opts.num_clusters = esnap_num_clusters;
+	blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	SPDK_CU_ASSERT_FATAL(spdk_blob_is_esnap_clone(blob));
+	blobid = spdk_blob_get_id(blob);
+	esnap_dev = (struct ut_esnap_dev *)blob->back_bs_dev;
+
+	if (set_parent) {
+		/* The snapshot of a thin-provisioned blob of the same size becomes the new parent. */
+		ut_spdk_blob_opts_init(&opts);
+		opts.num_clusters = esnap_num_clusters;
+		opts.thin_provision = true;
+		base = ut_blob_create_and_open(bs, &opts);
+		SPDK_CU_ASSERT_FATAL(base != NULL);
+		baseid = spdk_blob_get_id(base);
+		spdk_bs_create_snapshot(bs, baseid, NULL, blob_op_with_id_complete, NULL);
+		poll_threads();
+		SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
+		SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+		snapshotid = g_blobid;
+	}
+
+	set_thread(0);
+	thread0 = spdk_get_thread();
+	ch0 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch0 != NULL);
+	set_thread(1);
+	thread1 = spdk_get_thread();
+	ch1 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+
+	/* Have one read in flight on each thread. */
+	esnap_dev->hold_reads = true;
+	memset(buf, 0, sizeof(buf));
+	set_thread(0);
+	if (write) {
+		spdk_blob_io_write(blob, ch0, buf, 0, 1, esnap_inflight_io_complete, &done);
+	} else {
+		spdk_blob_io_read(blob, ch0, buf, 0, 1, esnap_inflight_io_complete, &done);
+	}
+	set_thread(1);
+	if (write) {
+		spdk_blob_io_write(blob, ch1, buf, 0, 1, esnap_inflight_io_complete, &done);
+	} else {
+		spdk_blob_io_read(blob, ch1, buf, 0, 1, esnap_inflight_io_complete, &done);
+	}
+	set_thread(start_thread);
+	poll_threads();
+	esnap_dev->hold_reads = false;
+	CU_ASSERT(done == 0);
+	CU_ASSERT(esnap_dev->num_channels == 2);
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev) == 2);
+
+	/* The replacement waits for the reads. The channels must stay alive meanwhile. */
+	g_bserrno = 0xbad;
+	if (set_parent) {
+		spdk_bs_blob_set_parent(bs, blobid, snapshotid, bs_op_complete, NULL);
+	} else {
+		ut_esnap_opts_init(block_sz, esnap_num_blocks, "esnap2", &destroyed2, &esnap2_opts);
+		bs_dev = ut_esnap_dev_alloc(&esnap2_opts);
+		SPDK_CU_ASSERT_FATAL(bs_dev != NULL);
+		spdk_blob_set_esnap_bs_dev(blob, bs_dev, bs_op_complete, NULL);
+	}
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0xbad);
+	CU_ASSERT(!destroyed1);
+	CU_ASSERT(spdk_blob_is_esnap_clone(blob));
+	CU_ASSERT(esnap_dev->num_channels == 2);
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev) == 2);
+
+	/*
+	 * Completing the reads of one thread is not enough. The other thread still has a read in
+	 * flight on its channel. The completions run on the threads that submitted the reads.
+	 */
+	ut_esnap_complete_held_reads(esnap_dev, thread1);
+	poll_threads();
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev) == 1);
+	CU_ASSERT(g_bserrno == 0xbad);
+	CU_ASSERT(!destroyed1);
+
+	/* Once the last read completes, the replacement finishes and the old channels are gone. */
+	ut_esnap_complete_held_reads(esnap_dev, thread0);
+	poll_threads();
+	CU_ASSERT(done == 2);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(destroyed1);
+	if (set_parent) {
+		CU_ASSERT(!spdk_blob_is_esnap_clone(blob));
+		CU_ASSERT(spdk_blob_is_clone(blob));
+		CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapshotid);
+	} else {
+		CU_ASSERT(!destroyed2);
+		CU_ASSERT(spdk_blob_is_esnap_clone(blob));
+		CU_ASSERT(blob->back_bs_dev == bs_dev);
+
+		/* IO uses the new external snapshot. */
+		done = 0;
+		set_thread(0);
+		spdk_blob_io_read(blob, ch0, buf, 0, 1, esnap_inflight_io_complete, &done);
+		set_thread(start_thread);
+		poll_threads();
+		CU_ASSERT(done == 1);
+	}
+
+	set_thread(0);
+	spdk_bs_free_io_channel(ch0);
+	set_thread(1);
+	spdk_bs_free_io_channel(ch1);
+	set_thread(start_thread);
+	poll_threads();
+
+	if (set_parent) {
+		ut_blob_close_and_delete(bs, blob);
+		ut_blob_close_and_delete(bs, base);
+		spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	} else {
+		g_bserrno = 0xbad;
+		spdk_blob_close(blob, bs_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(destroyed2);
+	}
+}
+
+static void
+blob_esnap_hotplug_inflight_read(void)
+{
+	_blob_esnap_replace_parent_inflight_io(false, false);
+}
+
+static void
+blob_esnap_hotplug_inflight_cow(void)
+{
+	_blob_esnap_replace_parent_inflight_io(true, false);
+}
+
+static void
+blob_esnap_set_parent_inflight_read(void)
+{
+	_blob_esnap_replace_parent_inflight_io(false, true);
+}
+
+static void
+blob_esnap_set_parent_inflight_cow(void)
+{
+	_blob_esnap_replace_parent_inflight_io(true, true);
+}
+
+/*
+ * Inflating or decoupling an esnap clone does not freeze it. Once the clusters are copied, the
+ * esnap channels on every thread are destroyed, so a read that another thread submitted to the
+ * esnap device just before must complete before its channel is destroyed and the device freed.
+ */
+static void
+_blob_esnap_clone_hydrate_inflight(enum blob_inflate_type allocate_type)
+{
+	struct spdk_blob_store	*bs = g_bs;
+	struct ut_esnap_opts	esnap_opts;
+	struct spdk_blob_opts	opts;
+	struct spdk_blob	*blob;
+	struct ut_esnap_dev	*esnap_dev;
+	uint32_t		cluster_sz = spdk_bs_get_cluster_size(bs);
+	uint32_t		block_sz = spdk_bs_get_io_unit_size(bs);
+	const uint32_t		esnap_num_clusters = 4;
+	uint64_t		esnap_num_blocks = cluster_sz * esnap_num_clusters / block_sz;
+	bool			destroyed = false;
+	uint64_t		start_thread = g_ut_thread_id;
+	struct spdk_thread	*thread1;
+	struct spdk_io_channel	*ch0, *ch1;
+	int			done = 0, frozen_done = 0;
+	char			buf[block_sz], frozen_buf[block_sz];
+
+	ut_spdk_blob_opts_init(&opts);
+	ut_esnap_opts_init(block_sz, esnap_num_blocks, __func__, &destroyed, &esnap_opts);
+	opts.esnap_id = &esnap_opts;
+	opts.esnap_id_len = sizeof(esnap_opts);
+	opts.num_clusters = esnap_num_clusters;
+	blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	SPDK_CU_ASSERT_FATAL(spdk_blob_is_esnap_clone(blob));
+	esnap_dev = (struct ut_esnap_dev *)blob->back_bs_dev;
+
+	set_thread(0);
+	ch0 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch0 != NULL);
+	set_thread(1);
+	thread1 = spdk_get_thread();
+	ch1 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+
+	/* Thread 1 has a read in flight on its esnap channel. */
+	esnap_dev->hold_reads = true;
+	spdk_blob_io_read(blob, ch1, buf, 0, 1, esnap_inflight_io_complete, &done);
+	set_thread(start_thread);
+	poll_threads();
+	esnap_dev->hold_reads = false;
+	CU_ASSERT(done == 0);
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev) == 1);
+
+	/* Hydrate on thread 0. The copy completes, but the operation waits for the read. */
+	set_thread(0);
+	g_bserrno = 0xbad;
+	if (allocate_type == BLOB_INFLATE_ALLOCATE_ALL) {
+		spdk_bs_inflate_blob(bs, ch0, spdk_blob_get_id(blob), blob_op_complete, NULL);
+	} else {
+		spdk_bs_blob_decouple_parent(bs, ch0, spdk_blob_get_id(blob), blob_op_complete, NULL);
+	}
+	set_thread(start_thread);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0xbad);
+	CU_ASSERT(!destroyed);
+	CU_ASSERT(!spdk_blob_is_esnap_clone(blob));
+	/* The channel on thread 0 is idle and already gone. Thread 1's waits for its read. */
+	CU_ASSERT(esnap_dev->num_channels == 1);
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev) == 1);
+
+	/*
+	 * The blob is frozen while its esnap device is detached, so no thread sees an esnap clone
+	 * without its device. New IO waits until the operation is done.
+	 */
+	set_thread(0);
+	spdk_blob_io_read(blob, ch0, frozen_buf, 0, 1, esnap_inflight_io_complete, &frozen_done);
+	set_thread(start_thread);
+	poll_threads();
+	CU_ASSERT(frozen_done == 0);
+
+	/* Once the read completes on its own thread, the channels and the device are released. */
+	ut_esnap_complete_held_reads(esnap_dev, thread1);
+	poll_threads();
+	CU_ASSERT(done == 1);
+	CU_ASSERT(frozen_done == 1);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(destroyed);
+	CU_ASSERT(ut_esnap_get_io_channel(ch0, spdk_blob_get_id(blob)) == NULL);
+	CU_ASSERT(ut_esnap_get_io_channel(ch1, spdk_blob_get_id(blob)) == NULL);
+
+	/* The data was copied from the esnap device. */
+	set_thread(1);
+	CU_ASSERT(blob_esnap_verify_contents(blob, ch1, 0, cluster_sz * esnap_num_clusters,
+					     cluster_sz * esnap_num_clusters, "read"));
+
+	spdk_bs_free_io_channel(ch1);
+	set_thread(0);
+	spdk_bs_free_io_channel(ch0);
+	set_thread(start_thread);
+	poll_threads();
+	ut_blob_close_and_delete(bs, blob);
+}
+
+static void
+blob_esnap_clone_inflate_inflight(void)
+{
+	_blob_esnap_clone_hydrate_inflight(BLOB_INFLATE_ALLOCATE_ALL);
+}
+
+static void
+blob_esnap_clone_decouple_inflight(void)
+{
+	_blob_esnap_clone_hydrate_inflight(BLOB_INFLATE_ALLOCATE_UNALLOCATED);
+}
+
+/*
+ * Taking a snapshot of an esnap clone destroys the esnap channels of the clone. Snapshot creation
+ * must wait for that, as it waits for reads in flight, and the clone may be closed and freed as
+ * soon as the snapshot is done.
+ */
+static void
+blob_esnap_snapshot_inflight_read(void)
+{
+	struct spdk_blob_store	*bs = g_bs;
+	struct ut_esnap_opts	esnap_opts;
+	struct spdk_blob_opts	opts;
+	struct spdk_blob	*blob;
+	struct ut_esnap_dev	*esnap_dev;
+	spdk_blob_id		blobid, snapshotid;
+	uint32_t		cluster_sz = spdk_bs_get_cluster_size(bs);
+	uint32_t		block_sz = spdk_bs_get_io_unit_size(bs);
+	const uint32_t		esnap_num_clusters = 4;
+	uint64_t		esnap_num_blocks = cluster_sz * esnap_num_clusters / block_sz;
+	bool			destroyed = false;
+	uint64_t		start_thread = g_ut_thread_id;
+	struct spdk_thread	*thread1;
+	struct spdk_io_channel	*ch0, *ch1;
+	int			done = 0;
+	char			buf[block_sz];
+
+	ut_spdk_blob_opts_init(&opts);
+	ut_esnap_opts_init(block_sz, esnap_num_blocks, __func__, &destroyed, &esnap_opts);
+	opts.esnap_id = &esnap_opts;
+	opts.esnap_id_len = sizeof(esnap_opts);
+	opts.num_clusters = esnap_num_clusters;
+	blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	blobid = spdk_blob_get_id(blob);
+	esnap_dev = (struct ut_esnap_dev *)blob->back_bs_dev;
+
+	set_thread(0);
+	ch0 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch0 != NULL);
+	set_thread(1);
+	thread1 = spdk_get_thread();
+	ch1 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+
+	/* Thread 1 has a read in flight on the esnap channel of the clone. */
+	esnap_dev->hold_reads = true;
+	spdk_blob_io_read(blob, ch1, buf, 0, 1, esnap_inflight_io_complete, &done);
+	set_thread(start_thread);
+	poll_threads();
+	esnap_dev->hold_reads = false;
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev) == 1);
+
+	/* The snapshot waits for the read before changing anything. */
+	g_bserrno = 0xbad;
+	g_blobid = SPDK_BLOBID_INVALID;
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0xbad);
+	CU_ASSERT(spdk_blob_is_esnap_clone(blob));
+
+	ut_esnap_complete_held_reads(esnap_dev, thread1);
+	poll_threads();
+	CU_ASSERT(done == 1);
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapshotid = g_blobid;
+	CU_ASSERT(!spdk_blob_is_esnap_clone(blob));
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapshotid);
+	CU_ASSERT(ut_esnap_get_io_channel(ch1, blobid) == NULL);
+	/* The esnap device now belongs to the snapshot. */
+	CU_ASSERT(!destroyed);
+
+	/* The clone reads the external snapshot through its snapshot. */
+	done = 0;
+	set_thread(0);
+	spdk_blob_io_read(blob, ch0, buf, 0, 1, esnap_inflight_io_complete, &done);
+	set_thread(start_thread);
+	poll_threads();
+	CU_ASSERT(done == 1);
+
+	set_thread(0);
+	spdk_bs_free_io_channel(ch0);
+	set_thread(1);
+	spdk_bs_free_io_channel(ch1);
+	set_thread(start_thread);
+	poll_threads();
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(destroyed);
+}
+
+/*
+ * An IO that spans a cluster boundary is split. If it arrives while the parent of an esnap clone
+ * is being replaced, it must not create a channel for the old external snapshot on a thread whose
+ * channels were already destroyed. That channel would never be released, would keep the old esnap
+ * device alive, and after a hotplug would be used for IO to the new one.
+ */
+static void
+_blob_esnap_replace_parent_split_io(bool set_parent)
+{
+	struct spdk_blob_store	*bs = g_bs;
+	struct ut_esnap_opts	esnap1_opts, esnap2_opts;
+	struct spdk_blob_opts	opts;
+	struct spdk_blob	*blob, *base = NULL;
+	struct spdk_bs_dev	*bs_dev = NULL;
+	struct ut_esnap_dev	*esnap_dev;
+	spdk_blob_id		blobid, snapshotid = SPDK_BLOBID_INVALID;
+	uint32_t		cluster_sz = spdk_bs_get_cluster_size(bs);
+	uint32_t		block_sz = spdk_bs_get_io_unit_size(bs);
+	uint64_t		blocks_per_cluster = cluster_sz / block_sz;
+	const uint32_t		esnap_num_clusters = 4;
+	uint64_t		esnap_num_blocks = cluster_sz * esnap_num_clusters / block_sz;
+	bool			destroyed1 = false, destroyed2 = false;
+	uint64_t		start_thread = g_ut_thread_id;
+	struct spdk_thread	*thread1;
+	struct spdk_io_channel	*ch0, *ch1;
+	int			done = 0, split_done = 0;
+	char			buf[block_sz], split_buf[block_sz * 2];
+
+	ut_spdk_blob_opts_init(&opts);
+	ut_esnap_opts_init(block_sz, esnap_num_blocks, "esnap1", &destroyed1, &esnap1_opts);
+	opts.esnap_id = &esnap1_opts;
+	opts.esnap_id_len = sizeof(esnap1_opts);
+	opts.num_clusters = esnap_num_clusters;
+	blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	blobid = spdk_blob_get_id(blob);
+	esnap_dev = (struct ut_esnap_dev *)blob->back_bs_dev;
+
+	if (set_parent) {
+		ut_spdk_blob_opts_init(&opts);
+		opts.num_clusters = esnap_num_clusters;
+		opts.thin_provision = true;
+		base = ut_blob_create_and_open(bs, &opts);
+		SPDK_CU_ASSERT_FATAL(base != NULL);
+		spdk_bs_create_snapshot(bs, spdk_blob_get_id(base), NULL, blob_op_with_id_complete, NULL);
+		poll_threads();
+		SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
+		snapshotid = g_blobid;
+	}
+
+	set_thread(0);
+	ch0 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch0 != NULL);
+	set_thread(1);
+	thread1 = spdk_get_thread();
+	ch1 = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+
+	/* A read in flight on thread 1 holds the replacement after thread 0 was visited. */
+	esnap_dev->hold_reads = true;
+	spdk_blob_io_read(blob, ch1, buf, 0, 1, esnap_inflight_io_complete, &done);
+	set_thread(start_thread);
+	poll_threads();
+	esnap_dev->hold_reads = false;
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev) == 1);
+
+	g_bserrno = 0xbad;
+	if (set_parent) {
+		spdk_bs_blob_set_parent(bs, blobid, snapshotid, bs_op_complete, NULL);
+	} else {
+		ut_esnap_opts_init(block_sz, esnap_num_blocks, "esnap2", &destroyed2, &esnap2_opts);
+		bs_dev = ut_esnap_dev_alloc(&esnap2_opts);
+		SPDK_CU_ASSERT_FATAL(bs_dev != NULL);
+		spdk_blob_set_esnap_bs_dev(blob, bs_dev, bs_op_complete, NULL);
+	}
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0xbad);
+
+	/* A read across a cluster boundary on thread 0 is queued without getting an esnap channel. */
+	set_thread(0);
+	spdk_blob_io_read(blob, ch0, split_buf, blocks_per_cluster - 1, 2, esnap_inflight_io_complete,
+			  &split_done);
+	set_thread(start_thread);
+	poll_threads();
+	CU_ASSERT(split_done == 0);
+	CU_ASSERT(ut_esnap_get_io_channel(ch0, blobid) == NULL);
+	CU_ASSERT(esnap_dev->num_channels == 1);
+
+	/* Once the in-flight read completes, the replacement finishes and the old device is freed. */
+	ut_esnap_complete_held_reads(esnap_dev, thread1);
+	poll_threads();
+	CU_ASSERT(done == 1);
+	CU_ASSERT(split_done == 1);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(destroyed1);
+	if (set_parent) {
+		CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapshotid);
+	} else {
+		CU_ASSERT(blob->back_bs_dev == bs_dev);
+	}
+
+	set_thread(0);
+	spdk_bs_free_io_channel(ch0);
+	set_thread(1);
+	spdk_bs_free_io_channel(ch1);
+	set_thread(start_thread);
+	poll_threads();
+
+	if (set_parent) {
+		ut_blob_close_and_delete(bs, blob);
+		ut_blob_close_and_delete(bs, base);
+		spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	} else {
+		g_bserrno = 0xbad;
+		spdk_blob_close(blob, bs_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(destroyed2);
+	}
+}
+
+static void
+blob_esnap_set_parent_split_io(void)
+{
+	_blob_esnap_replace_parent_split_io(true);
+}
+
+static void
+blob_esnap_hotplug_split_io(void)
+{
+	_blob_esnap_replace_parent_split_io(false);
+}
+
 static bool g_blob_is_degraded;
 static int g_blob_is_degraded_called;
 
@@ -12253,6 +12786,15 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_decouple_multithread);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_reload);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug_inflight_read);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug_inflight_cow);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_set_parent_inflight_read);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_set_parent_inflight_cow);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_inflate_inflight);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_decouple_inflight);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_snapshot_inflight_read);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_set_parent_split_io);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug_split_io);
 		CU_ADD_TEST(suite_blob, blob_is_degraded);
 		CU_ADD_TEST(suite_bs, blob_clone_resize);
 		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone);

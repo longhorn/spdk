@@ -11,6 +11,8 @@
 
 #include "spdk/blob.h"
 
+struct blob_esnap_channel;
+
 enum spdk_bs_cpl_type {
 	SPDK_BS_CPL_TYPE_NONE,
 	SPDK_BS_CPL_TYPE_BS_BASIC,
@@ -95,6 +97,13 @@ struct spdk_bs_request_set {
 	 * is an esnap clone, back_channel == spdk_io_channel_get_ctx(set->channel).
 	 */
 	struct spdk_io_channel		*back_channel;
+
+	/*
+	 * Set when the request is on an esnap clone. Reads from the esnap device are counted
+	 * on it, so that the channel is not destroyed while they are in flight.
+	 */
+	struct blob_esnap_channel	*esnap_ch;
+	uint32_t			esnap_inflight;
 
 	struct spdk_bs_dev_cb_args	cb_args;
 

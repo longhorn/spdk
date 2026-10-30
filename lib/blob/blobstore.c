@@ -65,6 +65,16 @@ struct blob_esnap_channel {
 	struct spdk_io_channel		*channel;
 	/* The bs_dev that created channel and must be used to destroy it. */
 	struct spdk_bs_dev		*bs_dev;
+
+	/* Number of reads submitted on channel that have not completed. */
+	uint32_t			inflight;
+
+	/*
+	 * Set while the channel is unlinked from the tree and waiting for the in-flight reads to
+	 * complete before it can be destroyed. The iteration over the blobstore channels is held
+	 * until then.
+	 */
+	struct spdk_io_channel_iter	*drain_iter;
 };
 
 static int blob_esnap_channel_compare(struct blob_esnap_channel *c1, struct blob_esnap_channel *c2);
@@ -2961,7 +2971,12 @@ blob_insert_cluster_clear(struct spdk_blob_copy_cluster_ctx *ctx)
 	cpl.u.blob_basic.cb_fn = blob_insert_cluster_clear_cpl;
 	cpl.u.blob_basic.cb_arg = ctx;
 
-	batch = bs_batch_open(ch, &cpl, ctx->blob);
+	/*
+	 * The clear only uses the blobstore device. Do not pass the blob, as that would get an esnap
+	 * channel for an esnap clone. This runs while the blob may be frozen to replace its parent,
+	 * and a channel created now would be missed by the one that destroys the old parent's channels.
+	 */
+	batch = bs_batch_open(ch, &cpl, NULL);
 	if (!batch) {
 		blob_insert_cluster_clear_cpl(ctx, -ENOMEM);
 		return;
@@ -3374,7 +3389,12 @@ blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
 	cpl.u.blob_basic.cb_fn = cb_fn;
 	cpl.u.blob_basic.cb_arg = cb_arg;
 
-	seq = bs_sequence_start_blob(ch, &cpl, blob);
+	/*
+	 * The sequence only completes the split operation and does no IO of its own. Do not start it
+	 * on the blob, as that would get an esnap channel for an esnap clone even while the blob is
+	 * frozen to replace its parent. The split operations get their own channels when they run.
+	 */
+	seq = bs_sequence_start_bs(ch, &cpl);
 	if (!seq) {
 		free(ctx);
 		cb_fn(cb_arg, -ENOMEM);
@@ -7072,26 +7092,12 @@ bs_snapshot_newblob_sync_cpl(void *cb_arg, int bserrno)
 }
 
 static void
-bs_snapshot_freeze_cpl(void *cb_arg, int rc)
+bs_snapshot_freeze_done(struct spdk_clone_snapshot_ctx *ctx)
 {
-	struct spdk_clone_snapshot_ctx *ctx = (struct spdk_clone_snapshot_ctx *)cb_arg;
 	struct spdk_blob *origblob = ctx->original.blob;
 	struct spdk_blob *newblob = ctx->new.blob;
 	int bserrno;
 
-	if (rc != 0) {
-		bs_clone_snapshot_newblob_cleanup(ctx, rc);
-		return;
-	}
-
-	ctx->frozen = true;
-
-	if (blob_is_esnap_clone(origblob)) {
-		/* Clean up any channels associated with the original blob id because future IO will
-		 * perform IO using the snapshot blob_id.
-		 */
-		blob_esnap_destroy_bs_dev_channels(origblob, false, NULL, NULL);
-	}
 	if (newblob->back_bs_dev) {
 		blob_back_bs_destroy(newblob);
 	}
@@ -7130,6 +7136,49 @@ bs_snapshot_freeze_cpl(void *cb_arg, int rc)
 
 	/* sync snapshot metadata */
 	spdk_blob_sync_md(newblob, bs_snapshot_newblob_sync_cpl, ctx);
+}
+
+static void
+bs_snapshot_esnap_channels_destroyed(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	struct spdk_clone_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": failed to destroy esnap channels: %d\n",
+			    blob->id, bserrno);
+		bs_clone_snapshot_newblob_cleanup(ctx, bserrno);
+		return;
+	}
+
+	bs_snapshot_freeze_done(ctx);
+}
+
+static void
+bs_snapshot_freeze_cpl(void *cb_arg, int rc)
+{
+	struct spdk_clone_snapshot_ctx *ctx = (struct spdk_clone_snapshot_ctx *)cb_arg;
+	struct spdk_blob *origblob = ctx->original.blob;
+
+	if (rc != 0) {
+		bs_clone_snapshot_newblob_cleanup(ctx, rc);
+		return;
+	}
+
+	ctx->frozen = true;
+
+	if (blob_is_esnap_clone(origblob)) {
+		/*
+		 * Clean up any channels associated with the original blob id because future IO will
+		 * perform IO using the snapshot blob_id. Wait for it, as it may wait for reads in
+		 * flight and must not outlive the original blob, which may be closed once this
+		 * snapshot is done.
+		 */
+		blob_esnap_destroy_bs_dev_channels(origblob, false,
+						   bs_snapshot_esnap_channels_destroyed, ctx);
+		return;
+	}
+
+	bs_snapshot_freeze_done(ctx);
 }
 
 static void
@@ -11452,8 +11501,8 @@ spdk_blob_get_esnap_id(struct spdk_blob *blob, const void **id, size_t *len)
 	return blob_get_xattr_value(blob, BLOB_EXTERNAL_SNAPSHOT_ID, id, len, true);
 }
 
-struct spdk_io_channel *
-blob_esnap_get_io_channel(struct spdk_io_channel *ch, struct spdk_blob *blob)
+struct blob_esnap_channel *
+blob_esnap_get_channel(struct spdk_io_channel *ch, struct spdk_blob *blob)
 {
 	struct spdk_bs_channel		*bs_channel = spdk_io_channel_get_ctx(ch);
 	struct spdk_bs_dev		*bs_dev = blob->back_bs_dev;
@@ -11467,7 +11516,7 @@ blob_esnap_get_io_channel(struct spdk_io_channel *ch, struct spdk_blob *blob)
 		assert(esnap_channel->bs_dev == bs_dev);
 		SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": using cached channel on thread %s\n",
 			      blob->id, spdk_thread_get_name(spdk_get_thread()));
-		return esnap_channel->channel;
+		return esnap_channel;
 	}
 
 	SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": allocating channel on thread %s\n",
@@ -11498,10 +11547,48 @@ blob_esnap_get_io_channel(struct spdk_io_channel *ch, struct spdk_blob *blob)
 		bs_dev->destroy_channel(bs_dev, esnap_channel->channel);
 		free(esnap_channel);
 
-		return existing->channel;
+		return existing;
 	}
 
+	return esnap_channel;
+}
+
+struct spdk_io_channel *
+blob_esnap_channel_io_channel(struct blob_esnap_channel *esnap_channel)
+{
 	return esnap_channel->channel;
+}
+
+void
+blob_esnap_channel_io_start(struct blob_esnap_channel *esnap_channel)
+{
+	esnap_channel->inflight++;
+}
+
+/*
+ * Called on the thread of the channel when reads submitted on it complete. If the channel was
+ * unlinked to be destroyed while the reads were in flight, destroy it now that it is idle.
+ * Returns true if the channel was destroyed.
+ */
+bool
+blob_esnap_channel_io_done(struct blob_esnap_channel *esnap_channel, uint32_t count)
+{
+	struct spdk_io_channel_iter *iter;
+
+	assert(esnap_channel->inflight >= count);
+	esnap_channel->inflight -= count;
+	if (esnap_channel->inflight != 0 || esnap_channel->drain_iter == NULL) {
+		return false;
+	}
+
+	SPDK_DEBUGLOG(blob_esnap, "blob 0x%" PRIx64 ": in-flight IO drained, destroying channel on "
+		      "thread %s\n", esnap_channel->blob_id, spdk_thread_get_name(spdk_get_thread()));
+	iter = esnap_channel->drain_iter;
+	esnap_channel->bs_dev->destroy_channel(esnap_channel->bs_dev, esnap_channel->channel);
+	free(esnap_channel);
+	spdk_for_each_channel_continue(iter, 0);
+
+	return true;
 }
 
 static int
@@ -11569,6 +11656,20 @@ blob_esnap_destroy_one_channel(struct spdk_io_channel_iter *i)
 					bs_user_op_abort(op, -EIO);
 				}
 			}
+		}
+
+		/*
+		 * Reads that were already submitted still use the channel. Destroying it now would
+		 * leave them outstanding on a channel that is going away, so hold the iteration
+		 * until they complete. The channel is no longer in the tree, so new IO creates a
+		 * channel of its own.
+		 */
+		if (esnap_channel->inflight != 0) {
+			SPDK_NOTICELOG("blob 0x%" PRIx64 ": waiting for %" PRIu32 " in-flight read(s) on "
+				       "thread %s before destroying the channel\n", blob->id,
+				       esnap_channel->inflight, spdk_thread_get_name(spdk_get_thread()));
+			esnap_channel->drain_iter = i;
+			return;
 		}
 
 		bs_dev->destroy_channel(bs_dev, esnap_channel->channel);
@@ -11655,6 +11756,8 @@ blob_esnap_destroy_bs_channel(struct spdk_bs_channel *ch)
 			      ": destroying one channel in thread %s\n",
 			      esnap_channel->blob_id, spdk_thread_get_name(spdk_get_thread()));
 		RB_REMOVE(blob_esnap_channel_tree, &ch->esnap_channels, esnap_channel);
+		/* The bs_channel has no users left, so no read can still be using its channels. */
+		assert(esnap_channel->inflight == 0);
 		esnap_channel->bs_dev->destroy_channel(esnap_channel->bs_dev, esnap_channel->channel);
 		free(esnap_channel);
 	}

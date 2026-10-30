@@ -69,9 +69,28 @@ bs_request_set_complete(struct spdk_bs_request_set *set)
 }
 
 static void
+bs_request_set_esnap_io_done(struct spdk_bs_request_set *set)
+{
+	struct blob_esnap_channel *esnap_ch = set->esnap_ch;
+	uint32_t count = set->esnap_inflight;
+
+	if (count == 0) {
+		return;
+	}
+
+	set->esnap_inflight = 0;
+	if (blob_esnap_channel_io_done(esnap_ch, count)) {
+		/* The channel was waiting for its last read and is gone. */
+		set->esnap_ch = NULL;
+	}
+}
+
+static void
 bs_sequence_completion(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_request_set *set = cb_arg;
+
+	bs_request_set_esnap_io_done(set);
 
 	set->bserrno = bserrno;
 	set->u.sequence.cb_fn((spdk_bs_sequence_t *)set, set->u.sequence.cb_arg, bserrno);
@@ -79,7 +98,7 @@ bs_sequence_completion(struct spdk_io_channel *channel, void *cb_arg, int bserrn
 
 static inline spdk_bs_sequence_t *
 bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
-		  struct spdk_io_channel *back_channel)
+		  struct spdk_io_channel *back_channel, struct blob_esnap_channel *esnap_ch)
 {
 	struct spdk_bs_channel		*channel;
 	struct spdk_bs_request_set	*set;
@@ -99,6 +118,8 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->bserrno = 0;
 	set->channel = channel;
 	set->back_channel = back_channel;
+	set->esnap_ch = esnap_ch;
+	set->esnap_inflight = 0;
 
 	set->cb_args.cb_fn = bs_sequence_completion;
 	set->cb_args.cb_arg = set;
@@ -112,7 +133,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 spdk_bs_sequence_t *
 bs_sequence_start_bs(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl)
 {
-	return bs_sequence_start(_channel, cpl, _channel);
+	return bs_sequence_start(_channel, cpl, _channel, NULL);
 }
 
 /* Use when performing IO on a blob. */
@@ -120,11 +141,12 @@ spdk_bs_sequence_t *
 bs_sequence_start_blob(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 		       struct spdk_blob *blob)
 {
-	struct spdk_io_channel	*esnap_ch = _channel;
+	struct spdk_io_channel		*back_channel = _channel;
+	struct blob_esnap_channel	*esnap_channel = NULL;
 
 	if (spdk_blob_is_esnap_clone(blob)) {
-		esnap_ch = blob_esnap_get_io_channel(_channel, blob);
-		if (esnap_ch == NULL) {
+		esnap_channel = blob_esnap_get_channel(_channel, blob);
+		if (esnap_channel == NULL) {
 			/*
 			 * The most likely reason we are here is because of some logic error
 			 * elsewhere that caused channel allocations to fail. We could get here due
@@ -136,8 +158,19 @@ bs_sequence_start_blob(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl
 			assert(false);
 			return NULL;
 		}
+		back_channel = blob_esnap_channel_io_channel(esnap_channel);
 	}
-	return bs_sequence_start(_channel, cpl, esnap_ch);
+	return bs_sequence_start(_channel, cpl, back_channel, esnap_channel);
+}
+
+/* Counts a read submitted on the esnap channel of the request. Must be called before the read. */
+static inline void
+bs_request_set_esnap_io_start(struct spdk_bs_request_set *set)
+{
+	if (set->esnap_ch != NULL) {
+		set->esnap_inflight++;
+		blob_esnap_channel_io_start(set->esnap_ch);
+	}
 }
 
 void
@@ -154,6 +187,7 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 
+	bs_request_set_esnap_io_start(set);
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -206,6 +240,7 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 
+	bs_request_set_esnap_io_start(set);
 	if (set->ext_io_opts) {
 		assert(bs_dev->readv_ext);
 		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, lba, lba_count,
@@ -322,6 +357,14 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 		set->bserrno = bserrno;
 	}
 
+	/*
+	 * A batch does not tell which of its operations completed, so the reads from the esnap
+	 * device are released once all the operations submitted so far are done.
+	 */
+	if (set->u.batch.outstanding_ops == 0) {
+		bs_request_set_esnap_io_done(set);
+	}
+
 	if (set->u.batch.outstanding_ops == 0 && set->u.batch.batch_closed) {
 		if (set->u.batch.cb_fn) {
 			set->cb_args.cb_fn = bs_sequence_completion;
@@ -332,18 +375,21 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 	}
 }
 
+/* The blob is only used to find the esnap channel. It may be NULL for IO on the blobstore only. */
 spdk_bs_batch_t *
 bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct spdk_blob *blob)
 {
 	struct spdk_bs_channel		*channel;
 	struct spdk_bs_request_set	*set;
 	struct spdk_io_channel		*back_channel = _channel;
+	struct blob_esnap_channel	*esnap_channel = NULL;
 
-	if (spdk_blob_is_esnap_clone(blob)) {
-		back_channel = blob_esnap_get_io_channel(_channel, blob);
-		if (back_channel == NULL) {
+	if (blob != NULL && spdk_blob_is_esnap_clone(blob)) {
+		esnap_channel = blob_esnap_get_channel(_channel, blob);
+		if (esnap_channel == NULL) {
 			return NULL;
 		}
+		back_channel = blob_esnap_channel_io_channel(esnap_channel);
 	}
 
 	channel = spdk_io_channel_get_ctx(_channel);
@@ -361,6 +407,8 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 	set->bserrno = 0;
 	set->channel = channel;
 	set->back_channel = back_channel;
+	set->esnap_ch = esnap_channel;
+	set->esnap_inflight = 0;
 
 	set->u.batch.cb_fn = NULL;
 	set->u.batch.cb_arg = NULL;
@@ -385,6 +433,7 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 		      lba);
 
 	set->u.batch.outstanding_ops++;
+	bs_request_set_esnap_io_start(set);
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -500,6 +549,8 @@ bs_user_op_alloc(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->cpl = *cpl;
 	set->channel = channel;
 	set->back_channel = NULL;
+	set->esnap_ch = NULL;
+	set->esnap_inflight = 0;
 	set->ext_io_opts = NULL;
 
 	args = &set->u.user_op;
