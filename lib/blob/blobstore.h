@@ -156,6 +156,17 @@ struct spdk_blob {
 	RB_ENTRY(spdk_blob) link;
 
 	uint32_t frozen_refcnt;
+	/* Parent replacement and I/O queued by a freeze keep the blob alive through callbacks. */
+	pthread_mutex_t close_barrier_mutex;
+	uint32_t close_barriers;
+	spdk_bs_sequence_t *pending_close_seq;
+	bool pending_close_scheduled;
+	spdk_bs_sequence_t *esnap_teardown_seq;
+	/* Updated atomically when an I/O thread creates an esnap channel. */
+	uint64_t esnap_channel_generation;
+	uint64_t esnap_teardown_generation;
+	/* Close callbacks may be pending while open_ref still includes their references. */
+	uint32_t close_inflight;
 	bool locked_operation_in_progress;
 	enum blob_clear_method clear_method;
 	bool extent_rle_found;
@@ -484,8 +495,14 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super 
 
 struct spdk_bs_dev *bs_create_zeroes_dev(void);
 struct spdk_bs_dev *bs_create_blob_bs_dev(struct spdk_blob *blob);
-struct spdk_io_channel *blob_esnap_get_io_channel(struct spdk_io_channel *ch,
+void blob_close_barrier_get(struct spdk_blob *blob);
+void blob_close_barrier_put(struct spdk_blob *blob);
+struct blob_esnap_channel;
+struct blob_esnap_channel *blob_esnap_get_channel(struct spdk_io_channel *ch,
 		struct spdk_blob *blob);
+struct spdk_io_channel *blob_esnap_channel_io_channel(struct blob_esnap_channel *esnap_channel);
+void blob_esnap_channel_io_start(struct blob_esnap_channel *esnap_channel);
+bool blob_esnap_channel_io_done(struct blob_esnap_channel *esnap_channel, uint32_t count);
 bool blob_backed_with_zeroes_dev(struct spdk_blob *blob);
 
 /* Unit Conversions

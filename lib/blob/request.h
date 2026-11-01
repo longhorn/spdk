@@ -11,6 +11,8 @@
 
 #include "spdk/blob.h"
 
+struct blob_esnap_channel;
+
 enum spdk_bs_cpl_type {
 	SPDK_BS_CPL_TYPE_NONE,
 	SPDK_BS_CPL_TYPE_BS_BASIC,
@@ -96,6 +98,16 @@ struct spdk_bs_request_set {
 	 */
 	struct spdk_io_channel		*back_channel;
 
+	/*
+	 * Set when the request is on an esnap clone. Reads from the esnap device are counted
+	 * on it until the whole request completes, so that channel teardown cannot finish
+	 * while a read's continuation still uses the blob.
+	 */
+	struct blob_esnap_channel	*esnap_ch;
+	/* Holds the blob's close barrier from channel lookup through the completion callback. */
+	struct spdk_blob		*esnap_blob;
+	uint32_t			esnap_inflight;
+
 	struct spdk_bs_dev_cb_args	cb_args;
 
 	union {
@@ -132,8 +144,9 @@ void bs_call_cpl(struct spdk_bs_cpl *cpl, int bserrno);
 spdk_bs_sequence_t *bs_sequence_start_bs(struct spdk_io_channel *channel,
 		struct spdk_bs_cpl *cpl);
 
+/* On failure, the caller releases *barrier_held after its callback and cleanup. */
 spdk_bs_sequence_t *bs_sequence_start_blob(struct spdk_io_channel *channel,
-		struct spdk_bs_cpl *cpl, struct spdk_blob *blob);
+		struct spdk_bs_cpl *cpl, struct spdk_blob *blob, bool *barrier_held);
 
 spdk_bs_sequence_t *bs_sequence_start_esnap(struct spdk_io_channel *channel,
 		struct spdk_bs_cpl *cpl, struct spdk_blob *blob);
@@ -174,8 +187,9 @@ void bs_sequence_finish(spdk_bs_sequence_t *seq, int bserrno);
 
 void bs_user_op_sequence_finish(void *cb_arg, int bserrno);
 
+/* On failure, the caller releases *barrier_held after its callback and cleanup. */
 spdk_bs_batch_t *bs_batch_open(struct spdk_io_channel *channel,
-			       struct spdk_bs_cpl *cpl, struct spdk_blob *blob);
+			       struct spdk_bs_cpl *cpl, struct spdk_blob *blob, bool *barrier_held);
 
 void bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 			  void *payload, uint64_t lba, uint32_t lba_count);
