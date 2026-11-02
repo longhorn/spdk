@@ -12154,6 +12154,81 @@ blob_persist_error(void)
 }
 
 static void
+blob_recover_shared_clusters(void)
+{
+	/*
+	 * The metadata of two blobs can reference the same clusters, e.g. a snapshot whose deletion
+	 * was interrupted after its clone took its clusters over. A load that rebuilds the
+	 * allocation maps must count each of these clusters once. Counting it once per reference
+	 * makes the free clusters seem fewer than they are, and the load fails once they seem to
+	 * run out.
+	 */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob, *blob2;
+	spdk_blob_id blobid2;
+	uint64_t free_clusters, num_clusters, i;
+
+	dev = init_dev();
+	spdk_bs_init(dev, NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	/* Together, the two blobs reference more clusters than there are. */
+	free_clusters = spdk_bs_free_cluster_count(bs);
+	num_clusters = free_clusters * 3 / 4;
+
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.num_clusters = num_clusters;
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters - num_clusters);
+
+	blob_opts.thin_provision = true;
+	blob2 = ut_blob_create_and_open(bs, &blob_opts);
+	blobid2 = spdk_blob_get_id(blob2);
+
+	/* Have the second blob reference the clusters, and extent pages, of the first one. */
+	for (i = 0; i < num_clusters; i++) {
+		blob2->active.clusters[i] = blob->active.clusters[i];
+	}
+	blob2->active.num_allocated_clusters = blob->active.num_allocated_clusters;
+	SPDK_CU_ASSERT_FATAL(blob2->active.num_extent_pages == blob->active.num_extent_pages);
+	for (i = 0; i < blob->active.num_extent_pages; i++) {
+		blob2->active.extent_pages[i] = blob->active.extent_pages[i];
+	}
+	blob2->state = SPDK_BLOB_STATE_DIRTY;
+	g_bserrno = -1;
+	spdk_blob_sync_md(blob2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_blob_close(blob2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Power failure */
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters - num_clusters);
+
+	blob2 = ut_open_blob(bs, blobid2);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob2) == num_clusters);
+	spdk_blob_close(blob2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+}
+
+static void
 blob_esnap_clone_resize(void)
 {
 	struct spdk_bs_dev *dev;
@@ -13808,6 +13883,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_clone_resize);
 		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone);
 		CU_ADD_TEST(suite, blob_persist_error);
+		CU_ADD_TEST(suite, blob_recover_shared_clusters);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_deep_copy);

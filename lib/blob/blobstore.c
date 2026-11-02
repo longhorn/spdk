@@ -4947,10 +4947,30 @@ bs_load_read_used_pages(struct spdk_bs_load_ctx *ctx)
 			     bs_load_used_pages_cpl, ctx);
 }
 
+/* Mark a cluster referenced by the metadata of a blob as used. Count each cluster once, even if
+ * the metadata of several blobs references it: for example, a snapshot whose deletion was
+ * interrupted after its clone took its clusters over still references them. */
+static int
+bs_load_replay_claim_cluster(struct spdk_bs_load_ctx *ctx, uint32_t cluster_idx)
+{
+	struct spdk_blob_store *bs = ctx->bs;
+
+	if (spdk_bit_array_get(ctx->used_clusters, cluster_idx)) {
+		return 0;
+	}
+
+	spdk_bit_array_set(ctx->used_clusters, cluster_idx);
+	if (bs->num_free_clusters == 0) {
+		return -ENOSPC;
+	}
+	bs->num_free_clusters--;
+
+	return 0;
+}
+
 static int
 bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_page *page)
 {
-	struct spdk_blob_store *bs = ctx->bs;
 	struct spdk_blob_md_descriptor *desc;
 	size_t	cur_desc = 0;
 
@@ -4978,11 +4998,9 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 					 */
 					if (cluster_idx != 0) {
 						SPDK_NOTICELOG("Recover: cluster %" PRIu32 "\n", cluster_idx + j);
-						spdk_bit_array_set(ctx->used_clusters, cluster_idx + j);
-						if (bs->num_free_clusters == 0) {
+						if (bs_load_replay_claim_cluster(ctx, cluster_idx + j) != 0) {
 							return -ENOSPC;
 						}
-						bs->num_free_clusters--;
 					}
 					cluster_count++;
 				}
@@ -5012,11 +5030,9 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 				 * in the used cluster map.
 				 */
 				if (cluster_idx != 0) {
-					spdk_bit_array_set(ctx->used_clusters, cluster_idx);
-					if (bs->num_free_clusters == 0) {
+					if (bs_load_replay_claim_cluster(ctx, cluster_idx) != 0) {
 						return -ENOSPC;
 					}
-					bs->num_free_clusters--;
 				}
 				cluster_count++;
 			}
