@@ -282,6 +282,12 @@ struct raid_bdev {
 
 	/* A flag to enable the recording of a delta bitmap for faulty base bdevs */
 	bool				delta_bitmap_enabled;
+
+	/*
+	 * When true, the raid bdev does not resize on a base bdev RESIZE event and grows only
+	 * through bdev_raid_resize. Set with bdev_raid_set_raid_options; not saved by save_config.
+	 */
+	bool				explicit_resize;
 };
 
 #define RAID_FOR_EACH_BASE_BDEV(r, i) \
@@ -312,6 +318,8 @@ int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb 
 			       void *cb_ctx);
 int raid_bdev_grow_base_bdev(struct raid_bdev *raid_bdev, char *base_bdev_name,
 			     raid_bdev_action_cb cb_fn, void *cb_arg);
+int raid_bdev_resize(struct raid_bdev *raid_bdev, uint64_t min_blockcnt, raid_bdev_action_cb cb_fn,
+		     void *cb_arg);
 struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
 struct raid_base_bdev_info *raid_bdev_find_faulty_base_info_by_name(char *base_bdev_name);
 struct spdk_bit_array *raid_bdev_get_base_bdev_delta_bitmap(char *base_bdev_name);

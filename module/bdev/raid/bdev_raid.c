@@ -1157,6 +1157,7 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
 	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
 				     raid_bdev->num_base_bdevs_operational);
 	spdk_json_write_named_bool(w, "delta_bitmap_enabled", raid_bdev->delta_bitmap_enabled);
+	spdk_json_write_named_bool(w, "explicit_resize", raid_bdev->explicit_resize);
 
 	if (raid_bdev->process) {
 		struct raid_bdev_process *process = raid_bdev->process;
@@ -3002,6 +3003,20 @@ raid_bdev_resize_base_bdev(struct spdk_bdev *base_bdev)
 
 	base_info->blockcnt = base_bdev->blockcnt;
 
+	/*
+	 * Longhorn: with explicit_resize (bdev_raid_set_raid_options), the raid bdev grows only
+	 * through raid_bdev_resize() (the bdev_raid_resize RPC), like bdev_ec. A resize here could
+	 * change the size while the raid bdev is quiesced by a base bdev removal or growth, a
+	 * faulty state change or the end of a background process, and the unquiesce of that
+	 * operation would then no longer match the quiesced range. Without the option, the
+	 * upstream resize below runs unchanged; it is kept as is to ease forward porting.
+	 */
+	if (raid_bdev->explicit_resize) {
+		SPDK_NOTICELOG("raid bdev '%s' is not resized: raid bdevs are resized only by "
+			       "bdev_raid_resize\n", raid_bdev->bdev.name);
+		return;
+	}
+
 	if (!raid_bdev->module->resize) {
 		return;
 	}
@@ -3029,6 +3044,155 @@ raid_bdev_resize_base_bdev(struct spdk_bdev *base_bdev)
 		sb->raid_size = raid_bdev->bdev.blockcnt;
 		raid_bdev_write_superblock(raid_bdev, raid_bdev_resize_write_sb_cb, NULL);
 	}
+}
+
+/*
+ * brief:
+ * raid_bdev_resize function asks the raid module to recalculate the raid_bdev size from its
+ * current base bdevs. It is the counterpart of ec_bdev_resize(). A raid bdev with
+ * explicit_resize does not resize when a base bdev is resized, so this is the only way to grow
+ * it, for example after the base bdevs grew or a smaller base bdev was removed. It also works
+ * without the option.
+ * If the size changed and the raid_bdev has a superblock, the superblock update is started
+ * but not waited for, as in the upstream automatic resize: a failure is only logged by
+ * raid_bdev_resize_write_sb_cb().
+ * The raid_bdev must keep its size while it is quiesced, because the unquiesce range must
+ * match the quiesced one. So the raid_bdev must be online, and no base bdev update,
+ * background process, scheduled removal or faulty base bdev may be in progress.
+ * These checks cover every whole raid_bdev quiesce of a base bdev removal (remove_scheduled
+ * of the member is set from before its quiesce until after its unquiesce) and of a base bdev
+ * grow (base_bdev_updating). They do not cover the end of a background process after
+ * raid_bdev->process is cleared, nor the delta bitmap faulty state paths. Longhorn, the only
+ * user of this resize, uses neither: it grows raid bdevs without a rebuild and without delta
+ * bitmaps.
+ * If min_blockcnt is not 0, the raid_bdev must reach at least min_blockcnt blocks, or it is
+ * not resized. This is checked before the resize, because a wrong growth could not be undone
+ * (a bdev with open descriptors cannot shrink), and after the busy checks, because a base bdev
+ * that is being removed is still listed with its old size. It is "at least" rather than
+ * "exactly", because a base bdev can provide more than the expected size.
+ * params:
+ * raid_bdev - pointer to raid bdev
+ * min_blockcnt - minimum block count that the raid_bdev must reach, or 0 for no check.
+ *                Supported only for raid1.
+ * cb_fn - callback called when the resize is complete. Required: NULL is rejected with
+ *         -EINVAL. It is only called if this function returns 0, and it is called with 0
+ *         before this function returns: this function has no asynchronous step, so errors
+ *         are returned instead of passed to the callback.
+ * cb_arg - argument passed to cb_fn
+ * returns:
+ * 0 - the raid_bdev size changed
+ * -EALREADY - the raid_bdev size did not change
+ * -EINVAL - raid_bdev or cb_fn is NULL
+ * -ENOTSUP - the raid module does not support resizing, the caller is not on the app
+ *            thread, or min_blockcnt is set for a raid level other than raid1
+ * -ENOSPC - a base bdev is smaller than min_blockcnt; the raid_bdev size did not change
+ * -EIO - the raid_bdev is not online
+ * -EBUSY - another operation is in progress, try again later
+ */
+int
+raid_bdev_resize(struct raid_bdev *raid_bdev, uint64_t min_blockcnt, raid_bdev_action_cb cb_fn,
+		 void *cb_arg)
+{
+	struct raid_base_bdev_info *base_info;
+	uint64_t blockcnt_old;
+
+	/* Checked instead of asserted: production builds enable assertions. */
+	if (raid_bdev == NULL || cb_fn == NULL) {
+		SPDK_ERRLOG("raid bdev resize needs a raid bdev and a callback\n");
+		return -EINVAL;
+	}
+
+	if (spdk_get_thread() != spdk_thread_get_app_thread()) {
+		SPDK_ERRLOG("raid bdev '%s' must be resized on the app thread\n", raid_bdev->bdev.name);
+		return -ENOTSUP;
+	}
+
+	if (raid_bdev->state != SPDK_BDEV_RAID_STATE_ONLINE) {
+		SPDK_ERRLOG("raid bdev '%s' must be in online state to be resized\n",
+			    raid_bdev->bdev.name);
+		return -EIO;
+	}
+
+	if (!raid_bdev->module->resize) {
+		SPDK_ERRLOG("Raid level of raid bdev '%s' does not support resizing\n",
+			    raid_bdev->bdev.name);
+		return -ENOTSUP;
+	}
+
+	if (raid_bdev->base_bdev_updating != RAID_BDEV_UPDATE_NONE || raid_bdev->process != NULL) {
+		SPDK_ERRLOG("Another operation is in progress on raid bdev '%s'\n",
+			    raid_bdev->bdev.name);
+		return -EBUSY;
+	}
+
+	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+		if (base_info->remove_scheduled || base_info->state != BASE_BDEV_STATE_NONE) {
+			SPDK_ERRLOG("A base bdev of raid bdev '%s' is being removed or is faulty\n",
+				    raid_bdev->bdev.name);
+			return -EBUSY;
+		}
+	}
+
+	if (min_blockcnt != 0) {
+		if (raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1) {
+			SPDK_ERRLOG("raid bdev '%s': an expected size is supported only for raid1\n",
+				    raid_bdev->bdev.name);
+			return -ENOTSUP;
+		}
+
+		/* A raid1 bdev is as large as its smallest configured base bdev (raid1_resize()). */
+		RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+			uint64_t base_blockcnt;
+
+			if (base_info->desc == NULL) {
+				continue;
+			}
+			base_blockcnt = spdk_bdev_desc_get_bdev(base_info->desc)->blockcnt - base_info->data_offset;
+			if (base_blockcnt < min_blockcnt) {
+				SPDK_ERRLOG("raid bdev '%s' is not resized: base bdev '%s' provides %" PRIu64
+					    " blocks, less than the expected %" PRIu64 "\n",
+					    raid_bdev->bdev.name, base_info->name, base_blockcnt, min_blockcnt);
+				return -ENOSPC;
+			}
+		}
+	}
+
+	blockcnt_old = raid_bdev->bdev.blockcnt;
+	if (raid_bdev->module->resize(raid_bdev) == false) {
+		return -EALREADY;
+	}
+
+	SPDK_NOTICELOG("raid bdev '%s': block count was changed from %" PRIu64 " to %" PRIu64 "\n",
+		       raid_bdev->bdev.name, blockcnt_old, raid_bdev->bdev.blockcnt);
+
+	/*
+	 * The same superblock update as the upstream automatic resize. Longhorn does not use a
+	 * superblock, so a raid bdev with one is unexpected here: warn about it.
+	 */
+	if (raid_bdev->superblock_enabled) {
+		struct raid_bdev_superblock *sb = raid_bdev->sb;
+		uint8_t i;
+
+		SPDK_WARNLOG("raid bdev '%s' has a superblock, which Longhorn does not use: the superblock "
+			     "update is started but not waited for, and a failure is only logged\n",
+			     raid_bdev->bdev.name);
+
+		for (i = 0; i < sb->base_bdevs_size; i++) {
+			struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
+
+			if (sb_base_bdev->slot < raid_bdev->num_base_bdevs) {
+				base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
+				sb_base_bdev->data_size = base_info->data_size;
+			}
+		}
+		sb->raid_size = raid_bdev->bdev.blockcnt;
+		raid_bdev_write_superblock(raid_bdev, raid_bdev_resize_write_sb_cb, NULL);
+	}
+
+	/* Always 0: errors are returned above, not passed to the callback. */
+	cb_fn(cb_arg, 0);
+
+	return 0;
 }
 
 static void

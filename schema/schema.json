@@ -5745,6 +5745,38 @@
       ]
     },
     {
+      "name": "bdev_raid_resize",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Raid bdev name"
+        },
+        {
+          "name": "expected_size_in_mib",
+          "type": "uint64",
+          "description": "Minimum size in MiB that the raid bdev must reach (raid1 only); otherwise the resize is refused and the size is unchanged"
+        }
+      ]
+    },
+    {
+      "name": "bdev_raid_set_raid_options",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Raid bdev name"
+        },
+        {
+          "name": "explicit_resize",
+          "type": "boolean",
+          "description": "If true, the raid bdev does not resize on a base bdev resize event and grows only through bdev_raid_resize; unchanged if absent"
+        }
+      ]
+    },
+    {
       "name": "bdev_raid_get_base_bdev_delta_bitmap",
       "decoder": "rpc_bdev_raid_base_bdev_delta_bitmap_decoders",
       "params": [
