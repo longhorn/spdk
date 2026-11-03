@@ -95,6 +95,7 @@ struct raid_process_finish_action {
 static struct spdk_raid_bdev_opts g_opts = {
 	.process_window_size_kb = RAID_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT,
 	.process_max_bandwidth_mb_sec = RAID_BDEV_PROCESS_MAX_BANDWIDTH_MB_SEC_DEFAULT,
+	.resize_on_base_bdev_resize = true,
 };
 
 void
@@ -1531,6 +1532,7 @@ raid_bdev_opts_config_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "process_window_size_kb", g_opts.process_window_size_kb);
 	spdk_json_write_named_uint32(w, "process_max_bandwidth_mb_sec",
 				     g_opts.process_max_bandwidth_mb_sec);
+	spdk_json_write_named_bool(w, "resize_on_base_bdev_resize", g_opts.resize_on_base_bdev_resize);
 	spdk_json_write_object_end(w);
 
 	spdk_json_write_object_end(w);
@@ -2147,6 +2149,25 @@ raid_bdev_find_faulty_base_info_by_name(char *base_bdev_name)
 	return NULL;
 }
 
+/*
+ * Track the quiesces of the whole raid bdev requested by the raid module, so that an explicit
+ * resize can wait until the matching unquiesce has completed. Call raid_bdev_quiesce_started()
+ * right before spdk_bdev_quiesce(), and raid_bdev_quiesce_ended() when the quiesce fails or the
+ * matching unquiesce completes successfully.
+ */
+static void
+raid_bdev_quiesce_started(struct raid_bdev *raid_bdev)
+{
+	raid_bdev->quiesce_count++;
+}
+
+static void
+raid_bdev_quiesce_ended(struct raid_bdev *raid_bdev)
+{
+	assert(raid_bdev->quiesce_count > 0);
+	raid_bdev->quiesce_count--;
+}
+
 static void
 raid_bdev_remove_base_bdev_done(struct raid_base_bdev_info *base_info, int status)
 {
@@ -2185,6 +2206,18 @@ raid_bdev_remove_base_bdev_on_unquiesced(void *ctx, int status)
 }
 
 static void
+raid_bdev_remove_base_bdev_unquiesce_done(void *ctx, int status)
+{
+	struct raid_base_bdev_info *base_info = ctx;
+
+	if (status == 0) {
+		raid_bdev_quiesce_ended(base_info->raid_bdev);
+	}
+
+	raid_bdev_remove_base_bdev_on_unquiesced(base_info, status);
+}
+
+static void
 raid_bdev_channel_remove_base_bdev(struct spdk_io_channel_iter *i)
 {
 	struct raid_base_bdev_info *base_info = spdk_io_channel_iter_get_ctx(i);
@@ -2215,7 +2248,7 @@ raid_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int sta
 	raid_bdev_free_base_bdev_resource(base_info);
 
 	if (base_info->state == BASE_BDEV_STATE_NONE) {
-		spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_remove_base_bdev_on_unquiesced,
+		spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_remove_base_bdev_unquiesce_done,
 				    base_info);
 	} else {
 		raid_bdev_remove_base_bdev_on_unquiesced(base_info, 0);
@@ -2280,6 +2313,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
 			    raid_bdev->bdev.name, spdk_strerror(-status));
+		raid_bdev_quiesce_ended(raid_bdev);
 		raid_bdev_remove_base_bdev_done(base_info, status);
 		return;
 	}
@@ -2312,10 +2346,18 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 static int
 raid_bdev_remove_base_bdev_quiesce(struct raid_base_bdev_info *base_info)
 {
+	int rc;
+
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	return spdk_bdev_quiesce(&base_info->raid_bdev->bdev, &g_raid_if,
-				 raid_bdev_remove_base_bdev_on_quiesced, base_info);
+	raid_bdev_quiesce_started(base_info->raid_bdev);
+	rc = spdk_bdev_quiesce(&base_info->raid_bdev->bdev, &g_raid_if,
+			       raid_bdev_remove_base_bdev_on_quiesced, base_info);
+	if (rc != 0) {
+		raid_bdev_quiesce_ended(base_info->raid_bdev);
+	}
+
+	return rc;
 }
 
 struct raid_bdev_process_base_bdev_remove_ctx {
@@ -2574,6 +2616,11 @@ raid_bdev_start_faulty_state_on_unquiesced(void *ctx, int status)
 	struct raid_base_bdev_info *base_info = start_ctx->base_info;
 	struct raid_bdev *raid_bdev = base_info->raid_bdev;
 
+	/* Undoes the quiesce of the removal that started the faulty state. */
+	if (status == 0) {
+		raid_bdev_quiesce_ended(raid_bdev);
+	}
+
 	if (status != 0 || start_ctx->status != 0) {
 		if (status != 0) {
 			SPDK_ERRLOG("Starting faulty state of base bdev %s, failed to unquiesce raid bdev %s: %s\n",
@@ -2656,6 +2703,8 @@ raid_bdev_stop_faulty_state_done(void *_ctx, int status)
 		SPDK_ERRLOG("Failed to unquiesce raid bdev %s: %s\n",
 			    raid_bdev->bdev.name, spdk_strerror(-status));
 		ctx->status = status;
+	} else {
+		raid_bdev_quiesce_ended(raid_bdev);
 	}
 
 	if (ctx->cb_fn != NULL) {
@@ -2701,6 +2750,7 @@ _raid_bdev_base_bdev_stop_faulty_state(void *_ctx, int status)
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
 			    raid_bdev->bdev.name, spdk_strerror(-status));
+		raid_bdev_quiesce_ended(raid_bdev);
 		raid_bdev_stop_faulty_state_done(ctx, status);
 		return;
 	}
@@ -2729,6 +2779,7 @@ raid_bdev_stop_base_bdev_delta_bitmap(char *base_bdev_name, raid_bdev_action_cb 
 	struct raid_base_bdev_info *base_info;
 	struct raid_bdev *raid_bdev;
 	struct spdk_bdev *bdev;
+	int rc;
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
@@ -2765,7 +2816,13 @@ raid_bdev_stop_base_bdev_delta_bitmap(char *base_bdev_name, raid_bdev_action_cb 
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 
-	return spdk_bdev_quiesce(bdev, &g_raid_if, _raid_bdev_base_bdev_stop_faulty_state, ctx);
+	raid_bdev_quiesce_started(raid_bdev);
+	rc = spdk_bdev_quiesce(bdev, &g_raid_if, _raid_bdev_base_bdev_stop_faulty_state, ctx);
+	if (rc != 0) {
+		raid_bdev_quiesce_ended(raid_bdev);
+	}
+
+	return rc;
 }
 
 /*
@@ -2958,20 +3015,164 @@ raid_bdev_fail_base_bdev(struct raid_base_bdev_info *base_info)
 	spdk_thread_exec_msg(spdk_thread_get_app_thread(), _raid_bdev_fail_base_bdev, base_info);
 }
 
+struct raid_bdev_resize_ctx {
+	raid_bdev_action_cb	cb_fn;
+	void			*cb_arg;
+};
+
+static void raid_bdev_resize_write_sb(struct raid_bdev *raid_bdev,
+				      struct raid_bdev_resize_ctx *ctx);
+
 static void
-raid_bdev_resize_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
+raid_bdev_resize_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *_ctx)
 {
+	struct raid_bdev_resize_ctx *ctx = _ctx;
+
+	assert(raid_bdev->sb_resize_in_flight);
+	raid_bdev->sb_resize_in_flight = false;
+
 	if (status != 0) {
-		SPDK_ERRLOG("Failed to write raid bdev '%s' superblock after resizing the bdev: %s\n",
-			    raid_bdev->bdev.name, spdk_strerror(-status));
+		/* The new size is only in memory. An explicit resize retries the update. */
+		SPDK_ERRLOG("raid bdev '%s' was resized to %" PRIu64
+			    " blocks but its superblock update failed: %s\n",
+			    raid_bdev->bdev.name, raid_bdev->bdev.blockcnt, spdk_strerror(-status));
+		raid_bdev->sb_resize_pending = true;
+	} else {
+		raid_bdev->sb_resize_pending = false;
 	}
+
+	/*
+	 * An automatic resize during the write left the newer size to write now. A pending
+	 * request is completed only by the last write, with its status.
+	 */
+	if (raid_bdev->sb_resize_rewrite) {
+		raid_bdev->sb_resize_rewrite = false;
+		raid_bdev_resize_write_sb(raid_bdev, ctx);
+		return;
+	}
+
+	if (ctx != NULL) {
+		ctx->cb_fn(ctx->cb_arg, status);
+		free(ctx);
+	}
+}
+
+/*
+ * Write the current raid_bdev size to the superblock. ctx may be NULL; otherwise its callback
+ * is called after the write, possibly before this function returns.
+ *
+ * Only one resize superblock write runs at a time: the superblock buffer must not change while
+ * it is written, and its result decides sb_resize_pending. An explicit resize is refused while a
+ * write is in flight. An automatic resize (ctx == NULL) during a write only marks the superblock
+ * to be rewritten with the newest size when the write completes. The rewrite takes over the
+ * context of the completed write, so its callback reports the status of the last write.
+ */
+static void
+raid_bdev_resize_write_sb(struct raid_bdev *raid_bdev, struct raid_bdev_resize_ctx *ctx)
+{
+	struct raid_bdev_superblock *sb = raid_bdev->sb;
+	struct raid_base_bdev_info *base_info;
+	uint8_t i;
+
+	assert(raid_bdev->superblock_enabled);
+
+	if (raid_bdev->sb_resize_in_flight) {
+		assert(ctx == NULL);
+		raid_bdev->sb_resize_rewrite = true;
+		return;
+	}
+	raid_bdev->sb_resize_in_flight = true;
+
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
+
+		if (sb_base_bdev->slot < raid_bdev->num_base_bdevs) {
+			base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
+			sb_base_bdev->data_size = base_info->data_size;
+		}
+	}
+	sb->raid_size = raid_bdev->bdev.blockcnt;
+	raid_bdev_write_superblock(raid_bdev, raid_bdev_resize_write_sb_cb, ctx);
+}
+
+static int
+raid_bdev_resize_ctx_alloc(raid_bdev_action_cb cb_fn, void *cb_arg,
+			   struct raid_bdev_resize_ctx **_ctx)
+{
+	struct raid_bdev_resize_ctx *ctx = NULL;
+
+	if (cb_fn != NULL) {
+		ctx = calloc(1, sizeof(*ctx));
+		if (ctx == NULL) {
+			return -ENOMEM;
+		}
+		ctx->cb_fn = cb_fn;
+		ctx->cb_arg = cb_arg;
+	}
+
+	*_ctx = ctx;
+	return 0;
+}
+
+/*
+ * brief:
+ * raid_bdev_resize function asks the raid module to recalculate the raid_bdev size
+ * from its current base bdevs, and updates the superblock if the size changed.
+ * params:
+ * raid_bdev - pointer to raid bdev
+ * cb_fn - callback called when the resize is complete, including the superblock update.
+ *         It is only called if this function returns 0, and it may be called before this
+ *         function returns.
+ * cb_arg - argument passed to cb_fn
+ * returns:
+ * 0 - the raid_bdev size changed
+ * -EALREADY - the raid_bdev size did not change
+ * -ENOTSUP - the raid module does not support resizing
+ * -ENOMEM - out of memory, the raid_bdev size did not change
+ */
+static int
+raid_bdev_resize(struct raid_bdev *raid_bdev, raid_bdev_action_cb cb_fn, void *cb_arg)
+{
+	struct raid_bdev_resize_ctx *ctx;
+	uint64_t blockcnt_old;
+	int rc;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	if (!raid_bdev->module->resize) {
+		return -ENOTSUP;
+	}
+
+	rc = raid_bdev_resize_ctx_alloc(cb_fn, cb_arg, &ctx);
+	if (rc != 0) {
+		return rc;
+	}
+
+	blockcnt_old = raid_bdev->bdev.blockcnt;
+	if (raid_bdev->module->resize(raid_bdev) == false) {
+		free(ctx);
+		return -EALREADY;
+	}
+
+	SPDK_NOTICELOG("raid bdev '%s': block count was changed from %" PRIu64 " to %" PRIu64 "\n",
+		       raid_bdev->bdev.name, blockcnt_old, raid_bdev->bdev.blockcnt);
+
+	if (raid_bdev->superblock_enabled) {
+		raid_bdev_resize_write_sb(raid_bdev, ctx);
+	} else if (ctx != NULL) {
+		ctx->cb_fn(ctx->cb_arg, 0);
+		free(ctx);
+	}
+
+	return 0;
 }
 
 /*
  * brief:
  * raid_bdev_resize_base_bdev function is called by below layers when base_bdev
  * is resized. This function checks if the smallest size of the base_bdevs is changed.
- * If yes, call module handler to resize the raid_bdev if implemented.
+ * If yes, call module handler to resize the raid_bdev if implemented, unless the
+ * automatic resize is disabled by the resize_on_base_bdev_resize option.
  * params:
  * base_bdev - pointer to base bdev which got resized.
  * returns:
@@ -2982,7 +3183,6 @@ raid_bdev_resize_base_bdev(struct spdk_bdev *base_bdev)
 {
 	struct raid_bdev *raid_bdev;
 	struct raid_base_bdev_info *base_info;
-	uint64_t blockcnt_old;
 
 	SPDK_DEBUGLOG(bdev_raid, "raid_bdev_resize_base_bdev\n");
 
@@ -3002,33 +3202,100 @@ raid_bdev_resize_base_bdev(struct spdk_bdev *base_bdev)
 
 	base_info->blockcnt = base_bdev->blockcnt;
 
+	if (!g_opts.resize_on_base_bdev_resize) {
+		SPDK_NOTICELOG("raid bdev '%s' is not resized: automatic resize on base bdev resize "
+			       "is disabled, use bdev_raid_resize instead\n", raid_bdev->bdev.name);
+		return;
+	}
+
+	raid_bdev_resize(raid_bdev, NULL, NULL);
+}
+
+/*
+ * brief:
+ * raid_bdev_resize_explicit function recalculates the raid_bdev size from its current
+ * base bdevs on request, for example after its base bdevs were resized while the
+ * automatic resize on base bdev resize was disabled, or after a smaller base bdev was
+ * removed. The raid_bdev must be online, and no base bdev update, background process,
+ * scheduled removal, faulty base bdev or whole raid bdev quiesce may be in progress: those
+ * quiesce the raid_bdev with its current size or keep delta bitmaps that only cover the
+ * current size. Neither may the superblock write of an earlier resize, whose result is not
+ * known yet. If the size does not change but the last resize failed to update the
+ * superblock, the superblock update is retried.
+ * params:
+ * raid_bdev - pointer to raid bdev
+ * cb_fn - callback called when the resize is complete, including the superblock update.
+ *         It is only called if this function returns 0, and it may be called before this
+ *         function returns.
+ * cb_arg - argument passed to cb_fn
+ * returns:
+ * 0 - the raid_bdev size changed, or the superblock update of an earlier resize is retried
+ * -EALREADY - the raid_bdev size did not change
+ * non zero - failure to resize the raid_bdev
+ */
+int
+raid_bdev_resize_explicit(struct raid_bdev *raid_bdev, raid_bdev_action_cb cb_fn, void *cb_arg)
+{
+	struct raid_bdev_resize_ctx *ctx;
+	struct raid_base_bdev_info *base_info;
+	int rc;
+
+	assert(raid_bdev != NULL);
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	if (raid_bdev->state != SPDK_BDEV_RAID_STATE_ONLINE) {
+		SPDK_ERRLOG("raid bdev '%s' must be in online state to be resized\n",
+			    raid_bdev->bdev.name);
+		return -EINVAL;
+	}
+
 	if (!raid_bdev->module->resize) {
-		return;
+		SPDK_ERRLOG("Raid level of raid bdev '%s' does not support resizing\n",
+			    raid_bdev->bdev.name);
+		return -ENOTSUP;
 	}
 
-	blockcnt_old = raid_bdev->bdev.blockcnt;
-	if (raid_bdev->module->resize(raid_bdev) == false) {
-		return;
+	if (raid_bdev->base_bdev_updating != RAID_BDEV_UPDATE_NONE || raid_bdev->process != NULL) {
+		SPDK_ERRLOG("Another operation is in progress on raid bdev '%s'\n",
+			    raid_bdev->bdev.name);
+		return -EBUSY;
 	}
 
-	SPDK_NOTICELOG("raid bdev '%s': block count was changed from %" PRIu64 " to %" PRIu64 "\n",
-		       raid_bdev->bdev.name, blockcnt_old, raid_bdev->bdev.blockcnt);
-
-	if (raid_bdev->superblock_enabled) {
-		struct raid_bdev_superblock *sb = raid_bdev->sb;
-		uint8_t i;
-
-		for (i = 0; i < sb->base_bdevs_size; i++) {
-			struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
-
-			if (sb_base_bdev->slot < raid_bdev->num_base_bdevs) {
-				base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
-				sb_base_bdev->data_size = base_info->data_size;
-			}
+	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+		if (base_info->remove_scheduled || base_info->state != BASE_BDEV_STATE_NONE) {
+			SPDK_ERRLOG("A base bdev of raid bdev '%s' is being removed or is faulty\n",
+				    raid_bdev->bdev.name);
+			return -EBUSY;
 		}
-		sb->raid_size = raid_bdev->bdev.blockcnt;
-		raid_bdev_write_superblock(raid_bdev, raid_bdev_resize_write_sb_cb, NULL);
 	}
+
+	/*
+	 * A whole raid bdev quiesce may still be outstanding after the operation that requested it
+	 * looks finished, for example while a finished background process unquiesces the raid bdev.
+	 */
+	if (raid_bdev->quiesce_count != 0) {
+		SPDK_ERRLOG("raid bdev '%s' is quiesced\n", raid_bdev->bdev.name);
+		return -EBUSY;
+	}
+
+	/* Its result is not known yet, and the superblock must not change while it is written. */
+	if (raid_bdev->sb_resize_in_flight) {
+		SPDK_ERRLOG("A superblock update of raid bdev '%s' is in progress\n", raid_bdev->bdev.name);
+		return -EBUSY;
+	}
+
+	rc = raid_bdev_resize(raid_bdev, cb_fn, cb_arg);
+	if (rc == -EALREADY && raid_bdev->superblock_enabled && raid_bdev->sb_resize_pending) {
+		/* The size did not change, but the last resize did not reach the superblock. */
+		SPDK_NOTICELOG("raid bdev '%s': retrying the superblock update for %" PRIu64 " blocks\n",
+			       raid_bdev->bdev.name, raid_bdev->bdev.blockcnt);
+		rc = raid_bdev_resize_ctx_alloc(cb_fn, cb_arg, &ctx);
+		if (rc == 0) {
+			raid_bdev_resize_write_sb(raid_bdev, ctx);
+		}
+	}
+
+	return rc;
 }
 
 static void
@@ -3231,6 +3498,8 @@ raid_bdev_process_finish_unquiesced(void *ctx, int status)
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to unquiesce bdev: %s\n", spdk_strerror(-status));
+	} else {
+		raid_bdev_quiesce_ended(process->raid_bdev);
 	}
 
 	if (process->status != 0) {
@@ -3325,6 +3594,7 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to quiesce bdev: %s\n", spdk_strerror(-status));
+		raid_bdev_quiesce_ended(raid_bdev);
 		return;
 	}
 
@@ -3341,6 +3611,7 @@ _raid_bdev_process_finish(void *ctx)
 	struct raid_bdev_process *process = ctx;
 	int rc;
 
+	raid_bdev_quiesce_started(process->raid_bdev);
 	rc = spdk_bdev_quiesce(&process->raid_bdev->bdev, &g_raid_if,
 			       raid_bdev_process_finish_quiesced, process);
 	if (rc != 0) {
@@ -4293,6 +4564,8 @@ raid_bdev_grow_base_bdev_on_unquiesced(void *_ctx, int status)
 		goto out;
 	}
 
+	raid_bdev_quiesce_ended(raid_bdev);
+
 	if (!ctx->status && raid_bdev->sb) {
 		struct raid_bdev_superblock *sb = raid_bdev->sb;
 		struct raid_bdev_sb_base_bdev *sb_base_bdev = NULL;
@@ -4489,6 +4762,7 @@ raid_bdev_grow_base_bdev_on_quiesced(void *_ctx, int status)
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
 			    raid_bdev->bdev.name, spdk_strerror(-status));
+		raid_bdev_quiesce_ended(raid_bdev);
 		raid_bdev_grow_base_bdev_done(ctx, status);
 		return;
 	}
@@ -4534,11 +4808,18 @@ static int
 raid_bdev_grow_base_bdev_quiesce(struct raid_bdev_grow_base_bdev_ctx *ctx)
 {
 	struct raid_bdev *raid_bdev = ctx->raid_bdev;
+	int rc;
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	return spdk_bdev_quiesce(&raid_bdev->bdev, &g_raid_if,
-				 raid_bdev_grow_base_bdev_on_quiesced, ctx);
+	raid_bdev_quiesce_started(raid_bdev);
+	rc = spdk_bdev_quiesce(&raid_bdev->bdev, &g_raid_if,
+			       raid_bdev_grow_base_bdev_on_quiesced, ctx);
+	if (rc != 0) {
+		raid_bdev_quiesce_ended(raid_bdev);
+	}
+
+	return rc;
 }
 
 /*
