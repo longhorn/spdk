@@ -76,6 +76,8 @@ bool g_get_io_channel = true;
 bool g_create_ch = true;
 bool g_init_complete_called = false;
 bool g_fini_start_called = true;
+/* Complete I/O from submit_request, like a module that completes some I/O synchronously. */
+static bool g_ut_complete_inline = false;
 int g_status = 0;
 int g_count = 0;
 struct spdk_histogram_data *g_histogram = NULL;
@@ -188,6 +190,11 @@ stub_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 		}
 
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (g_ut_complete_inline && ch->avail_cnt > 0) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 		return;
 	}
 
@@ -1470,6 +1477,77 @@ enomem(void)
 
 	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == 0);
 	CU_ASSERT(shared_resource->io_outstanding == 0);
+
+	spdk_put_io_channel(io_ch);
+	poll_threads();
+	teardown_test();
+}
+
+static bool g_enomem_in_submit;
+static int g_enomem_cb_in_submit;
+
+static void
+enomem_in_submit_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	enum spdk_bdev_io_status *status = cb_arg;
+
+	if (g_enomem_in_submit) {
+		g_enomem_cb_in_submit++;
+	}
+	*status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
+	spdk_bdev_free_io(bdev_io);
+}
+
+/*
+ * When a nomem I/O is queued and no I/O is outstanding, the next submission retries the
+ * queued I/O from within the submit call. A module that completes these I/O synchronously
+ * must not get the user's callbacks called from within the submit call, as callers such as
+ * the nvmf unmap path free their context on the last completion while still using it.
+ */
+static void
+enomem_retry_in_submit(void)
+{
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *bdev_ch;
+	struct spdk_bdev_shared_resource *shared_resource;
+	struct ut_bdev_channel *ut_ch;
+	enum spdk_bdev_io_status status[2];
+	int rc;
+
+	setup_test();
+
+	set_thread(0);
+	io_ch = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch = spdk_io_channel_get_ctx(io_ch);
+	shared_resource = bdev_ch->shared_resource;
+	ut_ch = spdk_io_channel_get_ctx(bdev_ch->channel);
+
+	/* The first I/O fails with ENOMEM while nothing is outstanding. */
+	ut_ch->avail_cnt = 0;
+	status[0] = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_in_submit_done, &status[0]);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == 1);
+	CU_ASSERT(shared_resource->io_outstanding == 0);
+	CU_ASSERT(shared_resource->nomem_threshold == 0);
+
+	/* The next submission retries the queued I/O, which now completes synchronously. */
+	ut_ch->avail_cnt = 2;
+	g_ut_complete_inline = true;
+	g_enomem_cb_in_submit = 0;
+	status[1] = SPDK_BDEV_IO_STATUS_PENDING;
+	g_enomem_in_submit = true;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_in_submit_done, &status[1]);
+	g_enomem_in_submit = false;
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_enomem_cb_in_submit == 0);
+
+	poll_threads();
+	CU_ASSERT(status[0] == SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(status[1] == SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == 0);
+	CU_ASSERT(shared_resource->io_outstanding == 0);
+	g_ut_complete_inline = false;
 
 	spdk_put_io_channel(io_ch);
 	poll_threads();
@@ -2872,6 +2950,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, io_during_qos_queue);
 	CU_ADD_TEST(suite, io_during_qos_reset);
 	CU_ADD_TEST(suite, enomem);
+	CU_ADD_TEST(suite, enomem_retry_in_submit);
 	CU_ADD_TEST(suite, enomem_multi_bdev);
 	CU_ADD_TEST(suite, enomem_multi_bdev_unregister);
 	CU_ADD_TEST(suite, enomem_multi_io_target);

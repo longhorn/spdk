@@ -1636,7 +1636,14 @@ bdev_ch_resubmit_io(struct spdk_bdev_shared_resource *shared_resource, struct sp
 	bdev_io_increment_outstanding(bdev_io->internal.ch, shared_resource);
 	bdev_io->internal.error.nvme.cdw0 = 0;
 	bdev_io->num_retries++;
+	/*
+	 * The nomem I/O may be resubmitted from the submission of another I/O, see
+	 * bdev_io_do_submit(). As for its first submission, defer a completion by the module so
+	 * that the user's callback does not run from within the user's submit call.
+	 */
+	bdev_io->internal.f.in_submit_request = true;
 	bdev_submit_request(bdev, spdk_bdev_io_get_io_channel(bdev_io), bdev_io);
+	bdev_io->internal.f.in_submit_request = false;
 }
 
 static void
