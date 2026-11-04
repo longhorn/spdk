@@ -23,6 +23,11 @@ struct rpc_shallow_copy_status {
 	 * a negative value is the -errno of an aborted operation
 	 */
 	int					result;
+	/*
+	 * Set by the completion callback. The status cannot be freed before, as the callback
+	 * still writes the result after the last cluster is reported.
+	 */
+	bool					done;
 	uint64_t				copied_clusters;
 	uint64_t				unmapped_clusters;
 	uint64_t				total_clusters;
@@ -40,6 +45,8 @@ struct rpc_deep_copy_status {
 	 * a negative value is the -errno of an aborted operation
 	 */
 	int					result;
+	/* Set by the completion callback. The status cannot be freed before. */
+	bool					done;
 	uint64_t				processed_clusters;
 	uint64_t				total_clusters;
 	LIST_ENTRY(rpc_deep_copy_status)	link;
@@ -1437,6 +1444,7 @@ rpc_bdev_lvol_shallow_copy_cb(void *cb_arg, int lvolerrno)
 	struct rpc_bdev_lvol_shallow_copy_ctx *ctx = cb_arg;
 
 	ctx->status->result = lvolerrno;
+	ctx->status->done = true;
 
 	if (ctx->clusters) {
 		free(ctx->clusters);
@@ -1685,9 +1693,13 @@ rpc_bdev_lvol_check_shallow_copy(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_uint64(w, "copied_clusters", copied_clusters);
 	spdk_json_write_named_uint64(w, "unmapped_clusters", unmapped_clusters);
 	spdk_json_write_named_uint64(w, "total_clusters", total_clusters);
-	if (copied_clusters + unmapped_clusters < total_clusters && result == 0) {
+	/*
+	 * Every cluster may be reported before the copy completes. Report the copy in progress
+	 * until its completion callback ran, which still writes to the status.
+	 */
+	if (!status->done) {
 		spdk_json_write_named_string(w, "state", "in progress");
-	} else if (copied_clusters + unmapped_clusters == total_clusters && result == 0) {
+	} else if (result == 0) {
 		spdk_json_write_named_string(w, "state", "complete");
 		LIST_REMOVE(status, link);
 		free(status);
@@ -1725,6 +1737,7 @@ rpc_bdev_lvol_deep_copy_cb(void *cb_arg, int lvolerrno)
 	struct rpc_bdev_lvol_deep_copy_ctx *ctx = cb_arg;
 
 	ctx->status->result = lvolerrno;
+	ctx->status->done = true;
 	free(ctx);
 }
 
@@ -1870,9 +1883,10 @@ rpc_bdev_lvol_check_deep_copy(struct spdk_jsonrpc_request *request,
 
 	spdk_json_write_named_uint64(w, "processed_clusters", processed_clusters);
 	spdk_json_write_named_uint64(w, "total_clusters", total_clusters);
-	if (processed_clusters < total_clusters && result == 0) {
+	/* Like the shallow copy, the completion callback still writes to the status. */
+	if (!status->done) {
 		spdk_json_write_named_string(w, "state", "in progress");
-	} else if (processed_clusters == total_clusters && result == 0) {
+	} else if (result == 0) {
 		spdk_json_write_named_string(w, "state", "complete");
 		LIST_REMOVE(status, link);
 		free(status);
