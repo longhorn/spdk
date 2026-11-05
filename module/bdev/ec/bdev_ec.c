@@ -421,14 +421,8 @@ ec_teardown_must_defer(const struct ec_bdev *ec)
 }
 
 /*
- * Release the home-thread channels a single slot holds: its WIB channel
- * (parity slots only), its bitmap channel, and any live scrub / rebuild
- * channel. Each is NULL-checked, so this is safe to call once per slot
- * regardless of which channels that slot actually opened.
- *
- * Caller must ensure no persist write is outstanding on the WIB / bitmap
- * channels (see ec_teardown_must_defer and the deferral in
- * ec_handle_base_bdev_failure) -- putting a channel with I/O still in
+ * Release the home-thread channels held by one slot. Callers must check
+ * ec_teardown_must_defer first; putting a channel that still has I/O in
  * flight trips the bdev-layer io_outstanding assert.
  */
 static void
@@ -462,6 +456,83 @@ ec_release_slot_dedicated_channels(struct ec_bdev *ec, uint32_t slot)
  * Failure detection
  * ========================================================================= */
 
+/*
+ * Move a NORMAL or REPLACING slot to FAILED, release its dedicated
+ * channels, and start the async quiesce/reset/close chain that closes
+ * the descriptor.
+ */
+static void
+ec_fail_slot(struct ec_bdev *ec, uint32_t slot)
+{
+	const char *bdev_name;
+
+	assert(ec->base_states[slot] != EC_BASE_STATE_FAILED);
+	assert(ec->descs[slot] != NULL);
+
+	bdev_name = spdk_bdev_get_name(spdk_bdev_desc_get_bdev(ec->descs[slot]));
+
+	if (ec->base_states[slot] == EC_BASE_STATE_REPLACING) {
+		/*
+		 * Replacement disk failed before rebuild finished.
+		 * Clear rebuild flags; allow a new replace.
+		 */
+		SPDK_WARNLOG("EC bdev %s: REPLACEMENT disk %s "
+			     "(slot %u) failed before rebuild; "
+			     "slot returns to FAILED\n",
+			     ec->bdev.name, bdev_name, slot);
+		ec->needs_rebuild[slot] = false;
+		ec->replace_in_progress = false;
+		/*
+		 * If a rebuild is in progress for this slot,
+		 * it will fail on its next I/O and call
+		 * ec_rebuild_finish with a non-zero rc.
+		 * We do not abort it here; let the I/O error
+		 * path handle it naturally.
+		 */
+	} else {
+		ec->failed_count++;
+	}
+
+	ec->base_states[slot] = EC_BASE_STATE_FAILED;
+
+	if (ec->failed_count > ec->m) {
+		SPDK_ERRLOG("EC bdev %s fault tolerance exceeded: "
+			    "%u/%u disks failed (max %u). OFFLINE.\n",
+			    ec->bdev.name, ec->failed_count, ec->n, ec->m);
+		ec->offline = true;
+		/* Fail the writes parked on stripe conflicts. */
+		ec_stripe_waitq_fail_all(ec, SPDK_BDEV_IO_STATUS_ABORTED);
+	} else {
+		SPDK_WARNLOG("EC bdev %s: %s disk %s (slot %u/%u) failed "
+			     "(%u/%u disks failed, can tolerate %u more)\n",
+			     ec->bdev.name,
+			     slot >= ec->k ? "PARITY" : "DATA",
+			     bdev_name, slot, ec->n,
+			     ec->failed_count, ec->n,
+			     ec->m - ec->failed_count);
+	}
+
+	/*
+	 * Release this slot's dedicated channels and start the async
+	 * quiesce/reset/close. Defer both while a persist write is still
+	 * outstanding on the slot's WIB or bitmap channel; releasing now
+	 * would trip the bdev-layer io_outstanding assert. The slot is
+	 * already FAILED, so reads degrade either way. See
+	 * ec_teardown_must_defer for what bounds the deferral.
+	 */
+	if (ec_teardown_must_defer(ec)) {
+		ec->dedicated_release_pending[slot] = true;
+		SPDK_NOTICELOG("EC bdev %s: slot %u channel "
+			       "release deferred behind an "
+			       "in-flight persist\n",
+			       ec->bdev.name, slot);
+		return;
+	}
+
+	ec_release_slot_dedicated_channels(ec, slot);
+	ec_start_base_bdev_cleanup(ec, slot);
+}
+
 static void
 ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
 {
@@ -476,71 +547,7 @@ ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
 					bdev_name, i);
 				return;
 			}
-
-			if (ec->base_states[i] == EC_BASE_STATE_REPLACING) {
-				/*
-				 * Replacement disk failed before rebuild finished.
-				 * Clear rebuild flags; allow a new replace.
-				 */
-				SPDK_WARNLOG("EC bdev %s: REPLACEMENT disk %s "
-					     "(slot %u) failed before rebuild; "
-					     "slot returns to FAILED\n",
-					     ec->bdev.name, bdev_name, i);
-				ec->needs_rebuild[i]    = false;
-				ec->replace_in_progress = false;
-				/*
-				 * If a rebuild is in progress for this slot,
-				 * it will fail on its next I/O and call
-				 * ec_rebuild_finish with a non-zero rc.
-				 * We do not abort it here; let the I/O error
-				 * path handle it naturally.
-				 */
-			} else {
-				ec->failed_count++;
-			}
-
-			ec->base_states[i] = EC_BASE_STATE_FAILED;
-
-			if (ec->failed_count > ec->m) {
-				SPDK_ERRLOG("EC bdev %s fault tolerance exceeded: "
-					    "%u/%u disks failed (max %u). OFFLINE.\n",
-					    ec->bdev.name, ec->failed_count, ec->n, ec->m);
-				ec->offline = true;
-				/* Fail the writes parked on stripe conflicts. */
-				ec_stripe_waitq_fail_all(ec, SPDK_BDEV_IO_STATUS_ABORTED);
-			} else {
-				SPDK_WARNLOG("EC bdev %s: %s disk %s (slot %u/%u) failed "
-					     "(%u/%u disks failed, can tolerate %u more)\n",
-					     ec->bdev.name,
-					     i >= ec->k ? "PARITY" : "DATA",
-					     bdev_name, i, ec->n,
-					     ec->failed_count, ec->n,
-					     ec->m - ec->failed_count);
-			}
-
-			/*
-			 * Release this slot's dedicated channels, then start the
-			 * async quiesce/reset/close. Defer both if a persist write
-			 * is still outstanding on the slot's WIB / bitmap channel --
-			 * releasing then would trip the bdev-layer io_outstanding
-			 * assert. The slot is already FAILED, so reads degrade
-			 * regardless of when the channels are freed.
-			 *
-			 * The deferral holds the base descriptor open only briefly:
-			 * the stuck write is aborted at ctrlr-loss, the same event
-			 * as this REMOVE, and its completion resumes the release.
-			 */
-			if (ec_teardown_must_defer(ec)) {
-				ec->dedicated_release_pending[i] = true;
-				SPDK_NOTICELOG("EC bdev %s: slot %u channel "
-					       "release deferred behind an "
-					       "in-flight persist\n",
-					       ec->bdev.name, i);
-				return;
-			}
-
-			ec_release_slot_dedicated_channels(ec, i);
-			ec_start_base_bdev_cleanup(ec, i);
+			ec_fail_slot(ec, i);
 			return;
 		}
 	}
