@@ -52,6 +52,8 @@ static void bs_deep_copy_cluster_find_next(void *cb_arg);
 static void bs_snapshot_checksum_cluster_find_next(void *cb_arg);
 
 static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+static inline void blob_sync_md_checked(struct spdk_blob *blob, spdk_blob_op_complete cb_fn,
+					void *cb_arg);
 
 /*
  * External snapshots require a channel per thread per esnap bdev.  The tree
@@ -2086,6 +2088,9 @@ struct spdk_blob_persist_ctx {
 	spdk_bs_sequence_t		*seq;
 	spdk_bs_sequence_cpl		cb_fn;
 	void				*cb_arg;
+	int				bserrno;
+	/* Whether cb_fn gets the result of the persist, see blob_persist_complete_cb(). */
+	bool				checked;
 	TAILQ_ENTRY(spdk_blob_persist_ctx) link;
 };
 
@@ -2156,8 +2161,12 @@ blob_persist_complete_cb(void *arg)
 {
 	struct spdk_blob_persist_ctx *ctx = arg;
 
-	/* Call user callback */
-	ctx->cb_fn(ctx->seq, ctx->cb_arg, 0);
+	/*
+	 * Pass the result of the persist only to the callers that check it, see
+	 * blob_sync_md_checked(). The others get 0, as before: they only see the errors of the I/O
+	 * done on their own sequence, and their error paths do not expect other failures.
+	 */
+	ctx->cb_fn(ctx->seq, ctx->cb_arg, ctx->checked ? ctx->bserrno : 0);
 
 	/* Free the memory */
 	spdk_free(ctx->pages);
@@ -2181,6 +2190,7 @@ blob_persist_complete(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx
 	/* Complete all persists that were pending when the current persist started */
 	TAILQ_FOREACH_SAFE(next_persist, &blob->persists_to_complete, link, tmp) {
 		TAILQ_REMOVE(&blob->persists_to_complete, next_persist, link);
+		next_persist->bserrno = bserrno;
 		spdk_thread_send_msg(spdk_get_thread(), blob_persist_complete_cb, next_persist);
 	}
 
@@ -2894,10 +2904,11 @@ bs_mark_dirty(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 			     bs_mark_dirty_write, ctx);
 }
 
-/* Write a blob to disk */
+/* Write a blob to disk. If checked, cb_fn gets the result of the persist, see
+ * blob_persist_complete_cb(). */
 static void
-blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
-	     spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+blob_persist_ext(spdk_bs_sequence_t *seq, struct spdk_blob *blob, bool checked,
+		 spdk_bs_sequence_cpl cb_fn, void *cb_arg)
 {
 	struct spdk_blob_persist_ctx *ctx;
 
@@ -2917,6 +2928,7 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	ctx->seq = seq;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+	ctx->checked = checked;
 
 	/* Multiple blob persists can affect one another, via blob->state or
 	 * blob mutable data changes. To prevent it, queue up the persists. */
@@ -2927,6 +2939,13 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	TAILQ_INSERT_HEAD(&blob->persists_to_complete, ctx, link);
 
 	bs_mark_dirty(seq, blob->bs, blob_persist_start, ctx);
+}
+
+static void
+blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
+	     spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+{
+	blob_persist_ext(seq, blob, false, cb_fn, cb_arg);
 }
 
 struct spdk_blob_copy_cluster_ctx {
@@ -10239,7 +10258,8 @@ blob_sync_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 }
 
 static void
-blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+blob_sync_md_persist(struct spdk_blob *blob, bool checked, spdk_blob_op_complete cb_fn,
+		     void *cb_arg)
 {
 	struct spdk_bs_cpl	cpl;
 	spdk_bs_sequence_t	*seq;
@@ -10254,11 +10274,17 @@ blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 		return;
 	}
 
-	blob_persist(seq, blob, blob_sync_md_cpl, blob);
+	blob_persist_ext(seq, blob, checked, blob_sync_md_cpl, blob);
 }
 
-void
-spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+static void
+blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_sync_md_persist(blob, false, cb_fn, cb_arg);
+}
+
+static void
+blob_sync_md_ext(struct spdk_blob *blob, bool checked, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	blob_verify_md_op(blob);
 
@@ -10270,7 +10296,26 @@ spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_
 		return;
 	}
 
-	blob_sync_md(blob, cb_fn, cb_arg);
+	blob_sync_md_persist(blob, checked, cb_fn, cb_arg);
+}
+
+void
+spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_sync_md_ext(blob, false, cb_fn, cb_arg);
+}
+
+/*
+ * Sync a blob's metadata as spdk_blob_sync_md() does, but report every failure of the persist.
+ * spdk_blob_sync_md() reports success for failures outside the I/O of its own sequence, e.g. when
+ * no metadata page is free, or when a persist done for several queued ones fails.
+ *
+ * Use it where the result decides what to keep, revert or release.
+ */
+static inline void
+blob_sync_md_checked(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_sync_md_ext(blob, true, cb_fn, cb_arg);
 }
 
 /* END spdk_blob_sync_md */

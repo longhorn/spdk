@@ -11883,6 +11883,276 @@ blob_delete_snapshot_resized_clone(void)
 	g_phys_blocklen = saved_phys_blocklen;
 }
 
+#define UT_LARGE_XATTR_LEN 3000
+
+static void
+ut_get_large_xattr_value(void *arg, const char *name, const void **value, size_t *value_len)
+{
+	*value = arg;
+	*value_len = UT_LARGE_XATTR_LEN;
+}
+
+/* Make the blobstore device fail a write-like I/O with -EIO, as armed by ut_arm_io_failure(). */
+static struct ut_io_failure {
+	uint64_t lba;		/* UINT64_MAX: any LBA */
+	uint32_t nth;		/* 0: disarmed */
+	uint32_t count;
+} g_ut_io_failure;
+static bool g_ut_io_failed;
+
+static void
+ut_fail_io_complete(void *arg)
+{
+	struct spdk_bs_dev_cb_args *cb_args = arg;
+
+	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EIO);
+}
+
+static bool
+ut_fail_io(uint64_t lba, struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct ut_io_failure *f = &g_ut_io_failure;
+
+	if (f->nth == 0 || (f->lba != UINT64_MAX && f->lba != lba) || ++f->count != f->nth) {
+		return false;
+	}
+
+	g_ut_io_failed = true;
+	spdk_thread_send_msg(spdk_get_thread(), ut_fail_io_complete, cb_args);
+	return true;
+}
+
+static void
+ut_failing_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_write(dev, channel, payload, lba, lba_count, cb_args);
+	}
+}
+
+static void
+ut_failing_dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		      struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
+		      struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_writev(dev, channel, iov, iovcnt, lba, lba_count, cb_args);
+	}
+}
+
+static void
+ut_failing_dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			    uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_write_zeroes(dev, channel, lba, lba_count, cb_args);
+	}
+}
+
+static void
+ut_failing_dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		     uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (!ut_fail_io(lba, cb_args)) {
+		dev_unmap(dev, channel, lba, lba_count, cb_args);
+	}
+}
+
+/* Fail the nth write-like I/O to lba, or to any LBA if lba is UINT64_MAX, counting from now. */
+static void
+ut_arm_io_failure(struct spdk_bs_dev *dev, uint64_t lba, uint32_t nth)
+{
+	SPDK_CU_ASSERT_FATAL(nth > 0);
+	g_ut_io_failed = false;
+	g_ut_io_failure.lba = lba;
+	g_ut_io_failure.nth = nth;
+	g_ut_io_failure.count = 0;
+	dev->write = ut_failing_dev_write;
+	dev->writev = ut_failing_dev_writev;
+	dev->write_zeroes = ut_failing_dev_write_zeroes;
+	dev->unmap = ut_failing_dev_unmap;
+}
+
+static void
+ut_disarm_io_failure(struct spdk_bs_dev *dev)
+{
+	g_ut_io_failure.nth = 0;
+	if (dev == NULL) {
+		return;
+	}
+	dev->write = dev_write;
+	dev->writev = dev_writev;
+	dev->write_zeroes = dev_write_zeroes;
+	dev->unmap = dev_unmap;
+}
+
+/* Claim all the free metadata pages of the blobstore, recording them in pages. */
+static uint32_t
+ut_claim_free_md_pages(struct spdk_blob_store *bs, uint32_t *pages, uint32_t max_pages)
+{
+	uint32_t page, num_pages = 0;
+
+	spdk_spin_lock(&bs->used_lock);
+	while ((page = spdk_bit_array_find_first_clear(bs->used_md_pages, 0)) != UINT32_MAX) {
+		SPDK_CU_ASSERT_FATAL(num_pages < max_pages);
+		bs_claim_md_page(bs, page);
+		pages[num_pages++] = page;
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	return num_pages;
+}
+
+static void
+ut_release_md_pages(struct spdk_blob_store *bs, uint32_t *pages, uint32_t num_pages)
+{
+	spdk_spin_lock(&bs->used_lock);
+	while (num_pages > 0) {
+		bs_release_md_page(bs, pages[--num_pages]);
+	}
+	spdk_spin_unlock(&bs->used_lock);
+}
+
+static struct spdk_blob *
+ut_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid)
+{
+	g_blob = NULL;
+	g_bserrno = -1;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+
+	return g_blob;
+}
+
+static void
+blob_persist_error(void)
+{
+	/*
+	 * A failed persist of a blob's metadata must be reported to the code that checks it, see
+	 * blob_sync_md_checked(). The blob's metadata spans two pages, and each persist claims a
+	 * new page for the second one, so a sync fails when no metadata page is free. Check that:
+	 * - the sync fails then, and succeeds once a page is free;
+	 * - a close then releases the blob and reports no error, as callers such as the lvol
+	 *   library take a failed close for one that kept the blob open;
+	 * - persists queued behind the one in progress complete together, and all report the
+	 *   failure of the persist done for them.
+	 */
+	struct spdk_blob_xattr_opts xattrs;
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	char *xattr_names[] = {"large0", "large1"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t filled[64];
+	uint32_t num_filled;
+	const void *value;
+	size_t value_len;
+	int rc, rc1, rc2, rc3;
+
+	g_phys_blocklen = 4096;
+	dev = init_dev();
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.num_md_pages = SPDK_COUNTOF(filled);
+	spdk_bs_init(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	xattrs.count = SPDK_COUNTOF(xattr_names);
+	xattrs.names = xattr_names;
+	xattrs.ctx = xattr_value;
+	xattrs.get_value = ut_get_large_xattr_value;
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.xattrs = xattrs;
+
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	blobid = spdk_blob_get_id(blob);
+	SPDK_CU_ASSERT_FATAL(blob->active.num_pages == 2);
+
+	/* Syncing fails without free metadata pages, and succeeds once there are. */
+	rc = spdk_blob_set_xattr(blob, "kept", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+	g_bserrno = 0;
+	blob_sync_md_checked(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+	ut_release_md_pages(bs, filled, num_filled);
+
+	g_bserrno = -1;
+	blob_sync_md_checked(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Closing without free metadata pages releases the blob, without reporting an error. */
+	rc = spdk_blob_set_xattr(blob, "lost", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+	g_bserrno = -1;
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	ut_release_md_pages(bs, filled, num_filled);
+
+	ut_bs_reload(&bs, &bs_opts);
+	blob = ut_open_blob(bs, blobid);
+	rc = spdk_blob_get_xattr_value(blob, "kept", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(value_len == sizeof("value"));
+	rc = spdk_blob_get_xattr_value(blob, "lost", &value, &value_len);
+	CU_ASSERT(rc == -ENOENT);
+
+	/* Mark the blobstore dirty, so that the persists below do not write its super block. */
+	rc = spdk_blob_set_xattr(blob, "first", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	g_bserrno = -1;
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* The first sync writes the blob's second page, its first page, and zeroes its old
+	 * second page. Fail the next write, the first one of the persist done for the two
+	 * syncs queued behind the first one. */
+	ut_arm_io_failure(bs->dev, UINT64_MAX, 4);
+	rc1 = rc2 = rc3 = 1;
+	rc = spdk_blob_set_xattr(blob, "second", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	blob_sync_md_checked(blob, blob_op_complete, &rc1);
+	rc = spdk_blob_set_xattr(blob, "third", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	blob_sync_md_checked(blob, blob_op_complete, &rc2);
+	rc = spdk_blob_set_xattr(blob, "fourth", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	blob_sync_md_checked(blob, blob_op_complete, &rc3);
+	poll_threads();
+	CU_ASSERT(g_ut_io_failed);
+	ut_disarm_io_failure(bs->dev);
+	CU_ASSERT(rc1 == 0);
+	CU_ASSERT(rc2 == -EIO);
+	CU_ASSERT(rc3 == -EIO);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
 static void
 blob_esnap_clone_resize(void)
 {
@@ -13537,6 +13807,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_blob, blob_is_degraded);
 		CU_ADD_TEST(suite_bs, blob_clone_resize);
 		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone);
+		CU_ADD_TEST(suite, blob_persist_error);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_deep_copy);
