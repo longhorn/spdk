@@ -5623,6 +5623,11 @@
           "name": "process_max_bandwidth_mb_sec",
           "type": "uint32",
           "description": "Background process (e.g. rebuild) maximum bandwidth in MiB/Sec"
+        },
+        {
+          "name": "resize_on_base_bdev_resize",
+          "type": "boolean",
+          "description": "Resize raid bdevs automatically when a base bdev is resized (default: `true`). If disabled, use bdev_raid_resize"
         }
       ]
     },
@@ -5741,6 +5746,17 @@
           "type": "string",
           "required": true,
           "description": "Base bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_raid_resize",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Raid bdev name"
         }
       ]
     },

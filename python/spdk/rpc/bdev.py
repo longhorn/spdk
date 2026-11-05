@@ -358,11 +358,13 @@ def bdev_null_resize(client, name, new_size):
 
 
 @deprecated_method
-def bdev_raid_set_options(client, process_window_size_kb=None, process_max_bandwidth_mb_sec=None):
+def bdev_raid_set_options(client, process_window_size_kb=None, process_max_bandwidth_mb_sec=None,
+                          resize_on_base_bdev_resize=None):
     """Set options for bdev raid.
     Args:
         process_window_size_kb: Background process (e.g. rebuild) window size in KiB
         process_max_bandwidth_mb_sec: Background process (e.g. rebuild) maximum bandwidth in MiB/Sec
+        resize_on_base_bdev_resize: Resize raid bdevs automatically when a base bdev is resized
     """
     params = dict()
     if process_window_size_kb is not None:
@@ -370,6 +372,9 @@ def bdev_raid_set_options(client, process_window_size_kb=None, process_max_bandw
 
     if process_max_bandwidth_mb_sec is not None:
         params['process_max_bandwidth_mb_sec'] = process_max_bandwidth_mb_sec
+
+    if resize_on_base_bdev_resize is not None:
+        params['resize_on_base_bdev_resize'] = resize_on_base_bdev_resize
 
     return client.call('bdev_raid_set_options', params)
 
@@ -475,6 +480,20 @@ def bdev_raid_grow_base_bdev(client, raid_name, base_name):
     params = {'raid_name': raid_name, 'base_name': base_name}
 
     return client.call('bdev_raid_grow_base_bdev', params)
+
+
+def bdev_raid_resize(client, name):
+    """Recalculate the size of a raid bdev from its current base bdevs.
+
+    Args:
+        name: raid bdev name
+
+    Returns:
+        Object with name, old_blockcnt, new_blockcnt, and resized.
+    """
+    params = {'name': name}
+
+    return client.call('bdev_raid_resize', params)
 
 
 @deprecated_method

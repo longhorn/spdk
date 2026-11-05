@@ -282,6 +282,22 @@ struct raid_bdev {
 
 	/* A flag to enable the recording of a delta bitmap for faulty base bdevs */
 	bool				delta_bitmap_enabled;
+
+	/*
+	 * Number of quiesces of the whole raid bdev requested by the raid module and not yet
+	 * undone. The raid bdev must keep its size while it is quiesced, because the unquiesce
+	 * range must match the quiesced one.
+	 */
+	uint32_t			quiesce_count;
+
+	/* The last resize of the raid bdev failed to update its superblock */
+	bool				sb_resize_pending;
+
+	/* A superblock write of a resize is in progress */
+	bool				sb_resize_in_flight;
+
+	/* The raid bdev was resized again during that write, so the superblock must be rewritten */
+	bool				sb_resize_rewrite;
 };
 
 #define RAID_FOR_EACH_BASE_BDEV(r, i) \
@@ -312,6 +328,8 @@ int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb 
 			       void *cb_ctx);
 int raid_bdev_grow_base_bdev(struct raid_bdev *raid_bdev, char *base_bdev_name,
 			     raid_bdev_action_cb cb_fn, void *cb_arg);
+int raid_bdev_resize_explicit(struct raid_bdev *raid_bdev, raid_bdev_action_cb cb_fn,
+			      void *cb_arg);
 struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
 struct raid_base_bdev_info *raid_bdev_find_faulty_base_info_by_name(char *base_bdev_name);
 struct spdk_bit_array *raid_bdev_get_base_bdev_delta_bitmap(char *base_bdev_name);
@@ -635,6 +653,11 @@ struct spdk_raid_bdev_opts {
 	uint32_t process_window_size_kb;
 	/* Maximum bandwidth in MiB to process per second */
 	uint32_t process_max_bandwidth_mb_sec;
+	/*
+	 * Resize the raid bdev automatically when a base bdev is resized. If disabled, the raid
+	 * bdev is only resized by raid_bdev_resize_explicit().
+	 */
+	bool resize_on_base_bdev_resize;
 };
 
 void raid_bdev_get_opts(struct spdk_raid_bdev_opts *opts);

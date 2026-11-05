@@ -1304,7 +1304,8 @@ def add_parser(subparsers):
     def bdev_raid_set_options(args):
         args.client.bdev_raid_set_options(
                                        process_window_size_kb=args.process_window_size_kb,
-                                       process_max_bandwidth_mb_sec=args.process_max_bandwidth_mb_sec)
+                                       process_max_bandwidth_mb_sec=args.process_max_bandwidth_mb_sec,
+                                       resize_on_base_bdev_resize=args.resize_on_base_bdev_resize)
 
     p = subparsers.add_parser('bdev_raid_set_options',
                               help='Set options for bdev raid.')
@@ -1312,6 +1313,8 @@ def add_parser(subparsers):
                    help="Background process (e.g. rebuild) window size in KiB")
     p.add_argument('-b', '--process-max-bandwidth-mb-sec', type=int,
                    help="Background process (e.g. rebuild) maximum bandwidth in MiB/Sec")
+    p.add_argument('--resize-on-base-bdev-resize', action=argparse.BooleanOptionalAction,
+                   help="Enable or disable resizing raid bdevs automatically when a base bdev is resized")
 
     p.set_defaults(func=bdev_raid_set_options)
 
@@ -1381,6 +1384,13 @@ def add_parser(subparsers):
     p.add_argument('raid_name', help='raid bdev name')
     p.add_argument('base_name', help='base bdev name')
     p.set_defaults(func=bdev_raid_grow_base_bdev)
+
+    def bdev_raid_resize(args):
+        print_dict(args.client.bdev_raid_resize(name=args.name))
+    p = subparsers.add_parser('bdev_raid_resize',
+                              help='Recalculate the size of a raid bdev from its current base bdevs')
+    p.add_argument('-n', '--name', help='raid bdev name', required=True)
+    p.set_defaults(func=bdev_raid_resize)
 
     def bdev_raid_get_base_bdev_delta_bitmap(args):
         print_json(args.client.bdev_raid_get_base_bdev_delta_bitmap(base_bdev_name=args.base_bdev_name))
