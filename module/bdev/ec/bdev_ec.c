@@ -361,15 +361,17 @@ static void
 ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 {
 	struct ec_base_bdev_cleanup_ctx *ctx;
+	int                              rc;
 
 	SPDK_NOTICELOG("EC bdev %s: starting async cleanup for slot %u\n",
 		       ec->bdev.name, slot);
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
-		SPDK_ERRLOG("EC bdev %s: OOM for cleanup ctx slot %u\n",
+		SPDK_ERRLOG("EC bdev %s: OOM for cleanup ctx slot %u; "
+			    "closing descriptor without full cleanup\n",
 			    ec->bdev.name, slot);
-		return;
+		goto close_direct;
 	}
 
 	ctx->ec       = ec;
@@ -377,7 +379,27 @@ ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 	ctx->quiesced = false;
 	ctx->quiesced_blockcnt = ec->bdev.blockcnt;
 
-	spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
+	rc = spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: failed to submit quiesce for slot %u "
+			    "(rc=%d); closing descriptor without full cleanup\n",
+			    ec->bdev.name, slot, rc);
+		free(ctx);
+		goto close_direct;
+	}
+	return;
+
+close_direct:
+	/*
+	 * The cleanup chain never started. Close the descriptor here, as
+	 * ec_cleanup_quiesce_cb does on quiesce failure; nothing else will,
+	 * and leaving it open leaks it for the life of the bdev.
+	 */
+	if (ec->descs[slot]) {
+		ec_slot_publish_base_bdev(ec, slot, NULL);
+		spdk_bdev_close(ec->descs[slot]);
+		ec->descs[slot] = NULL;
+	}
 }
 
 /*
