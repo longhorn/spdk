@@ -1263,6 +1263,69 @@ test_replace_rejects_slot_cleanup_in_flight(void)
 }
 
 /*
+ * cleanup_pending mirrors the replace guard: a FAILED slot reports true
+ * while its descriptor is still open, false once cleanup closed it. The
+ * key is absent on other states.
+ */
+static char   g_ut_json_buf[4096];
+static size_t g_ut_json_len;
+
+static int
+ut_json_write_cb(void *cb_ctx, const void *data, size_t size)
+{
+	SPDK_CU_ASSERT_FATAL(g_ut_json_len + size < sizeof(g_ut_json_buf));
+	memcpy(g_ut_json_buf + g_ut_json_len, data, size);
+	g_ut_json_len += size;
+	g_ut_json_buf[g_ut_json_len] = '\0';
+	return 0;
+}
+
+static void
+ut_render_base_bdevs(const struct ec_bdev *ec)
+{
+	struct spdk_json_write_ctx *w;
+
+	g_ut_json_len = 0;
+	w = spdk_json_write_begin(ut_json_write_cb, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(w != NULL);
+	spdk_json_write_object_begin(w);
+	ec_write_base_bdevs_array_json(w, ec);
+	spdk_json_write_object_end(w);
+	spdk_json_write_end(w);
+}
+
+static void
+test_json_cleanup_pending(void)
+{
+	struct ec_bdev ec;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	/* All NORMAL: the key never appears. */
+	ut_render_base_bdevs(&ec);
+	CU_ASSERT(strstr(g_ut_json_buf, "cleanup_pending") == NULL);
+
+	/* FAILED with the descriptor still open: cleanup in flight. */
+	ec.base_states[1] = EC_BASE_STATE_FAILED;
+	ec.descs[1]       = (struct spdk_bdev_desc *)0x1;
+	ut_render_base_bdevs(&ec);
+	CU_ASSERT(strstr(g_ut_json_buf, "\"cleanup_pending\":true") != NULL);
+
+	/* Cleanup closed the descriptor. */
+	ec.descs[1] = NULL;
+	ut_render_base_bdevs(&ec);
+	CU_ASSERT(strstr(g_ut_json_buf, "\"cleanup_pending\":false") != NULL);
+	CU_ASSERT(strstr(g_ut_json_buf, "\"cleanup_pending\":true") == NULL);
+
+	ec_free_runtime_arrays(&ec);
+}
+
+/*
  * Unit coverage: deferred dedicated-channel teardown.
  *
  * A persist write to a failing disk can sit outstanding on a WIB /
@@ -1833,6 +1896,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_resize_wib_reset_on_grow);
 	CU_ADD_TEST(suite, test_resize_precondition_errors);
 	CU_ADD_TEST(suite, test_replace_rejects_slot_cleanup_in_flight);
+	CU_ADD_TEST(suite, test_json_cleanup_pending);
 
 	CU_ADD_TEST(suite, test_dedicated_channel_release);
 	CU_ADD_TEST(suite, test_dedicated_release_deferred_gate);

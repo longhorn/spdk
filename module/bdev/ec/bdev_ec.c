@@ -1964,6 +1964,8 @@ ec_slot_name_for_json(const struct ec_bdev *ec, uint32_t slot)
  *   name           live base bdev name, or "<failed>" / "<unknown>"
  *   state          "normal" | "failed" | "replacing"
  *   needs_rebuild  bool   (only when state == "replacing")
+ *   cleanup_pending bool (only when state == "failed"): descriptor
+ *                  still held by the async slot cleanup
  *
  * When descs[i] is NULL on a non-FAILED slot (state machine
  * inconsistency, should not happen in normal operation), writes
@@ -1989,6 +1991,8 @@ ec_write_base_bdevs_array_json(struct spdk_json_write_ctx *w,
 		case EC_BASE_STATE_FAILED:
 			spdk_json_write_named_string(w, "name",  "<failed>");
 			spdk_json_write_named_string(w, "state", "failed");
+			spdk_json_write_named_bool(w, "cleanup_pending",
+						   ec->descs[i] != NULL);
 			break;
 		case EC_BASE_STATE_REPLACING:
 			spdk_json_write_named_string(w, "name",
