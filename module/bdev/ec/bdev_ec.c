@@ -2581,6 +2581,16 @@ ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
 		return -EINVAL;
 	}
 
+	/*
+	 * An open descriptor on a FAILED slot means the async cleanup chain
+	 * is still tearing it down. Installing the replacement now would leak
+	 * the old descriptor and let the chain close the new one instead.
+	 * Retry once descs[slot] is NULL.
+	 */
+	if (ec->descs[slot] != NULL) {
+		return -EBUSY;
+	}
+
 	if (ec->replace_in_progress) {
 		return -EBUSY;
 	}

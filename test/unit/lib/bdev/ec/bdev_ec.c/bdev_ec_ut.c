@@ -1221,6 +1221,48 @@ test_resize_precondition_errors(void)
 }
 
 /*
+ * Replace must not run while the async slot cleanup still owns the old
+ * descriptor: a FAILED slot with descs[slot] != NULL is -EBUSY.
+ */
+static void
+test_replace_rejects_slot_cleanup_in_flight(void)
+{
+	struct ec_bdev         ec;
+	struct spdk_bdev_desc *old_desc = (struct spdk_bdev_desc *)0x1;
+	int                    rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	ec.bdev.name = "ec_ut_replace";
+	TAILQ_INSERT_TAIL(&g_ec_bdev_list, &ec, link);
+
+	ec.base_states[1] = EC_BASE_STATE_FAILED;
+	ec.descs[1]       = old_desc;
+
+	rc = ec_bdev_replace_base_bdev("ec_ut_replace", 1, "new_base", NULL, NULL);
+	CU_ASSERT(rc == -EBUSY);
+	CU_ASSERT(ec.descs[1] == old_desc);
+	CU_ASSERT(ec.replace_in_progress == false);
+
+	/*
+	 * Cleanup finished: the request passes the guard. spdk_bdev_open_ext is
+	 * forced to fail so it stops at the next step without a real new bdev.
+	 */
+	ec.descs[1] = NULL;
+	MOCK_SET(spdk_bdev_open_ext, -ENODEV);
+	rc = ec_bdev_replace_base_bdev("ec_ut_replace", 1, "new_base", NULL, NULL);
+	CU_ASSERT(rc == -ENODEV);
+	MOCK_CLEAR(spdk_bdev_open_ext);
+
+	TAILQ_REMOVE(&g_ec_bdev_list, &ec, link);
+	ec_free_runtime_arrays(&ec);
+}
+
+/*
  * Unit coverage: deferred dedicated-channel teardown.
  *
  * A persist write to a failing disk can sit outstanding on a WIB /
@@ -1790,6 +1832,7 @@ main(int argc, char **argv)
 
 	CU_ADD_TEST(suite, test_resize_wib_reset_on_grow);
 	CU_ADD_TEST(suite, test_resize_precondition_errors);
+	CU_ADD_TEST(suite, test_replace_rejects_slot_cleanup_in_flight);
 
 	CU_ADD_TEST(suite, test_dedicated_channel_release);
 	CU_ADD_TEST(suite, test_dedicated_release_deferred_gate);

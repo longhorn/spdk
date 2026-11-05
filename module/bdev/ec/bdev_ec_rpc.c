@@ -252,7 +252,7 @@ ec_errno_to_msg(int rc)
 	case ENODEV:  return "EC bdev not found";
 	case ENOENT:  return "Slot index out of range";
 	case EINVAL:  return "Slot not in FAILED state or geometry mismatch";
-	case EBUSY:   return "Another replace is already in progress";
+	case EBUSY:   return "Slot busy with another operation; retry later";
 	case ENOMEM:  return "Out of memory";
 	default:      return spdk_strerror(-rc);
 	}
