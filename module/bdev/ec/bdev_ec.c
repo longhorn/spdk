@@ -282,9 +282,9 @@ ec_cleanup_reset_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 
 	if (!success) {
-		SPDK_WARNLOG("EC bdev %s: reset of slot %u did not succeed "
-			     "(expected for dead device); continuing\n",
-			     ec->bdev.name, ctx->slot);
+		SPDK_NOTICELOG("EC bdev %s: reset of slot %u did not succeed "
+			       "(expected for dead device); continuing\n",
+			       ec->bdev.name, ctx->slot);
 	}
 
 	cctx = calloc(1, sizeof(*cctx));
