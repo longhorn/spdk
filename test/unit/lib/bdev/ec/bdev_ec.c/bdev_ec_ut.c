@@ -1326,6 +1326,60 @@ test_json_cleanup_pending(void)
 }
 
 /*
+ * ec_bdev_fail_base_bdev: validation, then the same transition as a
+ * REMOVE event. spdk_bdev_quiesce is forced to fail so the cleanup chain
+ * takes its synchronous close path instead of leaking a context whose
+ * callback never fires under the stubs.
+ */
+static void
+test_fail_base_bdev(void)
+{
+	struct ec_bdev ec;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	ec.bdev.name = "ec_ut_fail";
+	TAILQ_INSERT_TAIL(&g_ec_bdev_list, &ec, link);
+	ec.descs[1] = (struct spdk_bdev_desc *)&g_base_bdev;
+	ec.descs[2] = (struct spdk_bdev_desc *)&g_base_bdev;
+
+	CU_ASSERT(ec_bdev_fail_base_bdev("no_such_ec", 1) == -ENODEV);
+	CU_ASSERT(ec_bdev_fail_base_bdev("ec_ut_fail", ec.n) == -ENOENT);
+
+	ec.base_states[2] = EC_BASE_STATE_REPLACING;
+	CU_ASSERT(ec_bdev_fail_base_bdev("ec_ut_fail", 2) == -EBUSY);
+	CU_ASSERT(ec.base_states[2] == EC_BASE_STATE_REPLACING);
+	ec.base_states[2] = EC_BASE_STATE_NORMAL;
+
+	ec.create_in_progress = true;
+	CU_ASSERT(ec_bdev_fail_base_bdev("ec_ut_fail", 1) == -EBUSY);
+	CU_ASSERT(ec.base_states[1] == EC_BASE_STATE_NORMAL);
+	ec.create_in_progress = false;
+
+	MOCK_SET(spdk_bdev_quiesce, -EIO);
+	rc = ec_bdev_fail_base_bdev("ec_ut_fail", 1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ec.base_states[1] == EC_BASE_STATE_FAILED);
+	CU_ASSERT(ec.failed_count == 1);
+	CU_ASSERT(ec.descs[1] == NULL);
+	CU_ASSERT(ec.offline == false);
+
+	/* Repeat is a no-op. */
+	rc = ec_bdev_fail_base_bdev("ec_ut_fail", 1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ec.failed_count == 1);
+	MOCK_CLEAR(spdk_bdev_quiesce);
+
+	TAILQ_REMOVE(&g_ec_bdev_list, &ec, link);
+	ec_free_runtime_arrays(&ec);
+}
+
+/*
  * Unit coverage: deferred dedicated-channel teardown.
  *
  * A persist write to a failing disk can sit outstanding on a WIB /
@@ -1897,6 +1951,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_resize_precondition_errors);
 	CU_ADD_TEST(suite, test_replace_rejects_slot_cleanup_in_flight);
 	CU_ADD_TEST(suite, test_json_cleanup_pending);
+	CU_ADD_TEST(suite, test_fail_base_bdev);
 
 	CU_ADD_TEST(suite, test_dedicated_channel_release);
 	CU_ADD_TEST(suite, test_dedicated_release_deferred_gate);

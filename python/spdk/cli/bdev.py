@@ -1005,6 +1005,15 @@ def add_parser(subparsers):
     p.add_argument('--new-bdev-name', help='Name of the replacement bdev', required=True)
     p.set_defaults(func=bdev_ec_replace_base_bdev)
 
+    def bdev_ec_fail_base_bdev(args):
+        print_dict(args.client.bdev_ec_fail_base_bdev(ec_name=args.ec_name,
+                                                      slot=args.slot))
+
+    p = subparsers.add_parser('bdev_ec_fail_base_bdev', help='Mark a disk in an EC bdev as failed')
+    p.add_argument('--ec-name', help='Name of the EC bdev', required=True)
+    p.add_argument('--slot', help='Slot index of the disk to fail', type=int, required=True)
+    p.set_defaults(func=bdev_ec_fail_base_bdev)
+
     def bdev_ec_start_rebuild(args):
         print_dict(args.client.bdev_ec_start_rebuild(ec_name=args.ec_name))
 

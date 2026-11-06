@@ -514,11 +514,12 @@ ec_fail_slot(struct ec_bdev *ec, uint32_t slot)
 
 	/*
 	 * Release this slot's dedicated channels and start the async
-	 * quiesce/reset/close. Defer both while a persist write is still
-	 * outstanding on the slot's WIB or bitmap channel; releasing now
-	 * would trip the bdev-layer io_outstanding assert. The slot is
-	 * already FAILED, so reads degrade either way. See
-	 * ec_teardown_must_defer for what bounds the deferral.
+	 * quiesce/reset/close. Defer both while ec_teardown_must_defer
+	 * says something still has I/O outstanding on those channels;
+	 * releasing now would trip the bdev-layer io_outstanding assert.
+	 * The slot is already FAILED, so reads degrade either way.
+	 * ec_drain_deferred_slot_releases finishes the job once the
+	 * holder completes.
 	 */
 	if (ec_teardown_must_defer(ec)) {
 		ec->dedicated_release_pending[slot] = true;
@@ -2667,6 +2668,46 @@ ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
 	ec->replace_in_progress = true;
 
 	ec_replace_start_channel_walk(rctx);
+	return 0;
+}
+
+int
+ec_bdev_fail_base_bdev(const char *ec_name, uint32_t slot)
+{
+	struct ec_bdev *ec;
+
+	ec = ec_bdev_find(ec_name);
+	if (!ec) {
+		return -ENODEV;
+	}
+
+	if (slot >= ec->n) {
+		return -ENOENT;
+	}
+
+	if (ec->base_states[slot] == EC_BASE_STATE_FAILED) {
+		return 0;
+	}
+
+	/*
+	 * A REPLACING slot belongs to the replace/rebuild flow. Failing it
+	 * from the control plane would race that flow; a real failure of the
+	 * replacement disk still arrives through the REMOVE event.
+	 */
+	if (ec->base_states[slot] == EC_BASE_STATE_REPLACING) {
+		return -EBUSY;
+	}
+
+	/* Slots are not fully wired until create finishes. */
+	if (ec->create_in_progress) {
+		return -EBUSY;
+	}
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	SPDK_NOTICELOG("EC bdev %s: slot %u failed by request\n",
+		       ec->bdev.name, slot);
+	ec_fail_slot(ec, slot);
 	return 0;
 }
 

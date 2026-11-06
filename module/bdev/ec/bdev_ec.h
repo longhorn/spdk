@@ -185,6 +185,15 @@ int ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
 			      ec_replace_cb_fn cb_fn, void *cb_arg);
 
 /*
+ * Mark the NORMAL disk in slot as FAILED, as if its base bdev had been
+ * removed. The state change is immediate; the descriptor is closed by
+ * the async cleanup chain. Already FAILED slots return 0 unchanged.
+ *
+ * Returns: 0, -ENODEV, -ENOENT, -EBUSY
+ */
+int ec_bdev_fail_base_bdev(const char *ec_name, uint32_t slot);
+
+/*
  * Start background rebuild for all REPLACING slots in ec_name.
  * cb_fn NOT called on synchronous error return.
  *

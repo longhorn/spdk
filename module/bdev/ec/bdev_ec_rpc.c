@@ -332,6 +332,78 @@ rpc_bdev_ec_replace_base_bdev(struct spdk_jsonrpc_request *request,
 SPDK_RPC_REGISTER("bdev_ec_replace_base_bdev", rpc_bdev_ec_replace_base_bdev, SPDK_RPC_RUNTIME)
 
 /* =========================================================================
+ * RPC: bdev_ec_fail_base_bdev
+ * ========================================================================= */
+
+struct rpc_bdev_ec_fail {
+	char    *ec_name;
+	uint32_t slot;
+};
+
+static void
+free_rpc_bdev_ec_fail(struct rpc_bdev_ec_fail *req)
+{
+	free(req->ec_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_ec_fail_base_bdev_decoders[] = {
+	{"ec_name", offsetof(struct rpc_bdev_ec_fail, ec_name), spdk_json_decode_string},
+	{"slot",    offsetof(struct rpc_bdev_ec_fail, slot),    spdk_json_decode_uint32},
+};
+
+static const char *
+ec_fail_errno_to_msg(int rc)
+{
+	switch (-rc) {
+	case ENODEV: return "EC bdev not found";
+	case ENOENT: return "Slot index out of range";
+	case EBUSY:  return "Slot is being replaced or the EC bdev is still being created";
+	default:     return spdk_strerror(-rc);
+	}
+}
+
+static void
+rpc_bdev_ec_fail_base_bdev(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_bdev_ec_fail     req = {};
+	struct spdk_json_write_ctx *w;
+	struct ec_bdev             *ec;
+	int                         rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_ec_fail_base_bdev_decoders,
+				    SPDK_COUNTOF(rpc_bdev_ec_fail_base_bdev_decoders),
+				    &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed for bdev_ec_fail_base_bdev\n");
+		ec_rpc_send_decode_error(request);
+		goto cleanup;
+	}
+
+	rc = ec_bdev_fail_base_bdev(req.ec_name, req.slot);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, ec_fail_errno_to_msg(rc));
+		goto cleanup;
+	}
+
+	/* Synchronous call on the home thread: the bdev found above is still here. */
+	ec = ec_bdev_find(req.ec_name);
+	assert(ec != NULL);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "ec_name", req.ec_name);
+	spdk_json_write_named_uint32(w, "slot",    req.slot);
+	spdk_json_write_named_string(w, "state",   "failed");
+	spdk_json_write_named_bool(w,   "cleanup_pending", ec->descs[req.slot] != NULL);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_bdev_ec_fail(&req);
+}
+SPDK_RPC_REGISTER("bdev_ec_fail_base_bdev", rpc_bdev_ec_fail_base_bdev, SPDK_RPC_RUNTIME)
+
+/* =========================================================================
  * RPC: bdev_ec_get_bdevs
  * ========================================================================= */
 
