@@ -1750,13 +1750,39 @@ blob_load_final(struct spdk_blob_load_ctx *ctx, int bserrno)
 	free(ctx);
 }
 
+/* Whether the blob is marked by a snapshot operation that did not complete: the deletion of the
+ * snapshot (SNAPSHOT_PENDING_REMOVAL), or its creation (SNAPSHOT_IN_PROGRESS). */
+static bool
+blob_has_snapshot_marker(struct spdk_blob *blob)
+{
+	const void *value;
+	size_t len;
+
+	return blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true) == 0 ||
+	       blob_get_xattr_value(blob, SNAPSHOT_IN_PROGRESS, &value, &len, true) == 0;
+}
+
 static void
 blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 {
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 
-	if (bserrno == 0) {
+	if (bserrno == -ENOENT && blob_has_snapshot_marker(blob) &&
+	    !spdk_bit_array_get(blob->bs->used_blobids, bs_blobid_to_page(blob->parent_id))) {
+		/* The parent of a marked blob may have been deleted: a marked blob is not listed
+		 * among the clones of its parent, so nothing stopped that. Load the blob without
+		 * its parent then, so that the recovery in bs_load_iter() can decide what to do
+		 * with it. Only do this if the parent's id is no longer in use. If the parent still
+		 * exists but fails to load, for example because its metadata is damaged, fail to
+		 * load this blob too: without its parent, it would read zeroes instead of the
+		 * parent's data. */
+		SPDK_NOTICELOG("Parent 0x%" PRIx64 " of marked blob 0x%" PRIx64 " not found\n",
+			       blob->parent_id, blob->id);
+		blob->parent_id = SPDK_BLOBID_INVALID;
+		blob->back_bs_dev = bs_create_zeroes_dev();
+		bserrno = 0;
+	} else if (bserrno == 0) {
 		blob->back_bs_dev = bs_create_blob_bs_dev(snapshot);
 		if (blob->back_bs_dev == NULL) {
 			bserrno = -ENOMEM;
@@ -2675,6 +2701,12 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 	void *tmp;
 	int rc;
 
+	if (blob->quarantined) {
+		/* Quarantined while its extent pages were being written, see blob_quarantine(). */
+		blob_persist_complete(seq, ctx, -EPERM);
+		return;
+	}
+
 	/* Generate the new metadata */
 	rc = blob_serialize(blob, &ctx->pages, &blob->active.num_pages);
 	if (rc < 0) {
@@ -2787,6 +2819,12 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
+		return;
+	}
+
+	if (blob->quarantined) {
+		/* See blob_quarantine() */
+		blob_persist_complete(seq, ctx, -EPERM);
 		return;
 	}
 
@@ -4010,6 +4048,29 @@ blob_lookup(struct spdk_blob_store *bs, spdk_blob_id blobid)
 	return RB_FIND(spdk_blob_tree, &bs->open_blobs, &find);
 }
 
+/* Quarantine a blob until the blobstore is loaded again, when its metadata on disk may not match
+ * its metadata in memory, or when only the recovery done by the next load can decide on it: it
+ * can no longer be opened, and its open handles can no longer write it nor persist its metadata.
+ * What it claimed stays claimed. */
+static void
+bs_quarantine_blobid(struct spdk_blob_store *bs, spdk_blob_id blobid)
+{
+	SPDK_WARNLOG("Quarantining blob 0x%" PRIx64 " until the next load\n", blobid);
+	spdk_bit_array_set(bs->quarantined_blobids, bs_blobid_to_page(blobid));
+}
+
+/* Quarantine an open blob, see bs_quarantine_blobid(). */
+static void
+blob_quarantine(struct spdk_blob *blob)
+{
+	bs_quarantine_blobid(blob->bs, blob->id);
+	blob->quarantined = true;
+	blob->data_ro = true;
+	blob->md_ro = true;
+	/* There is nothing to persist anymore. */
+	blob->state = SPDK_BLOB_STATE_CLEAN;
+}
+
 static void
 blob_get_snapshot_and_clone_entries(struct spdk_blob *blob,
 				    struct spdk_blob_list **snapshot_entry, struct spdk_blob_list **clone_entry)
@@ -4142,6 +4203,7 @@ bs_dev_destroy(void *io_device)
 
 	spdk_spin_destroy(&bs->used_lock);
 
+	spdk_bit_array_free(&bs->quarantined_blobids);
 	spdk_bit_array_free(&bs->open_blobids);
 	spdk_bit_array_free(&bs->used_blobids);
 	spdk_bit_array_free(&bs->used_md_pages);
@@ -4155,23 +4217,20 @@ bs_dev_destroy(void *io_device)
 	free(bs);
 }
 
+/* List blob blobid among the clones of snapshot_id, if that is a snapshot. */
 static int
-bs_blob_list_add(struct spdk_blob *blob)
+bs_blob_list_add_id(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_id snapshot_id)
 {
-	spdk_blob_id snapshot_id;
 	struct spdk_blob_list *snapshot_entry = NULL;
 	struct spdk_blob_list *clone_entry = NULL;
 	bool snapshot_entry_added = false;
 
-	assert(blob != NULL);
-
-	snapshot_id = blob->parent_id;
 	if (snapshot_id == SPDK_BLOBID_INVALID ||
 	    snapshot_id == SPDK_BLOBID_EXTERNAL_SNAPSHOT) {
 		return 0;
 	}
 
-	snapshot_entry = bs_get_snapshot_entry(blob->bs, snapshot_id);
+	snapshot_entry = bs_get_snapshot_entry(bs, snapshot_id);
 	if (snapshot_entry == NULL) {
 		/* Snapshot not found */
 		snapshot_entry = calloc(1, sizeof(struct spdk_blob_list));
@@ -4180,11 +4239,11 @@ bs_blob_list_add(struct spdk_blob *blob)
 		}
 		snapshot_entry->id = snapshot_id;
 		TAILQ_INIT(&snapshot_entry->clones);
-		TAILQ_INSERT_TAIL(&blob->bs->snapshots, snapshot_entry, link);
+		TAILQ_INSERT_TAIL(&bs->snapshots, snapshot_entry, link);
 		snapshot_entry_added = true;
 	} else {
 		TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
-			if (clone_entry->id == blob->id) {
+			if (clone_entry->id == blobid) {
 				break;
 			}
 		}
@@ -4195,18 +4254,26 @@ bs_blob_list_add(struct spdk_blob *blob)
 		clone_entry = calloc(1, sizeof(struct spdk_blob_list));
 		if (clone_entry == NULL) {
 			if (snapshot_entry_added) {
-				TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
+				TAILQ_REMOVE(&bs->snapshots, snapshot_entry, link);
 				free(snapshot_entry);
 			}
 			return -ENOMEM;
 		}
-		clone_entry->id = blob->id;
+		clone_entry->id = blobid;
 		TAILQ_INIT(&clone_entry->clones);
 		TAILQ_INSERT_TAIL(&snapshot_entry->clones, clone_entry, link);
 		snapshot_entry->clone_count++;
 	}
 
 	return 0;
+}
+
+static int
+bs_blob_list_add(struct spdk_blob *blob)
+{
+	assert(blob != NULL);
+
+	return bs_blob_list_add_id(blob->bs, blob->id, blob->parent_id);
 }
 
 static void
@@ -4324,6 +4391,20 @@ bs_opts_verify(struct spdk_bs_opts *opts)
 
 /* spdk_bs_load_ctx is used for init, load, unload and dump code paths. */
 
+/* A blob marked by a snapshot operation that did not complete, see bs_load_iter(). */
+struct bs_load_marked_blob {
+	spdk_blob_id	id;
+	spdk_blob_id	parent_id;
+	/* Index of its parent among the marked blobs, or UINT32_MAX */
+	uint32_t	parent_idx;
+	/* Number of marked clones not decided on yet */
+	uint32_t	num_undecided_clones;
+	/* Number of marked clones left for a later load, and listed among its clones */
+	uint32_t	num_deferred_clones;
+	/* Next marked blob ready to be decided on, or UINT32_MAX */
+	uint32_t	next_ready;
+};
+
 struct spdk_bs_load_ctx {
 	struct spdk_blob_store		*bs;
 	struct spdk_bs_super_block	*super;
@@ -4344,6 +4425,15 @@ struct spdk_bs_load_ctx {
 	void					*iter_cb_arg;
 	struct spdk_blob			*blob;
 	spdk_blob_id				blobid;
+
+	/* These fields are used to iterate over the blobs, see bs_load_iter(). */
+	int64_t					iter_page;
+	bool					iter_failed;
+	int					iter_rc;
+	struct bs_load_marked_blob		*marked;
+	uint32_t				num_marked;
+	uint32_t				marked_idx;
+	uint32_t				ready;
 
 	bool					force_recover;
 
@@ -4452,6 +4542,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	bs->used_md_pages = spdk_bit_array_create(1);
 	bs->used_blobids = spdk_bit_array_create(0);
 	bs->open_blobids = spdk_bit_array_create(0);
+	bs->quarantined_blobids = spdk_bit_array_create(0);
 
 	spdk_spin_init(&bs->used_lock);
 
@@ -4461,6 +4552,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	if (rc == -1) {
 		spdk_io_device_unregister(bs, NULL);
 		spdk_spin_destroy(&bs->used_lock);
+		spdk_bit_array_free(&bs->quarantined_blobids);
 		spdk_bit_array_free(&bs->open_blobids);
 		spdk_bit_array_free(&bs->used_blobids);
 		spdk_bit_array_free(&bs->used_md_pages);
@@ -4598,175 +4690,394 @@ blob_set_clear_method(struct spdk_blob *blob, enum blob_clear_method clear_metho
 	blob->state = SPDK_BLOB_STATE_DIRTY;
 }
 
+/*
+ * Recovery of the snapshot operations that did not complete.
+ *
+ * A snapshot being deleted is marked with SNAPSHOT_PENDING_REMOVAL before its clone stops
+ * depending on it, and a snapshot being created is marked with SNAPSHOT_IN_PROGRESS until the
+ * original blob depends on it. A marker remains on disk after a power failure, after a failure
+ * that left the outcome of the operation uncertain, or when a failed operation could not remove
+ * it. The outcome shows in the parent links the other blobs record in their metadata, whatever
+ * blob the marker records, as that blob may have been deleted since: a marked blob is kept as
+ * long as another blob has it as parent, and removed otherwise. Blobs only record their parent,
+ * so this takes two passes over the blobs:
+ * - bs_load_iter() loads every blob, lists the unmarked ones among the clones of their parent and
+ *   reports them, and records the marked ones;
+ * - bs_load_recover_start() then decides on the marked blobs, leaves first. A marked blob that an
+ *   unmarked blob or a kept marked blob has as parent is kept: unmarked, listed among the clones
+ *   of its parent and reported. A marked blob without clones is removed.
+ * A marked blob is left for a later load to decide on when it cannot be reopened, when a blob that
+ * may be one of its clones failed to load, or when all its clones are left for a later load. While
+ * it may have clones, it stays listed among the clones of its parent: neither the recovery nor a
+ * deletion can then remove the parent while those clones may depend on it.
+ */
+
 static void bs_load_iter(void *arg, struct spdk_blob *blob, int bserrno);
+static void bs_load_recover_start(struct spdk_bs_load_ctx *ctx);
+static void bs_load_recover_next(struct spdk_bs_load_ctx *ctx);
 
 static void
-bs_delete_corrupted_blob_cpl(void *cb_arg, int bserrno)
+bs_load_iter_finish(struct spdk_bs_load_ctx *ctx, int bserrno)
 {
-	struct spdk_bs_load_ctx *ctx = cb_arg;
-	spdk_blob_id id;
-	int64_t page_num;
+	ctx->iter_cb_fn = NULL;
 
-	/* Iterate to next blob (we can't use spdk_bs_iter_next function as our
-	 * last blob has been removed */
-	page_num = bs_blobid_to_page(ctx->blobid);
-	page_num++;
-	page_num = spdk_bit_array_find_first_set(ctx->bs->used_blobids, page_num);
-	if (page_num >= spdk_bit_array_capacity(ctx->bs->used_blobids)) {
-		bs_load_iter(ctx, NULL, -ENOENT);
-		return;
+	free(ctx->marked);
+	spdk_free(ctx->super);
+	bs_sequence_finish(ctx->seq, bserrno);
+	if (bserrno != 0) {
+		bs_free(ctx->bs);
 	}
-
-	id = bs_page_to_blobid(page_num);
-
-	spdk_bs_open_blob(ctx->bs, id, bs_load_iter, ctx);
+	free(ctx);
 }
 
 static void
-bs_delete_corrupted_close_cb(void *cb_arg, int bserrno)
+bs_load_iter_next(struct spdk_bs_load_ctx *ctx)
 {
-	struct spdk_bs_load_ctx *ctx = cb_arg;
+	struct spdk_blob_store *bs = ctx->bs;
 
-	if (bserrno != 0) {
-		SPDK_ERRLOG("Failed to close corrupted blob\n");
-		spdk_bs_iter_next(ctx->bs, ctx->blob, bs_load_iter, ctx);
+	ctx->iter_page = spdk_bit_array_find_first_set(bs->used_blobids, ctx->iter_page + 1);
+	if (ctx->iter_page >= spdk_bit_array_capacity(bs->used_blobids)) {
+		bs_load_recover_start(ctx);
 		return;
 	}
 
-	spdk_bs_delete_blob(ctx->bs, ctx->blobid, bs_delete_corrupted_blob_cpl, ctx);
+	spdk_bs_open_blob(bs, bs_page_to_blobid(ctx->iter_page), bs_load_iter, ctx);
 }
 
 static void
-bs_delete_corrupted_blob(void *cb_arg, int bserrno)
+bs_load_iter_close_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
-	uint64_t i;
 
-	if (bserrno != 0) {
-		SPDK_ERRLOG("Failed to close clone of a corrupted blob\n");
-		spdk_bs_iter_next(ctx->bs, ctx->blob, bs_load_iter, ctx);
+	if (ctx->iter_rc != 0) {
+		bs_load_iter_finish(ctx, ctx->iter_rc);
 		return;
 	}
 
-	/* Snapshot and clone have the same copy of cluster map and extent pages
-	 * at this point. Let's clear both for snapshot now,
-	 * so that it won't be cleared for clone later when we remove snapshot.
-	 * Also set thin provision to pass data corruption check */
-	for (i = 0; i < ctx->blob->active.num_clusters; i++) {
-		ctx->blob->active.clusters[i] = 0;
-	}
-	for (i = 0; i < ctx->blob->active.num_extent_pages; i++) {
-		ctx->blob->active.extent_pages[i] = 0;
-	}
-
-	ctx->blob->active.num_allocated_clusters = 0;
-
-	ctx->blob->md_ro = false;
-
-	blob_set_thin_provision(ctx->blob);
-
-	ctx->blobid = ctx->blob->id;
-
-	spdk_blob_close(ctx->blob, bs_delete_corrupted_close_cb, ctx);
+	bs_load_iter_next(ctx);
 }
 
-static void
-bs_update_corrupted_blob(void *cb_arg, int bserrno)
+static int
+bs_load_record_marked(struct spdk_bs_load_ctx *ctx, struct spdk_blob *blob)
 {
-	struct spdk_bs_load_ctx *ctx = cb_arg;
+	struct bs_load_marked_blob *marked;
 
-	if (bserrno != 0) {
-		SPDK_ERRLOG("Failed to close clone of a corrupted blob\n");
-		spdk_bs_iter_next(ctx->bs, ctx->blob, bs_load_iter, ctx);
-		return;
+	marked = realloc(ctx->marked, (ctx->num_marked + 1) * sizeof(*marked));
+	if (marked == NULL) {
+		return -ENOMEM;
 	}
+	ctx->marked = marked;
 
-	ctx->blob->md_ro = false;
-	blob_remove_xattr(ctx->blob, SNAPSHOT_PENDING_REMOVAL, true);
-	blob_remove_xattr(ctx->blob, SNAPSHOT_IN_PROGRESS, true);
-	spdk_blob_set_read_only(ctx->blob);
+	/* Blobs are loaded in the order of their ids, see bs_load_find_marked(). */
+	assert(ctx->num_marked == 0 || ctx->marked[ctx->num_marked - 1].id < blob->id);
+	marked = &ctx->marked[ctx->num_marked++];
+	marked->id = blob->id;
+	marked->parent_id = blob->parent_id;
+	marked->parent_idx = UINT32_MAX;
+	marked->num_undecided_clones = 0;
+	marked->num_deferred_clones = 0;
+	marked->next_ready = UINT32_MAX;
 
-	if (ctx->iter_cb_fn) {
-		ctx->iter_cb_fn(ctx->iter_cb_arg, ctx->blob, 0);
-	}
-	bs_blob_list_add(ctx->blob);
-
-	spdk_bs_iter_next(ctx->bs, ctx->blob, bs_load_iter, ctx);
-}
-
-static void
-bs_examine_clone(void *cb_arg, struct spdk_blob *blob, int bserrno)
-{
-	struct spdk_bs_load_ctx *ctx = cb_arg;
-
-	if (bserrno != 0) {
-		SPDK_ERRLOG("Failed to open clone of a corrupted blob\n");
-		spdk_bs_iter_next(ctx->bs, ctx->blob, bs_load_iter, ctx);
-		return;
-	}
-
-	if (blob->parent_id == ctx->blob->id) {
-		/* Power failure occurred before updating clone (snapshot delete case)
-		 * or after updating clone (creating snapshot case) - keep snapshot */
-		spdk_blob_close(blob, bs_update_corrupted_blob, ctx);
-	} else {
-		/* Power failure occurred after updating clone (snapshot delete case)
-		 * or before updating clone (creating snapshot case) - remove snapshot */
-		spdk_blob_close(blob, bs_delete_corrupted_blob, ctx);
-	}
+	return 0;
 }
 
 static void
 bs_load_iter(void *arg, struct spdk_blob *blob, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = arg;
-	const void *value;
-	size_t len;
-	int rc = 0;
 
-	if (bserrno == 0) {
-		/* Examine blob if it is corrupted after power failure. Fix
-		 * the ones that can be fixed and remove any other corrupted
-		 * ones. If it is not corrupted just process it */
-		rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
-		if (rc != 0) {
-			rc = blob_get_xattr_value(blob, SNAPSHOT_IN_PROGRESS, &value, &len, true);
-			if (rc != 0) {
-				/* Not corrupted - process it and continue with iterating through blobs */
-				if (ctx->iter_cb_fn) {
-					ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
-				}
-				bs_blob_list_add(blob);
-				spdk_bs_iter_next(ctx->bs, blob, bs_load_iter, ctx);
-				return;
-			}
-
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to load blob 0x%" PRIx64 ": %d\n",
+			    bs_page_to_blobid(ctx->iter_page), bserrno);
+		/* The blob may be a clone of a marked blob: do not remove marked blobs before a
+		 * load that loads it, unless no load can, as its metadata is invalid or its parent
+		 * does not exist, or it is the clone of an external snapshot. */
+		if (bserrno != -EINVAL && bserrno != -ENOENT && bserrno != -ENOTSUP) {
+			ctx->iter_failed = true;
 		}
-
-		assert(len == sizeof(spdk_blob_id));
-
-		ctx->blob = blob;
-
-		/* Open clone to check if we are able to fix this blob or should we remove it */
-		spdk_bs_open_blob(ctx->bs, *(spdk_blob_id *)value, bs_examine_clone, ctx);
+		bs_load_iter_next(ctx);
 		return;
-	} else if (bserrno == -ENOENT) {
-		bserrno = 0;
-	} else {
-		/*
-		 * This case needs to be looked at further.  Same problem
-		 *  exists with applications that rely on explicit blob
-		 *  iteration.  We should just skip the blob that failed
-		 *  to load and continue on to the next one.
-		 */
-		SPDK_ERRLOG("Error in iterating blobs\n");
 	}
 
-	ctx->iter_cb_fn = NULL;
+	if (blob_has_snapshot_marker(blob)) {
+		ctx->iter_rc = bs_load_record_marked(ctx, blob);
+	} else {
+		if (ctx->iter_cb_fn) {
+			ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
+		}
+		ctx->iter_rc = bs_blob_list_add(blob);
+	}
 
-	spdk_free(ctx->super);
-	bs_sequence_finish(ctx->seq, bserrno);
-	free(ctx);
+	spdk_blob_close(blob, bs_load_iter_close_cpl, ctx);
+}
+
+static void
+bs_load_recover_close_cpl(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+
+	if (ctx->iter_rc != 0) {
+		bs_load_iter_finish(ctx, ctx->iter_rc);
+		return;
+	}
+
+	bs_load_recover_next(ctx);
+}
+
+static void
+bs_load_remove_delete_cpl(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to delete marked blob 0x%" PRIx64 ": %d\n", ctx->blobid,
+			    bserrno);
+		bs_quarantine_blobid(ctx->bs, ctx->blobid);
+	}
+
+	bs_load_recover_next(ctx);
+}
+
+static void
+bs_load_remove_close_cpl(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	struct spdk_blob *blob;
+
+	if (bserrno != 0) {
+		/* The blob is still open, and cannot be deleted. */
+		SPDK_ERRLOG("Failed to close marked blob 0x%" PRIx64 ": %d\n", ctx->blobid,
+			    bserrno);
+		blob = blob_lookup(ctx->bs, ctx->blobid);
+		if (blob != NULL) {
+			blob_quarantine(blob);
+		} else {
+			bs_quarantine_blobid(ctx->bs, ctx->blobid);
+		}
+		bs_load_recover_next(ctx);
+		return;
+	}
+
+	spdk_bs_delete_blob(ctx->bs, ctx->blobid, bs_load_remove_delete_cpl, ctx);
+}
+
+static void
+bs_load_remove_sync_cpl(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		/* The metadata of the blob on disk may still reference clusters or extent pages
+		 * other blobs use: do not delete it, the next load retries. */
+		SPDK_ERRLOG("Failed to persist marked blob 0x%" PRIx64 ": %d\n", ctx->blobid,
+			    bserrno);
+		blob_quarantine(ctx->blob);
+		spdk_blob_close(ctx->blob, bs_load_recover_close_cpl, ctx);
+		return;
+	}
+
+	spdk_blob_close(ctx->blob, bs_load_remove_close_cpl, ctx);
+}
+
+/* Remove a marked blob without clones. Its metadata on disk may reference clusters and extent pages
+ * other blobs use: those it shared with its former clone, or with the blob it was to be a snapshot
+ * of. As they cannot be told apart from the ones only the marked blob used, drop all of them rather
+ * than release any: the latter stay claimed until a load rebuilds the allocation maps from the
+ * metadata of the blobs, as after a power failure. The marked blob is not listed among the clones
+ * of its parent, which may have been deleted since, and its id reused: clear its link to its parent
+ * as well, so that deleting it neither loads nor updates the parent. Deleting the blob loads it
+ * again from disk, so persist it first. */
+static void
+bs_load_remove_marked(struct spdk_bs_load_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+	uint64_t i;
+
+	SPDK_NOTICELOG("Removing blob 0x%" PRIx64 " left by an interrupted snapshot operation\n",
+		       blob->id);
+
+	blob->md_ro = false;
+	blob_remove_xattr(blob, BLOB_SNAPSHOT, true);
+	if (blob->parent_id != SPDK_BLOBID_EXTERNAL_SNAPSHOT) {
+		blob->parent_id = SPDK_BLOBID_INVALID;
+	}
+
+	for (i = 0; i < blob->active.num_clusters; i++) {
+		blob->active.clusters[i] = 0;
+	}
+	blob->active.num_allocated_clusters = 0;
+	for (i = 0; i < blob->active.num_extent_pages; i++) {
+		blob->active.extent_pages[i] = 0;
+	}
+
+	/* Also passes the data corruption check */
+	blob_set_thin_provision(blob);
+
+	blob_sync_md_checked(blob, bs_load_remove_sync_cpl, ctx);
+}
+
+/* Keep a marked blob that has clones. If persisting it without its markers fails when it is
+ * closed, the next load decides on it again. */
+static void
+bs_load_keep_marked(struct spdk_bs_load_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+
+	blob->md_ro = false;
+	blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
+	blob_remove_xattr(blob, SNAPSHOT_IN_PROGRESS, true);
+	spdk_blob_set_read_only(blob);
+
+	if (ctx->iter_cb_fn) {
+		ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
+	}
+	ctx->iter_rc = bs_blob_list_add(blob);
+
+	spdk_blob_close(blob, bs_load_recover_close_cpl, ctx);
+}
+
+/* Leave the marked blob being decided on for a later load to decide on. Without clones, it may
+ * reference clusters other blobs own: quarantine it. With clones, it is still needed, as its
+ * clones read through it. While it may have clones, list it among the clones of its parent. */
+static int
+bs_load_defer_marked(struct spdk_bs_load_ctx *ctx, struct spdk_blob *blob, bool has_clones)
+{
+	struct bs_load_marked_blob *marked = &ctx->marked[ctx->marked_idx];
+	int rc;
+
+	if (!has_clones) {
+		if (blob != NULL) {
+			blob_quarantine(blob);
+		} else {
+			bs_quarantine_blobid(ctx->bs, marked->id);
+		}
+		if (!ctx->iter_failed) {
+			return 0;
+		}
+	}
+
+	rc = bs_blob_list_add_id(ctx->bs, marked->id, marked->parent_id);
+	if (rc == 0 && marked->parent_idx != UINT32_MAX) {
+		ctx->marked[marked->parent_idx].num_deferred_clones++;
+	}
+
+	return rc;
+}
+
+static void
+bs_load_recover_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	struct bs_load_marked_blob *marked = &ctx->marked[ctx->marked_idx];
+	struct spdk_blob_list *snapshot_entry;
+	size_t num_clones;
+
+	/* Its clones are the blobs this load keeps, and the marked blobs it leaves for a later load
+	 * that bs_load_defer_marked() listed. */
+	snapshot_entry = bs_get_snapshot_entry(ctx->bs, ctx->blobid);
+	num_clones = snapshot_entry != NULL ? snapshot_entry->clone_count : 0;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to open marked blob 0x%" PRIx64 ": %d\n", ctx->blobid, bserrno);
+		ctx->iter_rc = bs_load_defer_marked(ctx, NULL, num_clones > 0);
+		if (ctx->iter_rc != 0) {
+			bs_load_iter_finish(ctx, ctx->iter_rc);
+			return;
+		}
+		bs_load_recover_next(ctx);
+		return;
+	}
+
+	ctx->blob = blob;
+
+	if (num_clones > marked->num_deferred_clones) {
+		bs_load_keep_marked(ctx);
+	} else if (num_clones > 0 || ctx->iter_failed) {
+		ctx->iter_rc = bs_load_defer_marked(ctx, blob, num_clones > 0);
+		spdk_blob_close(blob, bs_load_recover_close_cpl, ctx);
+	} else {
+		bs_load_remove_marked(ctx);
+	}
+}
+
+/* Find marked blob blobid by its id, as the marked blobs are recorded in the order of their ids.
+ * Return its index, or UINT32_MAX. */
+static uint32_t
+bs_load_find_marked(struct spdk_bs_load_ctx *ctx, spdk_blob_id blobid)
+{
+	uint32_t lo = 0, hi = ctx->num_marked, mid;
+
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2;
+		if (ctx->marked[mid].id < blobid) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+
+	return lo < ctx->num_marked && ctx->marked[lo].id == blobid ? lo : UINT32_MAX;
+}
+
+static void
+bs_load_push_ready(struct spdk_bs_load_ctx *ctx, uint32_t idx)
+{
+	ctx->marked[idx].next_ready = ctx->ready;
+	ctx->ready = idx;
+}
+
+/* Decide on a marked blob once its marked clones have been decided on: whether these are kept
+ * determines whether it has clones. Link each marked blob to its marked parent and count its
+ * marked clones once, then decide on the blobs that have none left, each decision readying its
+ * parent once its last marked clone is decided on. */
+static void
+bs_load_recover_start(struct spdk_bs_load_ctx *ctx)
+{
+	struct bs_load_marked_blob *marked;
+	uint32_t i;
+
+	ctx->ready = UINT32_MAX;
+	for (i = 0; i < ctx->num_marked; i++) {
+		marked = &ctx->marked[i];
+		marked->parent_idx = bs_load_find_marked(ctx, marked->parent_id);
+		if (marked->parent_idx != UINT32_MAX) {
+			ctx->marked[marked->parent_idx].num_undecided_clones++;
+		}
+	}
+
+	/* Push in reverse, to decide on the ready blobs in the order of their ids. */
+	for (i = ctx->num_marked; i > 0; i--) {
+		if (ctx->marked[i - 1].num_undecided_clones == 0) {
+			bs_load_push_ready(ctx, i - 1);
+		}
+	}
+
+	bs_load_recover_next(ctx);
+}
+
+static void
+bs_load_recover_next(struct spdk_bs_load_ctx *ctx)
+{
+	struct bs_load_marked_blob *marked;
+	uint32_t parent_idx;
+
+	if (ctx->ready == UINT32_MAX) {
+		bs_load_iter_finish(ctx, 0);
+		return;
+	}
+
+	ctx->marked_idx = ctx->ready;
+	marked = &ctx->marked[ctx->marked_idx];
+	ctx->ready = marked->next_ready;
+
+	/* Decisions are taken one at a time, so the parent is decided on after this blob. */
+	parent_idx = marked->parent_idx;
+	if (parent_idx != UINT32_MAX && --ctx->marked[parent_idx].num_undecided_clones == 0) {
+		bs_load_push_ready(ctx, parent_idx);
+	}
+
+	ctx->blobid = marked->id;
+	spdk_bs_open_blob(ctx->bs, marked->id, bs_load_recover_open_cpl, ctx);
 }
 
 static void bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg);
@@ -4779,7 +5090,9 @@ bs_load_complete(struct spdk_bs_load_ctx *ctx)
 		bs_dump_read_md_page(ctx->seq, ctx);
 		return;
 	}
-	spdk_bs_iter_first(ctx->bs, bs_load_iter, ctx);
+
+	ctx->iter_page = -1;
+	bs_load_iter_next(ctx);
 }
 
 static void
@@ -5446,6 +5759,10 @@ bs_parse_super(struct spdk_bs_load_ctx *ctx)
 	if (rc < 0) {
 		return -ENOMEM;
 	}
+	rc = spdk_bit_array_resize(&ctx->bs->quarantined_blobids, ctx->bs->md_len);
+	if (rc < 0) {
+		return -ENOMEM;
+	}
 
 	ctx->bs->total_data_clusters = ctx->bs->total_clusters - spdk_divide_round_up(
 					       ctx->bs->md_start + ctx->bs->md_len, ctx->bs->pages_per_cluster);
@@ -6100,6 +6417,15 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	}
 
 	rc = spdk_bit_array_resize(&bs->open_blobids, bs->md_len);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	rc = spdk_bit_array_resize(&bs->quarantined_blobids, bs->md_len);
 	if (rc < 0) {
 		spdk_free(ctx->super);
 		free(ctx);
@@ -10191,6 +10517,12 @@ bs_open_blob(struct spdk_blob_store *bs,
 		return;
 	}
 
+	if (spdk_bit_array_get(bs->quarantined_blobids, page_num)) {
+		SPDK_ERRLOG("Blob 0x%" PRIx64 " is quarantined until the next load\n", blobid);
+		cb_fn(cb_arg, NULL, -EBUSY);
+		return;
+	}
+
 	blob = blob_lookup(bs, blobid);
 	if (blob) {
 		blob->open_ref++;
@@ -10303,6 +10635,12 @@ blob_sync_md_ext(struct spdk_blob *blob, bool checked, spdk_blob_op_complete cb_
 	blob_verify_md_op(blob);
 
 	SPDK_DEBUGLOG(blob, "Syncing blob 0x%" PRIx64 "\n", blob->id);
+
+	if (blob->quarantined) {
+		/* Its metadata in memory may not match the one on disk, see blob_quarantine(). */
+		cb_fn(cb_arg, -EPERM);
+		return;
+	}
 
 	if (blob->md_ro && blob->state != SPDK_BLOB_STATE_DIRTY_XATTR) {
 		assert(blob->state == SPDK_BLOB_STATE_CLEAN);
@@ -11416,6 +11754,11 @@ bs_load_grow_continue(struct spdk_bs_load_ctx *ctx)
 	ctx->bs->md_start = ctx->super->md_start;
 	ctx->bs->md_len = ctx->super->md_len;
 	rc = spdk_bit_array_resize(&ctx->bs->open_blobids, ctx->bs->md_len);
+	if (rc < 0) {
+		bs_load_ctx_fail(ctx, -ENOMEM);
+		return;
+	}
+	rc = spdk_bit_array_resize(&ctx->bs->quarantined_blobids, ctx->bs->md_len);
 	if (rc < 0) {
 		bs_load_ctx_fail(ctx, -ENOMEM);
 		return;
