@@ -14293,15 +14293,18 @@ blob_delete_snapshot_resized_clone_snapshot_error(void)
 }
 
 /* Create a blob with a parent snapshot and a snapshot, and fail the deletion of the snapshot
- * once the clone's metadata is committed, when persisting the snapshot's. The clone has no
- * extent page of its own in slot 0, where it gets a copy of the snapshot's, *snap_page. */
+ * once the clone's metadata is committed: when persisting the snapshot's, or, if fail_close, when
+ * closing the clone afterwards. The clone has no extent page of its own in slot 0, where it gets
+ * a copy of the snapshot's, *snap_page. */
 static struct spdk_blob_store *
-ut_committed_clone(struct spdk_bs_opts *bs_opts, struct spdk_blob **blob,
+ut_committed_clone(struct spdk_bs_opts *bs_opts, bool fail_close, struct spdk_blob **blob,
 		   struct spdk_io_channel **channel, spdk_blob_id *parentid, spdk_blob_id *snapid,
 		   uint32_t *snap_page, uint32_t *base_md_pages)
 {
 	struct spdk_blob_store *bs;
 	struct spdk_blob_opts blob_opts;
+	uint64_t snap_lba, clone_lba;
+	int rc;
 
 	spdk_bs_opts_init(bs_opts, sizeof(*bs_opts));
 	bs_opts->cluster_sz = 4096;
@@ -14329,13 +14332,31 @@ ut_committed_clone(struct spdk_bs_opts *bs_opts, struct spdk_blob **blob,
 
 	/* The snapshot's root page is written to mark it for removal, then to drop the references
 	 * it shares with the clone. */
-	ut_arm_io_failure(bs->dev, bs_md_page_to_lba(bs, bs_blobid_to_page(*snapid)), 2);
+	snap_lba = bs_md_page_to_lba(bs, bs_blobid_to_page(*snapid));
 	g_bserrno = 0;
-	spdk_bs_delete_blob(bs, *snapid, blob_op_complete, NULL);
+	if (!fail_close) {
+		ut_arm_io_failure(bs->dev, snap_lba, 2);
+		spdk_bs_delete_blob(bs, *snapid, blob_op_complete, NULL);
+	} else {
+		/* Hold the second write, change the clone meanwhile, and fail the write of the
+		 * clone's root page when the deletion closes the clone. */
+		ut_arm_io_hold(bs->dev, snap_lba);
+		spdk_bs_delete_blob(bs, *snapid, blob_op_complete, NULL);
+		poll_threads();
+		ut_release_held_io();
+		ut_arm_io_hold(bs->dev, snap_lba);
+		poll_threads();
+		rc = spdk_blob_set_xattr(*blob, "ut", "1", 2);
+		CU_ASSERT(rc == 0);
+		clone_lba = bs_md_page_to_lba(bs, bs_blobid_to_page(spdk_blob_get_id(*blob)));
+		ut_arm_io_failure(bs->dev, clone_lba, 1);
+		ut_release_held_io();
+	}
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EIO);
 	CU_ASSERT(g_ut_io_failed);
 	ut_disarm_io_failure(bs->dev);
+	CU_ASSERT(bs->needs_recovery);
 
 	/* The clone got its own copy of the snapshot's extent page, and belongs to the parent
 	 * snapshot, which keeps a single clone. */
@@ -14369,7 +14390,7 @@ blob_delete_snapshot_committed_clone_snapshot(void)
 	uint32_t base_md_pages, snap_page, clone_page;
 
 	g_phys_blocklen = 4096;
-	bs = ut_committed_clone(&bs_opts, &blob, &channel, &parentid, &snapid, &snap_page,
+	bs = ut_committed_clone(&bs_opts, false, &blob, &channel, &parentid, &snapid, &snap_page,
 				&base_md_pages);
 	blobid = spdk_blob_get_id(blob);
 	clone_page = blob->active.extent_pages[0];
@@ -14432,15 +14453,19 @@ static void
 blob_delete_snapshot_committed_clone_delete(void)
 {
 	/*
-	 * The deletion of a snapshot failed after the clone's metadata was committed, see
-	 * ut_committed_clone(). Delete the clone, the head of the chain, then the parent snapshot,
-	 * whose only clone the clone was. Check that:
+	 * The deletion of a snapshot failed after the clone's metadata was committed, when
+	 * persisting the snapshot or when closing the clone, see ut_committed_clone(). Delete the
+	 * clone, the head of the chain, then the parent snapshot, whose only clone the clone was.
+	 * Check that:
 	 * - deleting the clone does not release the snapshot's extent page, which the snapshot's
-	 *   metadata on disk still references. Otherwise a load after a power failure, which
-	 *   rebuilds the allocation maps from the metadata of every blob, extent pages included,
-	 *   would fail;
-	 * - that load removes the snapshot, whose parent no longer exists;
-	 * - once a load rebuilds the allocation maps again, no metadata page or cluster leaked.
+	 *   metadata on disk still references. Otherwise a load that rebuilds the allocation maps
+	 *   from the metadata of every blob, extent pages included, would fail;
+	 * - whether the blobstore is unloaded first or not (a power failure), the next load
+	 *   rebuilds the allocation maps and removes the snapshot. Deleting the clone released the
+	 *   clusters the snapshot's metadata on disk still references, so the allocation maps an
+	 *   unload saves show them as free, and a load that used them would skip the snapshot;
+	 * - the load after that rebuilds the maps again, and finds that no metadata page or cluster
+	 *   leaked.
 	 */
 	struct spdk_blob_store *bs;
 	struct spdk_bs_opts bs_opts;
@@ -14449,25 +14474,35 @@ blob_delete_snapshot_committed_clone_delete(void)
 	spdk_blob_id parentid, snapid;
 	uint32_t saved_phys_blocklen = g_phys_blocklen;
 	uint32_t base_md_pages, snap_page;
+	int fail_close, unload;
 
 	g_phys_blocklen = 4096;
-	bs = ut_committed_clone(&bs_opts, &blob, &channel, &parentid, &snapid, &snap_page,
-				&base_md_pages);
-	ut_blob_close_and_delete(bs, blob);
-	spdk_bs_free_io_channel(channel);
-	poll_threads();
-	CU_ASSERT(spdk_bit_array_get(bs->used_md_pages, snap_page));
-	ut_delete_blob(bs, parentid);
+	for (fail_close = 0; fail_close < 2; fail_close++) {
+		for (unload = 0; unload < 2; unload++) {
+			bs = ut_committed_clone(&bs_opts, fail_close, &blob, &channel, &parentid,
+						&snapid, &snap_page, &base_md_pages);
+			ut_blob_close_and_delete(bs, blob);
+			spdk_bs_free_io_channel(channel);
+			poll_threads();
+			CU_ASSERT(spdk_bit_array_get(bs->used_md_pages, snap_page));
+			ut_delete_blob(bs, parentid);
 
-	/* Power failure */
-	ut_bs_dirty_load(&bs, &bs_opts);
-	ut_open_blob_fails(bs, snapid, -ENOENT);
-	ut_open_blob_fails(bs, parentid, -ENOENT);
+			if (unload) {
+				ut_bs_reload(&bs, &bs_opts);
+			} else {
+				/* Power failure */
+				ut_bs_dirty_load(&bs, &bs_opts);
+			}
+			ut_open_blob_fails(bs, snapid, -ENOENT);
+			ut_open_blob_fails(bs, parentid, -ENOENT);
 
-	ut_bs_dirty_load(&bs, &bs_opts);
-	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
-	CU_ASSERT(spdk_bs_free_cluster_count(bs) == spdk_bs_total_data_cluster_count(bs));
-	ut_unload_bs(bs);
+			ut_bs_reload(&bs, &bs_opts);
+			CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+			CU_ASSERT(spdk_bs_free_cluster_count(bs) ==
+				  spdk_bs_total_data_cluster_count(bs));
+			ut_unload_bs(bs);
+		}
+	}
 
 	g_phys_blocklen = saved_phys_blocklen;
 }
