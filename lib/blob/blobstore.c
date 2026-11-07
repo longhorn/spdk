@@ -2230,6 +2230,25 @@ blob_persist_complete(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx
 	bs_mark_dirty(seq, blob->bs, blob_persist_start, next_persist);
 }
 
+/* If no persist is running, start the persists waiting in pending_persists, as
+ * blob_persist_complete() does when a persist finishes. */
+static void
+blob_persist_start_pending(struct spdk_blob *blob)
+{
+	struct spdk_blob_persist_ctx *ctx;
+
+	if (!TAILQ_EMPTY(&blob->persists_to_complete) || TAILQ_EMPTY(&blob->pending_persists)) {
+		return;
+	}
+
+	TAILQ_SWAP(&blob->persists_to_complete, &blob->pending_persists, spdk_blob_persist_ctx,
+		   link);
+	ctx = TAILQ_FIRST(&blob->persists_to_complete);
+
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+	bs_mark_dirty(ctx->seq, blob->bs, blob_persist_start, ctx);
+}
+
 static void
 blob_persist_clear_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -9871,6 +9890,10 @@ struct delete_snapshot_ctx {
 	/* The context to unfreeze I/O to the clone with, allocated before freezing it so that
 	 * unfreezing it cannot fail. */
 	struct freeze_io_ctx *unfreeze_ctx;
+	/* Placeholder put in the clone's persists_to_complete to make other persists of the clone
+	 * wait, see delete_snapshot_hold_clone_persists(). */
+	struct spdk_blob_persist_ctx clone_persist_hold;
+	bool clone_persists_held;
 };
 
 static void
@@ -9930,6 +9953,46 @@ delete_snapshot_cleanup_snapshot(void *cb_arg, int bserrno)
 	spdk_blob_close(ctx->snapshot, delete_blob_cleanup_finish, ctx);
 }
 
+/* Make other persists of the clone wait while the deletion changes the clone in memory. Until
+ * the commit, the clone in memory is half-changed: for example, its extent table points to new
+ * extent pages that an abort frees again. Another persist would write that to disk. The
+ * placeholder in persists_to_complete looks like a running persist, so blob_persist_ext() puts
+ * the other persists in pending_persists. Only add it when no cluster insertion and no persist
+ * of the clone is running, and return false otherwise: a running persist would finish the
+ * placeholder together with itself, see blob_persist_complete(). */
+static bool
+delete_snapshot_hold_clone_persists(struct delete_snapshot_ctx *ctx)
+{
+	struct spdk_blob *clone = ctx->clone;
+
+	/* With an extent table, a cluster insertion stays in cluster_op_queue until it has
+	 * persisted the clone's metadata; without one, it is a persist. Pending persists wait
+	 * for the ones in persists_to_complete. */
+	if (!TAILQ_EMPTY(&clone->cluster_op_queue) || !TAILQ_EMPTY(&clone->persists_to_complete)) {
+		return false;
+	}
+
+	TAILQ_INSERT_HEAD(&clone->persists_to_complete, &ctx->clone_persist_hold, link);
+	ctx->clone_persists_held = true;
+	return true;
+}
+
+/* Let the other persists of the clone go. Start them now if start is true. Otherwise the commit
+ * of the clone goes first, and they start when it completes. */
+static void
+delete_snapshot_release_clone_persists(struct delete_snapshot_ctx *ctx, bool start)
+{
+	if (!ctx->clone_persists_held) {
+		return;
+	}
+
+	TAILQ_REMOVE(&ctx->clone->persists_to_complete, &ctx->clone_persist_hold, link);
+	ctx->clone_persists_held = false;
+	if (start) {
+		blob_persist_start_pending(ctx->clone);
+	}
+}
+
 /* Unfreeze I/O to the clone with the context allocated before freezing it: this cannot fail. */
 static void
 delete_snapshot_unfreeze_clone(struct delete_snapshot_ctx *ctx, spdk_blob_op_complete cb_fn)
@@ -9946,6 +10009,8 @@ static void
 delete_snapshot_cleanup_clone(void *cb_arg, int bserrno)
 {
 	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	delete_snapshot_release_clone_persists(ctx, true);
 
 	if (ctx->clone_frozen) {
 		/* The deletion failed: do not leave I/O to the clone frozen. */
@@ -10296,6 +10361,10 @@ delete_snapshot_sync_clone_cpl(void *cb_arg, int bserrno)
 		delete_snapshot_revert_clone_map(ctx);
 		blob_quarantine(ctx->clone);
 		blob_quarantine(ctx->snapshot);
+		/* The persists that waited for the deletion normally start when the commit
+		 * completes. If the commit failed before it started, start them here. They fail,
+		 * because the clone is quarantined. */
+		blob_persist_start_pending(ctx->clone);
 		delete_snapshot_cleanup_clone(ctx, 0);
 		return;
 	}
@@ -10368,6 +10437,7 @@ delete_snapshot_update_extent_pages_cpl(struct delete_snapshot_ctx *ctx)
 		return;
 	}
 
+	delete_snapshot_release_clone_persists(ctx, false);
 	blob_sync_md_checked(ctx->clone, delete_snapshot_sync_clone_cpl, ctx);
 }
 
@@ -10538,23 +10608,21 @@ delete_snapshot_mark_snapshot(struct delete_snapshot_ctx *ctx)
  * metadata, as may other persists of the clone. Wait for them before merging the snapshot's
  * cluster map into the clone's: they would otherwise write the merged mapping, or the extent
  * pages the deletion allocates, to the clone's metadata on disk before the deletion commits it,
- * where an abort or a power failure could no longer undo it.
+ * where an abort or a power failure could no longer undo it. Once they are done, make new persists
+ * of the clone wait, see delete_snapshot_hold_clone_persists().
  */
 static void
 delete_snapshot_drain_clone(void *arg)
 {
 	struct delete_snapshot_ctx *ctx = arg;
-	struct spdk_blob *clone = ctx->clone;
 	int rc;
 
-	/* With an extent table, a cluster insertion stays in cluster_op_queue until it has
-	 * persisted the clone's metadata; without one, it is a persist. Pending persists wait
-	 * for the ones in persists_to_complete. */
-	if (TAILQ_EMPTY(&clone->cluster_op_queue) && TAILQ_EMPTY(&clone->persists_to_complete)) {
+	if (delete_snapshot_hold_clone_persists(ctx)) {
 		delete_snapshot_mark_snapshot(ctx);
 		return;
 	}
 
+	/* Something is still running: check again later. */
 	rc = spdk_thread_send_msg(spdk_get_thread(), delete_snapshot_drain_clone, ctx);
 	if (rc != 0) {
 		ctx->bserrno = rc;

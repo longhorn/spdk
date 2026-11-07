@@ -14459,6 +14459,82 @@ blob_delete_snapshot_inflight_persist(void)
 }
 
 static void
+blob_delete_snapshot_clone_persist_held(void)
+{
+	/* While the deletion changes the clone in memory, other persists of the clone must wait.
+	 * Otherwise they could write the clone's half-changed extent table to disk, pointing to new
+	 * extent pages that an abort frees again. Here the test syncs the clone, with a change of
+	 * its own, right after the deletion gave the clone a new extent page for slot 0. No
+	 * metadata page is left for slot 1, so the deletion then aborts. The sync must then write
+	 * the clone as it was before the deletion, plus its own change. */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone, *snapshot;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t filled[256];
+	uint32_t num_filled, base_md_pages, orig_page, polls;
+	const void *value;
+	size_t value_len;
+	int delete_rc, sync_rc;
+
+	g_phys_blocklen = 4096;
+	bs = ut_resized_clone_scenario(&bs_opts, NULL, NULL, &blobid, &snapid, &base_md_pages);
+	clone = ut_open_blob(bs, blobid);
+	orig_page = clone->active.extent_pages[0];
+	SPDK_CU_ASSERT_FATAL(orig_page != 0);
+
+	/* Leave one free metadata page: enough for slot 0, but not for slot 1. */
+	num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+	SPDK_CU_ASSERT_FATAL(num_filled > 0);
+	num_filled--;
+	ut_release_md_pages(bs, &filled[num_filled], 1);
+
+	delete_rc = 1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, &delete_rc);
+	for (polls = 0; clone->active.extent_pages[0] == orig_page && delete_rc == 1 &&
+	     polls < 100000; polls++) {
+		poll_thread_times(0, 1);
+	}
+	SPDK_CU_ASSERT_FATAL(clone->active.extent_pages[0] != orig_page);
+
+	CU_ASSERT(spdk_blob_set_xattr(clone, "ut", "x", 2) == 0);
+	sync_rc = 1;
+	spdk_blob_sync_md(clone, blob_op_complete, &sync_rc);
+	poll_threads();
+	CU_ASSERT(delete_rc == -ENOMEM);
+	CU_ASSERT(sync_rc == 0);
+	CU_ASSERT(clone->active.extent_pages[0] == orig_page);
+	ut_release_md_pages(bs, filled, num_filled);
+
+	/* On disk, the clone has its change, and still uses its own extent page for slot 0. So
+	 * writing to a cluster that the clone reads from the snapshot copies that cluster first. */
+	ut_close_blob(clone);
+	ut_bs_reload(&bs, &bs_opts);
+	clone = ut_open_blob(bs, blobid);
+	snapshot = ut_open_blob(bs, snapid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	CU_ASSERT(spdk_blob_get_xattr_value(clone, "ut", &value, &value_len) == 0);
+	CU_ASSERT(clone->active.extent_pages[0] == orig_page);
+	ut_cluster_write(clone, channel, 20, 0x5C);
+	CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+	CU_ASSERT(ut_cluster_check(snapshot, channel, 20, 0xB6));
+	ut_close_blob(snapshot);
+
+	ut_blob_close_and_delete(bs, clone);
+	ut_delete_blob(bs, snapid);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == spdk_bs_total_data_cluster_count(bs));
+	ut_unload_bs(bs);
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
 blob_delete_snapshot_stale_extent_page(void)
 {
 	/* A write that gives the clone an extent page for a slot can fail to persist the clone's
@@ -16249,6 +16325,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_recovery_error);
 		CU_ADD_TEST(suite, blob_delete_snapshot_inflight_insert);
 		CU_ADD_TEST(suite, blob_delete_snapshot_inflight_persist);
+		CU_ADD_TEST(suite, blob_delete_snapshot_clone_persist_held);
 		CU_ADD_TEST(suite, blob_delete_snapshot_stale_extent_page);
 		CU_ADD_TEST(suite, blob_delete_snapshot_marker_enomem);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
