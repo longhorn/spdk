@@ -2697,7 +2697,7 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 	struct spdk_blob *blob = ctx->blob;
 	struct spdk_blob_store *bs = blob->bs;
 	uint64_t i;
-	uint32_t page_num;
+	uint32_t page_num, num_pages;
 	void *tmp;
 	int rc;
 
@@ -2707,22 +2707,28 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 		return;
 	}
 
-	/* Generate the new metadata */
-	rc = blob_serialize(blob, &ctx->pages, &blob->active.num_pages);
+	/* Build the new metadata pages. Count them in a local variable, and only update
+	 * active.num_pages once the new pages are claimed. If the persist fails before that, the
+	 * blob keeps its page count. A count of 0 would mean that the blob is being deleted, see
+	 * blob_persist_start(). */
+	rc = blob_serialize(blob, &ctx->pages, &num_pages);
 	if (rc < 0) {
 		blob_persist_complete(seq, ctx, rc);
 		return;
 	}
 
-	assert(blob->active.num_pages >= 1);
+	assert(num_pages >= 1);
 
-	/* Resize the cache of page indices */
-	tmp = realloc(blob->active.pages, blob->active.num_pages * sizeof(*blob->active.pages));
-	if (!tmp) {
-		blob_persist_complete(seq, ctx, -ENOMEM);
-		return;
+	/* Make room for the new page numbers. Do not shrink the array: it still holds the current
+	 * pages. */
+	if (num_pages > blob->active.num_pages) {
+		tmp = realloc(blob->active.pages, num_pages * sizeof(*blob->active.pages));
+		if (!tmp) {
+			blob_persist_complete(seq, ctx, -ENOMEM);
+			return;
+		}
+		blob->active.pages = tmp;
 	}
-	blob->active.pages = tmp;
 
 	/* Assign this metadata to pages. This requires two passes - one to verify that there are
 	 * enough pages and a second to actually claim them. The used_lock is held across
@@ -2731,7 +2737,7 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 	spdk_spin_lock(&bs->used_lock);
 	page_num = 0;
 	/* Note that this loop starts at one. The first page location is fixed by the blobid. */
-	for (i = 1; i < blob->active.num_pages; i++) {
+	for (i = 1; i < num_pages; i++) {
 		page_num = spdk_bit_array_find_first_clear(bs->used_md_pages, page_num);
 		if (page_num == UINT32_MAX) {
 			spdk_spin_unlock(&bs->used_lock);
@@ -2741,6 +2747,7 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 		page_num++;
 	}
 
+	blob->active.num_pages = num_pages;
 	page_num = 0;
 	blob->active.pages[0] = bs_blobid_to_page(blob->id);
 	for (i = 1; i < blob->active.num_pages; i++) {
