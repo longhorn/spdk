@@ -4121,6 +4121,9 @@ blob_lookup(struct spdk_blob_store *bs, spdk_blob_id blobid)
  * - cannot be opened;
  * - cannot be written or persisted through its open handles;
  * - keeps what it claimed.
+ *
+ * This alone does not make the next load rebuild the allocation maps, see needs_recovery in struct
+ * spdk_blob_store.
  */
 static void
 bs_quarantine_blobid(struct spdk_blob_store *bs, spdk_blob_id blobid)
@@ -4956,8 +4959,8 @@ bs_load_remove_sync_cpl(void *cb_arg, int bserrno)
  * - Drop all its references. Its metadata on disk may reference clusters and extent pages that
  *   other blobs use: those it shared with its former clone, or with the blob it was to be a
  *   snapshot of. They cannot be told apart from the ones only this blob used, so release none of
- *   them. What only this blob used stays claimed until a load rebuilds the allocation maps, as
- *   after a power failure.
+ *   them. Have the next load rebuild the allocation maps instead: as no blob references what only
+ *   this blob used anymore, that load frees it.
  * - Clear its link to its parent. It is not listed among the clones of its parent, which may have
  *   been deleted since, and its id reused. Deleting the blob must neither load nor update the
  *   parent.
@@ -4988,6 +4991,11 @@ bs_load_remove_marked(struct spdk_bs_load_ctx *ctx)
 
 	/* Also passes the data corruption check */
 	blob_set_thin_provision(blob);
+
+	/* Set it before persisting: if that fails, the blob's metadata on disk still references
+	 * the clusters it shared, which their owner may release before the next load, see
+	 * delete_snapshot_sync_snapshot_cpl(). */
+	ctx->bs->needs_recovery = true;
 
 	blob_sync_md_checked(blob, bs_load_remove_sync_cpl, ctx);
 }
@@ -6798,7 +6806,8 @@ bs_unload_write_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 		return;
 	}
 
-	ctx->super->clean = 1;
+	/* Leave the blobstore dirty if the next load must rebuild the allocation maps. */
+	ctx->super->clean = ctx->bs->needs_recovery ? 0 : 1;
 
 	bs_write_super(seq, ctx->bs, ctx->super, bs_unload_write_super_cpl, ctx);
 }
@@ -10153,8 +10162,14 @@ delete_snapshot_release_clone_cpl(void *cb_arg, int bserrno)
 		if (ctx->bserrno == 0) {
 			ctx->bserrno = bserrno;
 		}
-		/* The snapshot cannot be deleted now: see delete_snapshot_sync_snapshot_cpl(). */
+		/*
+		 * The snapshot cannot be deleted now. Its metadata on disk may still reference
+		 * clusters the clone now owns, even if writing it succeeded: that write does not
+		 * rewrite its extent pages. Quarantine it, and have the next load rebuild the
+		 * allocation maps, as in delete_snapshot_sync_snapshot_cpl().
+		 */
 		blob_quarantine(ctx->snapshot);
+		ctx->snapshot->bs->needs_recovery = true;
 	}
 
 	if (ctx->bserrno != 0) {
@@ -10191,8 +10206,15 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 		 * hand them over to another blob. Quarantine the snapshot until the next load,
 		 * which removes it. The clone, the snapshot's parent and their other relatives stay
 		 * usable.
+		 *
+		 * Also have that load rebuild the allocation maps. If the clone releases those
+		 * clusters, the maps saved by the unload show them as free. A load that uses these
+		 * maps cannot load the snapshot, so it would skip it instead of removing it. Once
+		 * another blob took the clusters, the snapshot could be opened again, and deleting
+		 * it would release that blob's clusters.
 		 */
 		blob_quarantine(ctx->snapshot);
+		ctx->snapshot->bs->needs_recovery = true;
 	}
 
 	/* Restore md_ro flags */

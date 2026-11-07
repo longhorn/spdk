@@ -235,6 +235,18 @@ struct spdk_blob_store {
 
 	bool				clean;
 
+	/*
+	 * When set, the unload leaves the blobstore dirty, so that the next load rebuilds the
+	 * allocation maps from the metadata of the blobs, as after a power failure.
+	 *
+	 * Set it only when the maps may no longer match the metadata on disk, rather than for
+	 * every quarantined blob, because a rebuild:
+	 * - reads every metadata page, so the next load takes longer;
+	 * - fails the whole load if it cannot read a page, while a load that uses the saved maps
+	 *   only skips the blob of that page.
+	 */
+	bool				needs_recovery;
+
 	spdk_bs_esnap_dev_create	esnap_bs_dev_create;
 	void				*esnap_ctx;
 
