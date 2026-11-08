@@ -14911,6 +14911,64 @@ blob_delete_snapshot_stale_extent_page(void)
 }
 
 static void
+blob_delete_snapshot_marker_enomem(void)
+{
+	/* Deleting a snapshot first writes a "pending removal" marker into the snapshot. Here that
+	 * write fails, because memory runs out while the snapshot's metadata pages are built. The
+	 * deletion then keeps the snapshot, and writes it again without the marker when it closes
+	 * it. The failed write must not leave the snapshot with 0 metadata pages: that next write
+	 * would then delete the snapshot from disk, while the blob still reads data through it. */
+	struct spdk_blob_store *bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob, *snapshot;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	uint32_t polls;
+	int delete_rc;
+
+	bs = ut_init_bs(NULL);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 10;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	ut_cluster_write(blob, channel, 1, 0xB6);
+	snapid = ut_create_snapshot(bs, blobid);
+
+	/* Run out of memory once the deletion has frozen the blob, before it writes the marker. */
+	delete_rc = 1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, &delete_rc);
+	for (polls = 0; blob->frozen_refcnt == 0 && delete_rc == 1 && polls < 100000; polls++) {
+		poll_thread_times(0, 1);
+	}
+	SPDK_CU_ASSERT_FATAL(blob->frozen_refcnt == 1);
+	MOCK_SET(spdk_malloc, NULL);
+	poll_threads();
+	MOCK_CLEAR(spdk_malloc);
+	CU_ASSERT(delete_rc == -ENOMEM);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapid);
+
+	/* The snapshot is still on disk, without the marker, and the blob still reads its data. */
+	ut_close_blob(blob);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	ut_bs_reload(&bs, NULL);
+	snapshot = ut_open_blob(bs, snapid);
+	CU_ASSERT(!ut_blob_is_marked(snapshot));
+	ut_close_blob(snapshot);
+	ut_check_only_clone(bs, snapid, blobid);
+	blob = ut_open_blob(bs, blobid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	CU_ASSERT(ut_cluster_check(blob, channel, 1, 0xB6));
+	ut_close_blob(blob);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	ut_unload_bs(bs);
+}
+
+static void
 blob_esnap_clone_resize(void)
 {
 	struct spdk_bs_dev *dev;
@@ -16590,6 +16648,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_delete_snapshot_inflight_insert);
 		CU_ADD_TEST(suite, blob_delete_snapshot_inflight_persist);
 		CU_ADD_TEST(suite, blob_delete_snapshot_stale_extent_page);
+		CU_ADD_TEST(suite, blob_delete_snapshot_marker_enomem);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_deep_copy);
