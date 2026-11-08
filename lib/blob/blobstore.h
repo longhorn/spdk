@@ -130,6 +130,8 @@ struct spdk_blob {
 	bool		invalid;
 	bool		data_ro;
 	bool		md_ro;
+	/* Quarantined until the blobstore is loaded again, see blob_quarantine(). */
+	bool		quarantined;
 
 	uint64_t	invalid_flags;
 	uint64_t	data_ro_flags;
@@ -200,6 +202,8 @@ struct spdk_blob_store {
 	struct spdk_bit_pool		*used_clusters;		/* Protected by used_lock */
 	struct spdk_bit_array		*used_blobids;
 	struct spdk_bit_array		*open_blobids;
+	/* Blobs that cannot be opened until the blobstore is loaded again, see blob_quarantine() */
+	struct spdk_bit_array		*quarantined_blobids;
 
 	struct spdk_spinlock		used_lock;
 
