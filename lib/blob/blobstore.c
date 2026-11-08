@@ -2996,6 +2996,8 @@ struct spdk_blob_copy_cluster_ctx {
 	uint32_t new_extent_page;
 	spdk_bs_sequence_t *seq;
 	struct spdk_blob_md_page *new_cluster_page;
+	/* The error to report once the cluster is cleared, see blob_insert_cluster_cpl(). */
+	int bserrno;
 };
 
 struct spdk_blob_free_cluster_ctx {
@@ -3023,7 +3025,10 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 	while (!TAILQ_EMPTY(&requests)) {
 		op = TAILQ_FIRST(&requests);
 		TAILQ_REMOVE(&requests, op, link);
-		if (bserrno == 0) {
+		if (bserrno == 0 || (bserrno == -EPERM && op->u.user_op.blob != ctx->blob)) {
+			/* -EPERM only refuses the clusters of a quarantined blob, see
+			 * blob_insert_cluster_msg(). Run the requests of other blobs, which waited
+			 * on this channel, again. */
 			bs_user_op_execute(op);
 		} else {
 			bs_user_op_abort(op, bserrno);
@@ -3100,7 +3105,7 @@ blob_insert_cluster_clear_cpl(void *cb_arg, int bserrno)
 	}
 
 	blob_insert_cluster_revert(ctx);
-	bs_sequence_finish(ctx->seq, bserrno);
+	bs_sequence_finish(ctx->seq, ctx->bserrno != 0 ? ctx->bserrno : bserrno);
 }
 
 static void
@@ -3145,14 +3150,19 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 
 	if (bserrno) {
-		if (bserrno == -EEXIST || bserrno == -EAGAIN) {
-			/* The metadata insert failed because another thread
-			 * allocated the cluster first, or the extent table changed
-			 * after the cluster was allocated. Clear and free our cluster
-			 * but continue without error, so the I/O is retried.
-			 * -EAGAIN is only returned by blob_insert_cluster_msg() for
-			 * the latter; other failures (e.g. -ENOMEM, -EIO) are reverted
-			 * and reported below. */
+		if (bserrno == -EEXIST || bserrno == -EAGAIN || bserrno == -EPERM) {
+			/*
+			 * The metadata thread refused to insert the cluster, before it changed
+			 * anything:
+			 * - -EEXIST: another thread allocated the cluster first;
+			 * - -EAGAIN: the extent table changed after the cluster was allocated, or
+			 *   I/O to the blob is frozen;
+			 * - -EPERM: the blob is quarantined, see blob_quarantine().
+			 * Clear and free our cluster, as it may hold data copied from the parent.
+			 * Then retry the I/O, or fail it if the blob is quarantined. Other failures
+			 * (e.g. -ENOMEM, -EIO) are reverted and reported below.
+			 */
+			ctx->bserrno = bserrno == -EPERM ? -EPERM : 0;
 			blob_insert_cluster_clear(ctx);
 			return;
 		}
@@ -8188,10 +8198,9 @@ bs_inflate_blob_touch_next(void *cb_arg, int bserrno)
 	if (ctx->cluster < _blob->active.num_clusters) {
 		offset = bs_cluster_to_lba(_blob->bs, ctx->cluster);
 
-		/* We may safely increment a cluster before copying */
-		ctx->cluster++;
-
-		/* Use a dummy 0B read as a context for cluster copy */
+		/* Use a dummy 0B read as a context for cluster copy. Do not move past the cluster
+		 * yet: when the read completes, check the cluster again, as its insertion may
+		 * have been refused, see blob_insert_cluster_msg(). */
 		cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 		cpl.u.blob_basic.cb_fn = bs_inflate_blob_touch_next;
 		cpl.u.blob_basic.cb_arg = ctx;
@@ -8200,6 +8209,13 @@ bs_inflate_blob_touch_next(void *cb_arg, int bserrno)
 				      NULL, 0, offset, 0);
 		if (!op) {
 			bs_clone_snapshot_origblob_cleanup(ctx, -ENOMEM);
+			return;
+		}
+
+		if (_blob->frozen_refcnt > 0) {
+			/* The insertion would be refused while I/O to the blob is frozen. Wait
+			 * until it is unfrozen, as frozen I/O does. */
+			blob_queue_frozen_io(_blob, spdk_io_channel_get_ctx(ctx->channel), op);
 			return;
 		}
 
@@ -9885,6 +9901,9 @@ struct delete_snapshot_ep_update {
 	uint32_t orig;
 	/* The page the update put in its place, 0 if the slot was not updated. */
 	uint32_t updated;
+	/* Whether the clone's metadata on disk references orig, see
+	 * delete_snapshot_update_extent_pages(). */
+	bool orig_committed;
 };
 
 struct delete_snapshot_ctx {
@@ -10080,8 +10099,8 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 }
 
 /* Release the extent pages of the extent-page update that are no longer referenced: the pages
- * it replaced in the clone, once the clone's metadata has been committed, or the pages it
- * allocated, once the clone has been reverted before that. */
+ * it replaced in the clone's metadata on disk, once the clone's new metadata has been committed,
+ * or the pages it allocated, once the clone has been reverted before that. */
 static void
 delete_snapshot_release_extent_pages(struct delete_snapshot_ctx *ctx, bool replaced)
 {
@@ -10100,7 +10119,11 @@ delete_snapshot_release_extent_pages(struct delete_snapshot_ctx *ctx, bool repla
 		if (u->updated == 0) {
 			continue;
 		}
-		page = replaced ? u->orig : u->updated;
+		if (replaced) {
+			page = u->orig_committed ? u->orig : 0;
+		} else {
+			page = u->updated;
+		}
 		if (page != 0) {
 			bs_release_md_page(bs, page);
 		}
@@ -10459,6 +10482,7 @@ delete_snapshot_update_extent_pages(void *cb_arg, int bserrno)
 	uint32_t *extent_page;
 	uint32_t write_page;
 	uint64_t i;
+	bool committed;
 
 	if (bserrno != 0) {
 		/* A previous blob_write_extent_page() failed. */
@@ -10485,10 +10509,19 @@ delete_snapshot_update_extent_pages(void *cb_arg, int bserrno)
 
 		extent_page = &ctx->clone->active.extent_pages[i];
 
-		if (!delete_snapshot_slot_merged(ctx, i)) {
+		/* The clone's extent table may hold a page that its metadata on disk does not
+		 * reference. For example, a cluster insertion that failed to persist the clone's
+		 * metadata released its new extent page, but left it in the table. Committing
+		 * the clone's new metadata only releases the pages its metadata on disk
+		 * references. */
+		committed = i < ctx->clone->clean.num_extent_pages &&
+			    ctx->clone->clean.extent_pages[i] == *extent_page;
+
+		if ((*extent_page == 0 || committed) && !delete_snapshot_slot_merged(ctx, i)) {
 			/* The clone already maps every cluster the snapshot maps in this slot, so
 			 * nothing changes here. Keep the lack of an extent page, or the clone's
-			 * page: no new page is needed, and none may be free. */
+			 * page if its metadata on disk references it: no new page is needed, and
+			 * none may be free. */
 			continue;
 		}
 
@@ -10527,6 +10560,7 @@ delete_snapshot_update_extent_pages(void *cb_arg, int bserrno)
 		spdk_spin_unlock(&bs->used_lock);
 
 		ctx->ep_updates[i].orig = *extent_page;
+		ctx->ep_updates[i].orig_committed = committed;
 		ctx->ep_updates[i].updated = write_page;
 		*extent_page = write_page;
 		ctx->num_updated_extent_pages = i + 1;
@@ -10592,19 +10626,8 @@ delete_snapshot_esnap_channels_destroyed_cb(void *cb_arg, struct spdk_blob *blob
 }
 
 static void
-delete_snapshot_freeze_io_cb(void *cb_arg, int bserrno)
+delete_snapshot_mark_snapshot(struct delete_snapshot_ctx *ctx)
 {
-	struct delete_snapshot_ctx *ctx = cb_arg;
-
-	if (bserrno) {
-		SPDK_ERRLOG("Failed to freeze I/O on clone\n");
-		ctx->bserrno = bserrno;
-		delete_snapshot_cleanup_clone(ctx, 0);
-		return;
-	}
-
-	ctx->clone_frozen = true;
-
 	/* Temporarily override md_ro flag for snapshot for MD modification */
 	ctx->snapshot->md_ro = false;
 
@@ -10624,6 +10647,56 @@ delete_snapshot_freeze_io_cb(void *cb_arg, int bserrno)
 	}
 
 	blob_sync_md_checked(ctx->snapshot, delete_snapshot_sync_snapshot_xattr_cpl, ctx);
+}
+
+/*
+ * Freezing I/O to the clone does not wait for the writes under way:
+ * - A write that inserts its cluster after the clone is frozen retries once the clone is unfrozen,
+ *   see blob_insert_cluster_msg().
+ * - A write that inserted its cluster before may still be persisting the clone's metadata, and so
+ *   may other persists of the clone.
+ *
+ * Wait for the latter before merging the snapshot's cluster map into the clone's. Otherwise they
+ * could write the merged mapping, or the extent pages the deletion allocates, to the clone's
+ * metadata on disk before the deletion commits it, and an abort or a power failure could no longer
+ * undo it.
+ */
+static void
+delete_snapshot_drain_clone(void *arg)
+{
+	struct delete_snapshot_ctx *ctx = arg;
+	struct spdk_blob *clone = ctx->clone;
+	int rc;
+
+	/* With an extent table, a cluster insertion stays in cluster_op_queue until it has
+	 * persisted the clone's metadata; without one, it is a persist. Pending persists wait
+	 * for the ones in persists_to_complete. */
+	if (TAILQ_EMPTY(&clone->cluster_op_queue) && TAILQ_EMPTY(&clone->persists_to_complete)) {
+		delete_snapshot_mark_snapshot(ctx);
+		return;
+	}
+
+	rc = spdk_thread_send_msg(spdk_get_thread(), delete_snapshot_drain_clone, ctx);
+	if (rc != 0) {
+		ctx->bserrno = rc;
+		delete_snapshot_cleanup_clone(ctx, 0);
+	}
+}
+
+static void
+delete_snapshot_freeze_io_cb(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno) {
+		SPDK_ERRLOG("Failed to freeze I/O on clone\n");
+		ctx->bserrno = bserrno;
+		delete_snapshot_cleanup_clone(ctx, 0);
+		return;
+	}
+
+	ctx->clone_frozen = true;
+	delete_snapshot_drain_clone(ctx);
 }
 
 static void
@@ -11339,6 +11412,24 @@ blob_insert_cluster_msg(void *arg)
 	uint32_t *extent_page;
 	int rc;
 
+	if (ctx->blob->quarantined) {
+		/* The blob is quarantined, so its metadata must not change, see blob_quarantine().
+		 * This happens, for example, to a clone after a snapshot deletion failed to commit
+		 * it, and the clone is unfrozen then. Do not touch the metadata: the writing thread
+		 * clears and frees the cluster, and fails the write. */
+		blob_op_cluster_msg_cb(ctx, -EPERM);
+		return;
+	}
+
+	if (ctx->blob->frozen_refcnt > 0) {
+		/* I/O to the blob is frozen while its metadata changes, e.g. while the snapshot it
+		 * is a clone of is deleted, which merges the snapshot's cluster map into the
+		 * blob's. Leave the metadata untouched and let the original thread release the
+		 * cluster and retry the I/O, which then waits until the blob is unfrozen. */
+		blob_op_cluster_msg_cb(ctx, -EAGAIN);
+		return;
+	}
+
 	if (ctx->blob->use_extent_table && ctx->extent_page == 0 &&
 	    *bs_cluster_to_extent_page(ctx->blob, ctx->cluster_num) == 0) {
 		/* The extent page was present when the cluster was allocated on the
@@ -11347,7 +11438,7 @@ blob_insert_cluster_msg(void *arg)
 		 * the cluster allocation was in flight. Leave the metadata untouched and
 		 * let the original thread release the cluster and retry the I/O.
 		 * blob_insert_cluster_cpl() treats -EAGAIN as this retry request, so
-		 * do not return -EAGAIN from this function for any other reason. */
+		 * only return -EAGAIN from this function to have the I/O retried. */
 		blob_op_cluster_msg_cb(ctx, -EAGAIN);
 		return;
 	}
