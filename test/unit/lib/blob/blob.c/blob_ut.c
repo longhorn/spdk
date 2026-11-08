@@ -4720,6 +4720,45 @@ blob_open_quarantined_while_loading(void)
 }
 
 static void
+blob_sync_md_quarantined_queued(void)
+{
+	/*
+	 * A metadata sync of a blob waits while another persist of the blob runs. If the blob is
+	 * quarantined meanwhile, e.g. when a snapshot deletion fails to commit it, the sync's
+	 * persist is refused and writes nothing. Then:
+	 * - the sync must fail with -EPERM, as when the blob was already quarantined;
+	 * - a close that waited the same way must still release the blob.
+	 */
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	int sync1_rc, sync2_rc, close_rc;
+
+	blob = ut_blob_create_and_open(bs, NULL);
+	blobid = spdk_blob_get_id(blob);
+	CU_ASSERT(spdk_blob_set_xattr(blob, "ut", "x", 2) == 0);
+
+	sync1_rc = 1;
+	sync2_rc = 1;
+	close_rc = 1;
+	spdk_blob_sync_md(blob, blob_op_complete, &sync1_rc);
+	spdk_blob_sync_md(blob, blob_op_complete, &sync2_rc);
+	spdk_blob_close(blob, blob_op_complete, &close_rc);
+	CU_ASSERT(!TAILQ_EMPTY(&blob->pending_persists));
+	blob_quarantine(blob);
+	poll_threads();
+	CU_ASSERT(sync1_rc == 0);
+	CU_ASSERT(sync2_rc == -EPERM);
+	CU_ASSERT(close_rc == 0);
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+
+	g_bserrno = 0;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EBUSY);
+}
+
+static void
 blob_insert_cluster_msg_test(void)
 {
 	struct spdk_blob_store *bs = g_bs;
@@ -14849,6 +14888,113 @@ blob_delete_snapshot_inflight_persist(void)
 }
 
 static void
+blob_delete_snapshot_clone_persist_held(void)
+{
+	/* While the deletion changes the clone in memory, other persists of the clone must wait.
+	 * Otherwise they could write the clone's half-changed extent table to disk, pointing to new
+	 * extent pages that an abort frees again. Here the test syncs the clone, with a change of
+	 * its own, right after the deletion gave the clone a new extent page for slot 0. Then:
+	 * - No metadata page is left for slot 1, so the deletion aborts. The sync must then write
+	 *   the clone as it was before the deletion, plus its own change.
+	 * - Writing the clone's root metadata page fails when the deletion commits the clone. The
+	 *   sync must wait until the deletion has quarantined the clone, and then fail without
+	 *   writing anything: the clone's metadata on disk stays as it was. */
+	struct spdk_blob_store *bs;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *clone, *snapshot;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid, snapid;
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t filled[256];
+	uint32_t num_filled, base_md_pages, orig_page, polls;
+	const void *value;
+	size_t value_len;
+	int fail_commit, delete_rc, sync_rc;
+
+	g_phys_blocklen = 4096;
+	for (fail_commit = 0; fail_commit <= 1; fail_commit++) {
+		bs = ut_resized_clone_scenario(&bs_opts, NULL, NULL, &blobid, &snapid,
+					       &base_md_pages);
+		clone = ut_open_blob(bs, blobid);
+		orig_page = clone->active.extent_pages[0];
+		SPDK_CU_ASSERT_FATAL(orig_page != 0);
+
+		num_filled = 0;
+		if (!fail_commit) {
+			/* Leave one free metadata page: enough for slot 0, but not for slot 1. */
+			num_filled = ut_claim_free_md_pages(bs, filled, SPDK_COUNTOF(filled));
+			SPDK_CU_ASSERT_FATAL(num_filled > 0);
+			num_filled--;
+			ut_release_md_pages(bs, &filled[num_filled], 1);
+		}
+
+		delete_rc = 1;
+		spdk_bs_delete_blob(bs, snapid, blob_op_complete, &delete_rc);
+		for (polls = 0; clone->active.extent_pages[0] == orig_page && delete_rc == 1 &&
+		     polls < 100000; polls++) {
+			poll_thread_times(0, 1);
+		}
+		SPDK_CU_ASSERT_FATAL(clone->active.extent_pages[0] != orig_page);
+
+		CU_ASSERT(spdk_blob_set_xattr(clone, "ut", "x", 2) == 0);
+		if (fail_commit) {
+			ut_arm_io_failure(bs->dev,
+					  bs_md_page_to_lba(bs, bs_blobid_to_page(blobid)), 1);
+		}
+		sync_rc = 1;
+		spdk_blob_sync_md(clone, blob_op_complete, &sync_rc);
+		poll_threads();
+		ut_disarm_io_failure(bs->dev);
+		if (fail_commit) {
+			CU_ASSERT(g_ut_io_failed);
+			CU_ASSERT(delete_rc == -EIO);
+			CU_ASSERT(sync_rc == -EPERM);
+			CU_ASSERT(clone->quarantined);
+		} else {
+			CU_ASSERT(delete_rc == -ENOMEM);
+			CU_ASSERT(sync_rc == 0);
+		}
+		CU_ASSERT(clone->active.extent_pages[0] == orig_page);
+		ut_release_md_pages(bs, filled, num_filled);
+
+		/* On disk, the clone has its change only if the sync wrote it, and still uses its
+		 * own extent page for slot 0. So writing to a cluster that the clone reads from the
+		 * snapshot copies that cluster first. */
+		ut_close_blob(clone);
+		ut_bs_reload(&bs, &bs_opts);
+		clone = ut_open_blob(bs, blobid);
+		snapshot = ut_open_blob(bs, snapid);
+		channel = spdk_bs_alloc_io_channel(bs);
+		SPDK_CU_ASSERT_FATAL(channel != NULL);
+		if (fail_commit) {
+			CU_ASSERT(spdk_blob_get_xattr_value(clone, "ut", &value, &value_len) != 0);
+		} else {
+			CU_ASSERT(spdk_blob_get_xattr_value(clone, "ut", &value, &value_len) == 0);
+		}
+		CU_ASSERT(clone->active.extent_pages[0] == orig_page);
+		CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapid);
+		ut_cluster_write(clone, channel, 20, 0x5C);
+		CU_ASSERT(ut_cluster_check(clone, channel, 20, 0x5C));
+		CU_ASSERT(ut_cluster_check(snapshot, channel, 20, 0xB6));
+		ut_close_blob(snapshot);
+
+		ut_blob_close_and_delete(bs, clone);
+		ut_delete_blob(bs, snapid);
+		spdk_bs_free_io_channel(channel);
+		poll_threads();
+
+		/* The failed commit released none of the clone's new extent pages: a load that
+		 * rebuilds the allocation maps reclaims them. */
+		ut_bs_dirty_load(&bs, &bs_opts);
+		CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == base_md_pages);
+		CU_ASSERT(spdk_bs_free_cluster_count(bs) == spdk_bs_total_data_cluster_count(bs));
+		ut_unload_bs(bs);
+	}
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
 blob_delete_snapshot_stale_extent_page(void)
 {
 	/*
@@ -16550,6 +16696,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_set_xattrs_test);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_alloc);
 		CU_ADD_TEST(suite_bs, blob_open_quarantined_while_loading);
+		CU_ADD_TEST(suite_bs, blob_sync_md_quarantined_queued);
 		CU_ADD_TEST(suite_bs, blob_insert_cluster_msg_test);
 		CU_ADD_TEST(suite_bs, blob_insert_cluster_msg_snapshot_race);
 		CU_ADD_TEST(suite_bs, blob_insert_cluster_refused);
@@ -16647,6 +16794,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone_recovery_error);
 		CU_ADD_TEST(suite, blob_delete_snapshot_inflight_insert);
 		CU_ADD_TEST(suite, blob_delete_snapshot_inflight_persist);
+		CU_ADD_TEST(suite, blob_delete_snapshot_clone_persist_held);
 		CU_ADD_TEST(suite, blob_delete_snapshot_stale_extent_page);
 		CU_ADD_TEST(suite, blob_delete_snapshot_marker_enomem);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
