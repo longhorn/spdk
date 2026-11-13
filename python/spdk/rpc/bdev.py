@@ -477,6 +477,44 @@ def bdev_raid_grow_base_bdev(client, raid_name, base_name):
     return client.call('bdev_raid_grow_base_bdev', params)
 
 
+def bdev_raid_resize(client, name, expected_size_in_mib=None):
+    """Recalculate the size of a raid bdev from its current base bdevs. A raid bdev with
+    explicit_resize (bdev_raid_set_raid_options) does not resize when a base bdev is resized;
+    it grows only through this call.
+
+    Args:
+        name: raid bdev name
+        expected_size_in_mib: minimum size in MiB that the raid bdev must reach (raid1 only;
+            optional). Otherwise the resize is refused and the size is unchanged.
+
+    Returns:
+        Object with name, old_blockcnt, new_blockcnt, and resized.
+    """
+    params = {'name': name}
+    if expected_size_in_mib is not None:
+        params['expected_size_in_mib'] = expected_size_in_mib
+
+    return client.call('bdev_raid_resize', params)
+
+
+def bdev_raid_set_raid_options(client, name, explicit_resize=None):
+    """Set the options of one raid bdev.
+
+    Args:
+        name: raid bdev name
+        explicit_resize: if true, the raid bdev does not resize on a base bdev resize event
+            and grows only through bdev_raid_resize (optional; unchanged if not set)
+
+    Returns:
+        True
+    """
+    params = {'name': name}
+    if explicit_resize is not None:
+        params['explicit_resize'] = explicit_resize
+
+    return client.call('bdev_raid_set_raid_options', params)
+
+
 @deprecated_method
 def bdev_raid_get_base_bdev_delta_bitmap(client, base_bdev_name):
     """Get the delta bitmap of a faulty base bdev

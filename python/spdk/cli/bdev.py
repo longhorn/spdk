@@ -1382,6 +1382,28 @@ def add_parser(subparsers):
     p.add_argument('base_name', help='base bdev name')
     p.set_defaults(func=bdev_raid_grow_base_bdev)
 
+    def bdev_raid_resize(args):
+        print_dict(args.client.bdev_raid_resize(name=args.name,
+                                                expected_size_in_mib=args.expected_size_in_mib))
+    p = subparsers.add_parser('bdev_raid_resize',
+                              help='Recalculate the size of a raid bdev from its current base bdevs')
+    p.add_argument('-n', '--name', help='raid bdev name', required=True)
+    p.add_argument('--expected-size-in-mib', type=int,
+                   help='minimum size in MiB that the raid bdev must reach (raid1 only); '
+                   'otherwise the resize is refused and the size is unchanged')
+    p.set_defaults(func=bdev_raid_resize)
+
+    def bdev_raid_set_raid_options(args):
+        print_json(args.client.bdev_raid_set_raid_options(name=args.name,
+                                                          explicit_resize=args.explicit_resize))
+    p = subparsers.add_parser('bdev_raid_set_raid_options',
+                              help='Set the options of one raid bdev')
+    p.add_argument('-n', '--name', help='raid bdev name', required=True)
+    p.add_argument('--explicit-resize', action=argparse.BooleanOptionalAction,
+                   help='do not resize on a base bdev resize event; grow only through '
+                   'bdev_raid_resize (unchanged if not given)')
+    p.set_defaults(func=bdev_raid_set_raid_options)
+
     def bdev_raid_get_base_bdev_delta_bitmap(args):
         print_json(args.client.bdev_raid_get_base_bdev_delta_bitmap(base_bdev_name=args.base_bdev_name))
     p = subparsers.add_parser('bdev_raid_get_base_bdev_delta_bitmap',

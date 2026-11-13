@@ -536,6 +536,235 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_raid_grow_base_bdev", rpc_bdev_raid_grow_base_bdev, SPDK_RPC_RUNTIME)
 
+/*
+ * Decoder object for RPC bdev_raid_resize
+ */
+static const struct spdk_json_object_decoder rpc_bdev_raid_resize_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_raid_resize_ctx, name), spdk_json_decode_string},
+	{"expected_size_in_mib", offsetof(struct rpc_bdev_raid_resize_ctx, expected_size_in_mib), spdk_json_decode_uint64, true},
+};
+
+struct rpc_bdev_raid_resize {
+	struct rpc_bdev_raid_resize_ctx req;
+	uint64_t old_blockcnt;
+};
+
+static void
+rpc_bdev_raid_resize_free(struct rpc_bdev_raid_resize *ctx)
+{
+	free_rpc_bdev_raid_resize(&ctx->req);
+	free(ctx);
+}
+
+static void
+rpc_bdev_raid_resize_send_result(struct rpc_bdev_raid_resize *ctx, bool resized)
+{
+	struct spdk_json_write_ctx *w;
+	struct raid_bdev *raid_bdev;
+
+	raid_bdev = raid_bdev_find_by_name(ctx->req.name);
+
+	w = spdk_jsonrpc_begin_result(ctx->req.request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "name", ctx->req.name);
+	spdk_json_write_named_uint64(w, "old_blockcnt", ctx->old_blockcnt);
+	spdk_json_write_named_uint64(w, "new_blockcnt",
+				     raid_bdev != NULL ? raid_bdev->bdev.blockcnt : 0);
+	spdk_json_write_named_bool(w, "resized", resized);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(ctx->req.request, w);
+}
+
+/*
+ * brief:
+ * rpc_bdev_raid_resize_cb is called by raid_bdev_resize() after a successful resize. It
+ * sends the result and frees the context.
+ * params:
+ * cb_arg - pointer to the callback context.
+ * unused - status of the resize, always 0 (see below).
+ * returns:
+ * none
+ */
+static void
+rpc_bdev_raid_resize_cb(void *cb_arg, int unused)
+{
+	struct rpc_bdev_raid_resize *ctx = cb_arg;
+	struct raid_bdev *raid_bdev;
+
+	/*
+	 * raid_bdev_resize() calls this only after a successful resize, always with 0: it returns
+	 * its errors instead.
+	 */
+	raid_bdev = raid_bdev_find_by_name(ctx->req.name);
+	rpc_bdev_raid_resize_send_result(ctx, raid_bdev != NULL &&
+					 raid_bdev->bdev.blockcnt != ctx->old_blockcnt);
+	rpc_bdev_raid_resize_free(ctx);
+}
+
+/*
+ * brief:
+ * bdev_raid_resize is the RPC to recalculate the size of a raid bdev from its current base
+ * bdevs, the counterpart of bdev_ec_resize. A raid bdev with explicit_resize
+ * (bdev_raid_set_raid_options) does not resize when a base bdev is resized, so this is the
+ * only way to grow it; it also works without the option. It takes the raid bdev name as input.
+ * The response reports the old and new block counts and whether the raid bdev size changed. A
+ * superblock update is started but not waited for, as in the upstream automatic resize. The
+ * optional expected_size_in_mib is the minimum size that the raid bdev must reach: it is
+ * converted to blocks, rounded up, and checked by raid_bdev_resize() before the resize (raid1
+ * only). Without it, the raid bdev takes whatever size its base bdevs give.
+ * params:
+ * request - pointer to json rpc request
+ * params - pointer to request parameters
+ * returns:
+ * none
+ */
+static void
+rpc_bdev_raid_resize(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct rpc_bdev_raid_resize *ctx;
+	struct raid_bdev *raid_bdev;
+	uint64_t min_blockcnt = 0;
+	int rc;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		return;
+	}
+
+	if (spdk_json_decode_object(params, rpc_bdev_raid_resize_decoders,
+				    SPDK_COUNTOF(rpc_bdev_raid_resize_decoders),
+				    &ctx->req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	raid_bdev = raid_bdev_find_by_name(ctx->req.name);
+	if (raid_bdev == NULL) {
+		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
+						     "raid bdev %s not found",
+						     ctx->req.name);
+		goto cleanup;
+	}
+
+	if (ctx->req.expected_size_in_mib != 0) {
+		const uint64_t mib = 1024 * 1024;
+		uint64_t expected_bytes;
+
+		if (ctx->req.expected_size_in_mib > UINT64_MAX / mib) {
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+							     "expected_size_in_mib %" PRIu64 " of raid bdev %s is too large",
+							     ctx->req.expected_size_in_mib, ctx->req.name);
+			goto cleanup;
+		}
+		expected_bytes = ctx->req.expected_size_in_mib * mib;
+		min_blockcnt = expected_bytes / raid_bdev->bdev.blocklen +
+			       (expected_bytes % raid_bdev->bdev.blocklen != 0);
+	}
+
+	ctx->req.request = request;
+	ctx->old_blockcnt = raid_bdev->bdev.blockcnt;
+
+	/* On success, the callback has already sent the response and freed the context. */
+	rc = raid_bdev_resize(raid_bdev, min_blockcnt, rpc_bdev_raid_resize_cb, ctx);
+	if (rc == 0) {
+		return;
+	}
+
+	if (rc == -EALREADY) {
+		rpc_bdev_raid_resize_send_result(ctx, false);
+	} else {
+		spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "Failed to resize raid bdev %s: %s",
+						     ctx->req.name, spdk_strerror(-rc));
+	}
+
+cleanup:
+	rpc_bdev_raid_resize_free(ctx);
+}
+SPDK_RPC_REGISTER("bdev_raid_resize", rpc_bdev_raid_resize, SPDK_RPC_RUNTIME)
+
+/* An optional boolean parameter that remembers whether it was given. */
+struct rpc_bdev_raid_optional_bool {
+	bool value;
+	bool is_set;
+};
+
+static int
+rpc_bdev_raid_decode_optional_bool(const struct spdk_json_val *val, void *out)
+{
+	struct rpc_bdev_raid_optional_bool *opt = out;
+	int rc;
+
+	rc = spdk_json_decode_bool(val, &opt->value);
+	if (rc == 0) {
+		opt->is_set = true;
+	}
+
+	return rc;
+}
+
+struct rpc_bdev_raid_set_raid_options {
+	char *name;
+	struct rpc_bdev_raid_optional_bool explicit_resize;
+};
+
+/*
+ * Decoder object for RPC bdev_raid_set_raid_options
+ */
+static const struct spdk_json_object_decoder rpc_bdev_raid_set_raid_options_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_raid_set_raid_options, name), spdk_json_decode_string},
+	{"explicit_resize", offsetof(struct rpc_bdev_raid_set_raid_options, explicit_resize), rpc_bdev_raid_decode_optional_bool, true},
+};
+
+/*
+ * brief:
+ * bdev_raid_set_raid_options is the RPC to set the options of one raid bdev, unlike the
+ * global bdev_raid_set_options. explicit_resize makes the raid bdev ignore base bdev RESIZE
+ * events, so that it grows only through bdev_raid_resize; an absent option is unchanged. Any
+ * raid bdev state is allowed. The options are not saved by save_config.
+ * params:
+ * request - pointer to json rpc request
+ * params - pointer to request parameters
+ * returns:
+ * none
+ */
+static void
+rpc_bdev_raid_set_raid_options(struct spdk_jsonrpc_request *request,
+			       const struct spdk_json_val *params)
+{
+	struct rpc_bdev_raid_set_raid_options req = {};
+	struct raid_bdev *raid_bdev;
+
+	if (spdk_json_decode_object(params, rpc_bdev_raid_set_raid_options_decoders,
+				    SPDK_COUNTOF(rpc_bdev_raid_set_raid_options_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	raid_bdev = raid_bdev_find_by_name(req.name);
+	if (raid_bdev == NULL) {
+		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "raid bdev %s not found",
+						     req.name);
+		goto cleanup;
+	}
+
+	if (req.explicit_resize.is_set) {
+		raid_bdev->explicit_resize = req.explicit_resize.value;
+		SPDK_NOTICELOG("raid bdev '%s': explicit_resize is %s\n", raid_bdev->bdev.name,
+			       raid_bdev->explicit_resize ? "on" : "off");
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free(req.name);
+}
+SPDK_RPC_REGISTER("bdev_raid_set_raid_options", rpc_bdev_raid_set_raid_options, SPDK_RPC_RUNTIME)
+
 /* delta bitmap */
 
 /* Structure to decode the input parameters for delta bitmap RPC methods. */
