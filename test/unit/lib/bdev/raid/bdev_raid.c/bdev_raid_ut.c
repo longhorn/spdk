@@ -14,6 +14,7 @@
 #include "bdev/raid/bdev_raid_rpc.c"
 #include "common/lib/test_env.c"
 #include "bdev/raid/raid1.c"
+#include "bdev/raid/raid0.c"
 
 #define MAX_BASE_DRIVES 32
 #define MAX_RAIDS 2
@@ -195,7 +196,6 @@ DEFINE_STUB(spdk_bdev_is_md_separate, bool, (const struct spdk_bdev *bdev), true
 DEFINE_STUB(spdk_bdev_get_dif_type, enum spdk_dif_type, (const struct spdk_bdev *bdev),
 	    SPDK_DIF_DISABLE);
 DEFINE_STUB(spdk_bdev_is_dif_head_of_md, bool, (const struct spdk_bdev *bdev), false);
-DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint64_t size), 0);
 DEFINE_STUB(spdk_json_write_named_uuid, int, (struct spdk_json_write_ctx *w, const char *name,
 		const struct spdk_uuid *val), 0);
 DEFINE_STUB_V(raid_bdev_init_superblock, (struct raid_bdev *raid_bdev));
@@ -216,6 +216,9 @@ DEFINE_STUB(spdk_bdev_unmap_blocks, int, (struct spdk_bdev_desc *desc, struct sp
 uint32_t
 spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
 {
+	if (spdk_bdev_is_md_interleaved(bdev)) {
+		return bdev->blocklen - bdev->md_len;
+	}
 	return g_block_len;
 }
 
@@ -228,10 +231,16 @@ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_
 	return 0;
 }
 
+static int g_write_sb_status;
+static int g_write_sb_calls;
+static raid_bdev_write_sb_cb g_write_sb_cb;
+
 void
 raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb, void *cb_ctx)
 {
-	cb(0, raid_bdev, cb_ctx);
+	g_write_sb_calls++;
+	g_write_sb_cb = cb;
+	cb(g_write_sb_status, raid_bdev, cb_ctx);
 }
 
 void
@@ -250,6 +259,27 @@ struct spdk_io_channel *
 spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 {
 	return spdk_get_io_channel(&g_bdev_ch_io_device);
+}
+
+static int g_notify_blockcnt_change_calls;
+static int g_notify_blockcnt_change_rc;
+static uint64_t g_quiesce_blockcnt;
+static bool g_raid_quiesced;
+static int g_unquiesce_blockcnt_mismatches;
+static int g_json_disable_auto_resize_writes;
+static int g_json_remove_scheduled_writes;
+static int g_json_remove_scheduled_true_writes;
+
+int
+spdk_bdev_notify_blockcnt_change(struct spdk_bdev *bdev, uint64_t size)
+{
+	g_notify_blockcnt_change_calls++;
+	if (g_notify_blockcnt_change_rc != 0) {
+		return g_notify_blockcnt_change_rc;
+	}
+	bdev->blockcnt = size;
+
+	return 0;
 }
 
 static int
@@ -298,6 +328,17 @@ set_globals(void)
 	g_rpc_req_size = 0;
 	g_json_decode_obj_err = 0;
 	g_json_decode_obj_create = 0;
+	g_notify_blockcnt_change_calls = 0;
+	g_notify_blockcnt_change_rc = 0;
+	g_write_sb_status = 0;
+	g_write_sb_calls = 0;
+	g_write_sb_cb = NULL;
+	g_quiesce_blockcnt = 0;
+	g_raid_quiesced = false;
+	g_unquiesce_blockcnt_mismatches = 0;
+	g_json_disable_auto_resize_writes = 0;
+	g_json_remove_scheduled_writes = 0;
+	g_json_remove_scheduled_true_writes = 0;
 	g_bdev_io_defer_completion = false;
 }
 
@@ -493,10 +534,17 @@ spdk_json_write_named_string(struct spdk_json_write_ctx *w, const char *name, co
 int
 spdk_json_write_named_bool(struct spdk_json_write_ctx *w, const char *name, bool val)
 {
+	if (strcmp(name, "remove_scheduled") == 0) {
+		g_json_remove_scheduled_writes++;
+		g_json_remove_scheduled_true_writes += val;
+	}
 	if (!g_test_multi_raids) {
 		struct rpc_bdev_raid_create_ctx *req = g_rpc_req;
 		if (strcmp(name, "superblock") == 0) {
 			CU_ASSERT(val == req->superblock);
+		} else if (strcmp(name, "disable_auto_resize") == 0) {
+			CU_ASSERT(val == req->disable_auto_resize);
+			g_json_disable_auto_resize_writes++;
 		}
 	}
 	return 0;
@@ -552,6 +600,8 @@ spdk_json_decode_object(const struct spdk_json_val *values,
 		_out->strip_size_kb = req->strip_size_kb;
 		_out->raid_level = req->raid_level;
 		_out->superblock = req->superblock;
+		_out->delta_bitmap = req->delta_bitmap;
+		_out->disable_auto_resize = req->disable_auto_resize;
 		_out->base_bdevs.count = req->base_bdevs.count;
 		for (i = 0; i < req->base_bdevs.count; i++) {
 			_out->base_bdevs.items[i] = strdup(req->base_bdevs.items[i]);
@@ -600,10 +650,16 @@ spdk_bdev_get_by_name(const char *bdev_name)
 	return NULL;
 }
 
+/*
+ * The bdev layer unquiesces the range computed from the current block count, which must match
+ * the quiesced range. Count the unquiesces that would not match.
+ */
 int
 spdk_bdev_quiesce(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
 		  spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
 {
+	g_quiesce_blockcnt = bdev->blockcnt;
+	g_raid_quiesced = true;
 	if (cb_fn) {
 		cb_fn(cb_arg, 0);
 	}
@@ -615,6 +671,10 @@ int
 spdk_bdev_unquiesce(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
 		    spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
 {
+	if (bdev->blockcnt != g_quiesce_blockcnt) {
+		g_unquiesce_blockcnt_mismatches++;
+	}
+	g_raid_quiesced = false;
 	if (cb_fn) {
 		cb_fn(cb_arg, 0);
 	}
@@ -857,6 +917,8 @@ create_test_req(struct rpc_bdev_raid_create_ctx *r, const char *raid_name,
 	r->strip_size_kb = (g_strip_size * g_block_len) / 1024;
 	r->raid_level = 123;
 	r->superblock = superblock_enabled;
+	r->delta_bitmap = false;
+	r->disable_auto_resize = false;
 	r->base_bdevs.count = num_base_bdev_to_use;
 	for (i = 0; i < num_base_bdev_to_use; i++, bbdev_idx++) {
 		snprintf(name, 16, "%s%u%s", "Nvme", bbdev_idx, "n1");
@@ -1445,6 +1507,81 @@ test_raid_process(void)
 	reset_globals();
 }
 
+/*
+ * A finished background process clears raid_bdev->process while it still has the raid bdev
+ * quiesced: raid_bdev_resize() must stay busy until the unquiesce, whose range must match the
+ * quiesced one.
+ */
+static bool
+ut_check_process_finish_busy(struct raid_bdev *pbdev)
+{
+	if (g_raid_quiesced && pbdev->process == NULL) {
+		CU_ASSERT(raid_bdev_resize_is_busy(pbdev));
+		return true;
+	}
+	return false;
+}
+
+static void
+test_raid_process_finish_resize_busy(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct rpc_bdev_raid_delete_ctx destroy_req;
+	struct raid_bdev *pbdev;
+	struct spdk_bdev *base_bdev;
+	struct spdk_thread *process_thread;
+	uint64_t num_blocks_processed = 0;
+	bool progressed, window_seen = false;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
+	TAILQ_FOREACH(base_bdev, &g_bdev_list, internal.link) {
+		base_bdev->blockcnt = 128;
+	}
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	free_test_req(&req);
+	pbdev = raid_bdev_find_by_name("raid1");
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+
+	pbdev->module_private = &num_blocks_processed;
+	pbdev->min_base_bdevs_operational = 0;
+
+	CU_ASSERT(raid_bdev_start_rebuild(&pbdev->base_bdev_info[0]) == 0);
+	poll_app_thread();
+	SPDK_CU_ASSERT_FATAL(pbdev->process != NULL);
+	CU_ASSERT(raid_bdev_resize_is_busy(pbdev));
+
+	/* Run the process one message at a time, checking every step of its finish. */
+	process_thread = g_latest_thread;
+	do {
+		progressed = spdk_thread_poll(process_thread, 1, 0) > 0;
+		window_seen |= ut_check_process_finish_busy(pbdev);
+		while (spdk_thread_poll(g_app_thread, 1, 0) > 0) {
+			progressed = true;
+			window_seen |= ut_check_process_finish_busy(pbdev);
+		}
+	} while (progressed);
+
+	CU_ASSERT(window_seen);
+	CU_ASSERT(pbdev->process == NULL);
+	CU_ASSERT(!g_raid_quiesced);
+	CU_ASSERT(!pbdev->process_finishing);
+	CU_ASSERT(!raid_bdev_resize_is_busy(pbdev));
+	CU_ASSERT(num_blocks_processed == pbdev->bdev.blockcnt);
+
+	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
+	rpc_bdev_raid_delete(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev_present("raid1", false);
+
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
 static void
 test_raid_process_with_qos(void)
 {
@@ -1994,6 +2131,1259 @@ test_raid_grow_base_bdev_with_hole(void)
 	reset_globals();
 }
 
+static struct raid_bdev *
+ut_create_raid_level_opts(struct rpc_bdev_raid_create_ctx *req, enum spdk_bdev_raid_level level,
+			  bool disable_auto_resize)
+{
+	struct raid_bdev *pbdev;
+
+	verify_raid_bdev_present("raid1", false);
+	create_raid_bdev_create_req(req, "raid1", 0, true, 0, false);
+	if (level == SPDK_BDEV_RAID_LEVEL_RAID1) {
+		req->strip_size_kb = 0;
+	}
+	req->raid_level = (enum rpc_bdev_raid_level)level;
+	req->disable_auto_resize = disable_auto_resize;
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev(req, true, SPDK_BDEV_RAID_STATE_ONLINE);
+
+	TAILQ_FOREACH(pbdev, &g_raid_bdev_list, global_link) {
+		if (strcmp(pbdev->bdev.name, "raid1") == 0) {
+			break;
+		}
+	}
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+	CU_ASSERT(pbdev->disable_auto_resize == disable_auto_resize);
+
+	return pbdev;
+}
+
+static struct raid_bdev *
+ut_create_raid_level(struct rpc_bdev_raid_create_ctx *req, enum spdk_bdev_raid_level level)
+{
+	return ut_create_raid_level_opts(req, level, false);
+}
+
+static struct raid_bdev *
+ut_create_raid1(struct rpc_bdev_raid_create_ctx *req)
+{
+	return ut_create_raid_level(req, SPDK_BDEV_RAID_LEVEL_RAID1);
+}
+
+static void
+ut_delete_raid1(struct rpc_bdev_raid_create_ctx *req)
+{
+	struct rpc_bdev_raid_delete_ctx destroy_req;
+
+	free_test_req(req);
+	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
+	rpc_bdev_raid_delete(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev_present("raid1", false);
+}
+
+/* Grow every base bdev but the first one, and return the first one. */
+static struct raid_base_bdev_info *
+ut_grow_base_bdevs_but_first(struct raid_bdev *pbdev, uint64_t blockcnt)
+{
+	struct raid_base_bdev_info *base_info, *first = NULL;
+	struct spdk_bdev *base_bdev;
+
+	RAID_FOR_EACH_BASE_BDEV(pbdev, base_info) {
+		if (first == NULL) {
+			first = base_info;
+			continue;
+		}
+		base_bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+		base_bdev->blockcnt = blockcnt;
+		raid_bdev_resize_base_bdev(base_bdev);
+		CU_ASSERT(base_info->blockcnt == blockcnt);
+	}
+	SPDK_CU_ASSERT_FATAL(first != NULL);
+
+	return first;
+}
+
+static void
+ut_resize_cb(void *cb_arg, int rc)
+{
+	int *output = cb_arg;
+
+	*output = rc;
+}
+
+static void
+test_raid_disable_auto_resize(void)
+{
+	enum spdk_bdev_raid_level levels[] = { SPDK_BDEV_RAID_LEVEL_RAID1, SPDK_BDEV_RAID_LEVEL_RAID0 };
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *base_info;
+	struct spdk_bdev *base_bdev;
+	uint64_t blockcnt_old;
+	int resize_cb_output;
+	size_t i;
+
+	for (i = 0; i < SPDK_COUNTOF(levels); i++) {
+		set_globals();
+		CU_ASSERT(raid_bdev_init() == 0);
+
+		pbdev = ut_create_raid_level_opts(&req, levels[i], true);
+		SPDK_CU_ASSERT_FATAL(pbdev->module->resize != NULL);
+		blockcnt_old = pbdev->bdev.blockcnt;
+
+		/* Every base bdev grows: the sizes are recorded, but the raid bdev keeps its size. */
+		RAID_FOR_EACH_BASE_BDEV(pbdev, base_info) {
+			base_bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+			base_bdev->blockcnt = BLOCK_CNT * 2;
+			raid_bdev_resize_base_bdev(base_bdev);
+			CU_ASSERT(base_info->blockcnt == BLOCK_CNT * 2);
+		}
+		CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+		CU_ASSERT(g_notify_blockcnt_change_calls == 0);
+
+		/* raid_bdev_resize() grows it. */
+		resize_cb_output = 1;
+		CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == 0);
+		poll_app_thread();
+		CU_ASSERT(resize_cb_output == 0);
+		CU_ASSERT(pbdev->bdev.blockcnt > blockcnt_old);
+		CU_ASSERT(g_notify_blockcnt_change_calls == 1);
+
+		/* The option is reported by bdev_raid_get_bdevs and saved by save_config. */
+		raid_bdev_write_info_json(pbdev, NULL);
+		CU_ASSERT(g_json_disable_auto_resize_writes == 1);
+		raid_bdev_write_config_json(&pbdev->bdev, NULL);
+		CU_ASSERT(g_json_disable_auto_resize_writes == 2);
+
+		ut_delete_raid1(&req);
+		raid_bdev_exit();
+		base_bdevs_cleanup();
+		reset_globals();
+	}
+}
+
+/*
+ * The faulty state of a member can be cleared, by its timeout or by the RPC, while a delta
+ * bitmap faulty state change still has the raid bdev quiesced: raid_bdev_resize() must stay
+ * busy until the unquiesce, whose range must match the quiesced one.
+ */
+static void
+test_raid1_resize_busy_on_delta_bitmap(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct rpc_bdev_raid_delete_ctx destroy_req;
+	struct raid_bdev *pbdev;
+	struct spdk_bdev *base_bdev;
+	struct raid_base_bdev_info *stop_info, *start_info;
+	char *stop_name, *start_name;
+	bool cleared = false;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
+	req.raid_level = (enum rpc_bdev_raid_level)SPDK_BDEV_RAID_LEVEL_RAID1;
+	req.strip_size_kb = 0;
+	req.delta_bitmap = true;
+	TAILQ_FOREACH(base_bdev, &g_bdev_list, internal.link) {
+		base_bdev->optimal_io_boundary = 8;
+	}
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	free_test_req(&req);
+	pbdev = raid_bdev_find_by_name("raid1");
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+	SPDK_CU_ASSERT_FATAL(pbdev->num_base_bdevs >= 3);
+
+	/* The stop of a delta bitmap: its faulty state is cleared before it unquiesces. */
+	stop_info = &pbdev->base_bdev_info[0];
+	stop_name = strdup(stop_info->name);
+	SPDK_CU_ASSERT_FATAL(stop_name != NULL);
+	raid_bdev_fail_base_bdev(stop_info);
+	poll_app_thread();
+	CU_ASSERT(stop_info->state == BASE_BDEV_STATE_FAULTY);
+	CU_ASSERT(!g_raid_quiesced);
+	CU_ASSERT(pbdev->num_delta_bitmap_quiesces == 0);
+
+	CU_ASSERT(raid_bdev_stop_base_bdev_delta_bitmap(stop_name, NULL, NULL) == 0);
+	CU_ASSERT(g_raid_quiesced);
+	CU_ASSERT(raid_bdev_clear_base_bdev_faulty_state(stop_name, NULL, NULL) == 0);
+	CU_ASSERT(stop_info->state == BASE_BDEV_STATE_NONE);
+	CU_ASSERT(raid_bdev_resize_is_busy(pbdev));
+	poll_app_thread();
+	CU_ASSERT(!g_raid_quiesced);
+	CU_ASSERT(pbdev->num_delta_bitmap_quiesces == 0);
+	CU_ASSERT(!raid_bdev_resize_is_busy(pbdev));
+
+	/* The start of a faulty state: it is cleared before the start unquiesces. */
+	start_info = &pbdev->base_bdev_info[1];
+	start_name = strdup(start_info->name);
+	SPDK_CU_ASSERT_FATAL(start_name != NULL);
+	raid_bdev_fail_base_bdev(start_info);
+	do {
+		if (g_raid_quiesced) {
+			CU_ASSERT(raid_bdev_resize_is_busy(pbdev));
+		}
+		if (!cleared && g_raid_quiesced && !start_info->remove_scheduled &&
+		    start_info->state == BASE_BDEV_STATE_FAULTY) {
+			CU_ASSERT(raid_bdev_clear_base_bdev_faulty_state(start_name, NULL, NULL) == 0);
+			CU_ASSERT(start_info->state == BASE_BDEV_STATE_NONE);
+			CU_ASSERT(raid_bdev_resize_is_busy(pbdev));
+			cleared = true;
+		}
+	} while (spdk_thread_poll(g_app_thread, 1, 0) > 0);
+	CU_ASSERT(cleared);
+	CU_ASSERT(!g_raid_quiesced);
+	CU_ASSERT(pbdev->num_delta_bitmap_quiesces == 0);
+	CU_ASSERT(!raid_bdev_resize_is_busy(pbdev));
+	CU_ASSERT(g_unquiesce_blockcnt_mismatches == 0);
+
+	free(stop_name);
+	free(start_name);
+	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
+	rpc_bdev_raid_delete(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev_present("raid1", false);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+/*
+ * A superblock does not store disable_auto_resize, so the raid bdev assembled from it would
+ * resize automatically again: bdev_raid_create rejects the combination.
+ */
+static void
+test_raid_disable_auto_resize_with_superblock(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	verify_raid_bdev_present("raid1", false);
+	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, true);
+	req.raid_level = (enum rpc_bdev_raid_level)SPDK_BDEV_RAID_LEVEL_RAID1;
+	req.strip_size_kb = 0;
+	req.disable_auto_resize = true;
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+	verify_raid_bdev_present("raid1", false);
+	free_test_req(&req);
+
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+/* Without disable_auto_resize, save_config keeps the upstream bdev_raid_create parameters. */
+static void
+test_raid_auto_resize_config_json(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	raid_bdev_write_info_json(pbdev, NULL);
+	CU_ASSERT(g_json_disable_auto_resize_writes == 1);
+	raid_bdev_write_config_json(&pbdev->bdev, NULL);
+	CU_ASSERT(g_json_disable_auto_resize_writes == 1);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+/*
+ * A base bdev stays configured until its asynchronous removal completes, so
+ * bdev_raid_get_bdevs reports the pending removal of each base bdev.
+ */
+static void
+test_raid_info_json_remove_scheduled(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *base_info;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	raid_bdev_write_info_json(pbdev, NULL);
+	CU_ASSERT(g_json_remove_scheduled_writes == pbdev->num_base_bdevs);
+	CU_ASSERT(g_json_remove_scheduled_true_writes == 0);
+
+	base_info = &pbdev->base_bdev_info[1];
+	base_info->remove_scheduled = true;
+	CU_ASSERT(base_info->is_configured == true);
+	raid_bdev_write_info_json(pbdev, NULL);
+	CU_ASSERT(g_json_remove_scheduled_writes == 2 * pbdev->num_base_bdevs);
+	CU_ASSERT(g_json_remove_scheduled_true_writes == 1);
+	base_info->remove_scheduled = false;
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+/* Set the size of every base bdev without a RESIZE event. */
+static void
+ut_set_base_bdevs_blockcnt(struct raid_bdev *pbdev, uint64_t blockcnt)
+{
+	struct raid_base_bdev_info *base_info;
+
+	RAID_FOR_EACH_BASE_BDEV(pbdev, base_info) {
+		if (base_info->desc != NULL) {
+			spdk_bdev_desc_get_bdev(base_info->desc)->blockcnt = blockcnt;
+		}
+	}
+}
+
+enum ut_resize_busy_state {
+	UT_RESIZE_BUSY_REMOVING,
+	UT_RESIZE_BUSY_GROWING,
+	UT_RESIZE_BUSY_PROCESS,
+	UT_RESIZE_BUSY_REMOVE_SCHEDULED,
+	UT_RESIZE_BUSY_FAULTY,
+	UT_RESIZE_BUSY_FAULTY_STOPPED,
+	UT_RESIZE_BUSY_MAX,
+};
+
+static void
+ut_set_resize_busy(struct raid_bdev *pbdev, enum ut_resize_busy_state busy,
+		   struct raid_bdev_process *process, bool set)
+{
+	struct raid_base_bdev_info *base_info = &pbdev->base_bdev_info[0];
+
+	switch (busy) {
+	case UT_RESIZE_BUSY_REMOVING:
+		pbdev->base_bdev_updating = set ? RAID_BDEV_UPDATE_REMOVING : RAID_BDEV_UPDATE_NONE;
+		break;
+	case UT_RESIZE_BUSY_GROWING:
+		pbdev->base_bdev_updating = set ? RAID_BDEV_UPDATE_GROWING : RAID_BDEV_UPDATE_NONE;
+		break;
+	case UT_RESIZE_BUSY_PROCESS:
+		process->raid_bdev = pbdev;
+		process->target = base_info;
+		pbdev->process = set ? process : NULL;
+		break;
+	case UT_RESIZE_BUSY_REMOVE_SCHEDULED:
+		base_info->remove_scheduled = set;
+		break;
+	case UT_RESIZE_BUSY_FAULTY:
+		base_info->state = set ? BASE_BDEV_STATE_FAULTY : BASE_BDEV_STATE_NONE;
+		break;
+	case UT_RESIZE_BUSY_FAULTY_STOPPED:
+		base_info->state = set ? BASE_BDEV_STATE_FAULTY_STOPPED : BASE_BDEV_STATE_NONE;
+		break;
+	default:
+		CU_FAIL("unknown busy state");
+	}
+}
+
+static void
+test_raid_resize_while_busy(void)
+{
+	enum spdk_bdev_raid_level levels[] = { SPDK_BDEV_RAID_LEVEL_RAID1, SPDK_BDEV_RAID_LEVEL_RAID0 };
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev_process process = { };
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *base_info;
+	struct spdk_bdev *base_bdev;
+	uint64_t blockcnt_old, base_blockcnt;
+	int resize_cb_output;
+	size_t i;
+	int busy;
+
+	for (i = 0; i < SPDK_COUNTOF(levels); i++) {
+		set_globals();
+		CU_ASSERT(raid_bdev_init() == 0);
+
+		pbdev = ut_create_raid_level_opts(&req, levels[i], true);
+		SPDK_CU_ASSERT_FATAL(pbdev->module->resize != NULL);
+		base_blockcnt = BLOCK_CNT;
+
+		for (busy = 0; busy < UT_RESIZE_BUSY_MAX; busy++) {
+			blockcnt_old = pbdev->bdev.blockcnt;
+			base_blockcnt += BLOCK_CNT;
+			g_notify_blockcnt_change_calls = 0;
+
+			/*
+			 * A base bdev RESIZE event only records the new base bdev size, and
+			 * raid_bdev_resize() refuses to change the size while another operation may
+			 * hold a whole raid bdev quiesce.
+			 */
+			ut_set_resize_busy(pbdev, busy, &process, true);
+			RAID_FOR_EACH_BASE_BDEV(pbdev, base_info) {
+				base_bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+				base_bdev->blockcnt = base_blockcnt;
+				raid_bdev_resize_base_bdev(base_bdev);
+				CU_ASSERT(base_info->blockcnt == base_blockcnt);
+			}
+			CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+			CU_ASSERT(g_notify_blockcnt_change_calls == 0);
+
+			resize_cb_output = 1;
+			CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+			CU_ASSERT(resize_cb_output == 1);
+			ut_set_resize_busy(pbdev, busy, &process, false);
+
+			/* Once nothing else is in progress, raid_bdev_resize() grows it. */
+			CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == 0);
+			poll_app_thread();
+			CU_ASSERT(resize_cb_output == 0);
+			CU_ASSERT(pbdev->bdev.blockcnt > blockcnt_old);
+			CU_ASSERT(g_notify_blockcnt_change_calls == 1);
+		}
+
+		ut_delete_raid1(&req);
+		raid_bdev_exit();
+		base_bdevs_cleanup();
+		reset_globals();
+	}
+}
+
+/*
+ * A raid bdev with disable_auto_resize must keep its size while it is quiesced by a base bdev
+ * removal: the removal would otherwise unquiesce a range that does not match the quiesced one
+ * and leave the raid bdev quiesced. This happens when raid1 evicts a member while another
+ * member reads back an expanded size.
+ */
+static void
+test_raid1_resize_base_bdev_during_remove(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *base_info, *removed_info, *small_info;
+	struct spdk_bdev *small_bdev;
+	uint64_t blockcnt_old;
+	int remove_cb_output, resize_cb_output;
+	int rc;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid_level_opts(&req, SPDK_BDEV_RAID_LEVEL_RAID1, true);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	small_info = ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	small_bdev = spdk_bdev_desc_get_bdev(small_info->desc);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	removed_info = &pbdev->base_bdev_info[1];
+
+	/* Start removing a grown base bdev; the raid bdev is quiesced until it completes. */
+	remove_cb_output = 1;
+	rc = raid_bdev_remove_base_bdev(spdk_bdev_desc_get_bdev(removed_info->desc), ut_resize_cb,
+					&remove_cb_output);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	CU_ASSERT(remove_cb_output == 1);
+	CU_ASSERT(removed_info->remove_scheduled == true);
+
+	/* The last small base bdev grows meanwhile: the raid bdev keeps its size. */
+	small_bdev->blockcnt = BLOCK_CNT * 2;
+	raid_bdev_resize_base_bdev(small_bdev);
+	CU_ASSERT(small_info->blockcnt == BLOCK_CNT * 2);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 0);
+
+	/* The removal unquiesces the range it quiesced. */
+	poll_app_thread();
+	CU_ASSERT(remove_cb_output == 0);
+	CU_ASSERT(g_unquiesce_blockcnt_mismatches == 0);
+	CU_ASSERT(pbdev->num_base_bdevs_operational == pbdev->num_base_bdevs - 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* A failure to notify the new block count is reported, not taken for "no change". */
+	g_notify_blockcnt_change_rc = -ENOMEM;
+	resize_cb_output = 1;
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 2, ut_resize_cb, &resize_cb_output) == -EIO);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	g_notify_blockcnt_change_rc = 0;
+
+	/* raid_bdev_resize() then grows it. */
+	resize_cb_output = 1;
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 2, ut_resize_cb, &resize_cb_output) == 0);
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+	RAID_FOR_EACH_BASE_BDEV(pbdev, base_info) {
+		if (base_info->desc != NULL) {
+			CU_ASSERT(base_info->data_size == BLOCK_CNT * 2);
+		}
+	}
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_after_remove_base_bdev(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *small_info;
+	uint64_t blockcnt_old;
+	int remove_cb_output, resize_cb_output;
+	int rc;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	/* Like a Longhorn v2 RAID1 volume whose first replica failed to grow. */
+	pbdev = ut_create_raid_level_opts(&req, SPDK_BDEV_RAID_LEVEL_RAID1, true);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	small_info = ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* Removing the smallest base bdev does not resize the raid bdev implicitly. */
+	remove_cb_output = 1;
+	rc = raid_bdev_remove_base_bdev(spdk_bdev_desc_get_bdev(small_info->desc), ut_resize_cb,
+					&remove_cb_output);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	poll_app_thread();
+	CU_ASSERT(remove_cb_output == 0);
+	CU_ASSERT(pbdev->num_base_bdevs_operational == pbdev->num_base_bdevs - 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 0);
+
+	/* raid_bdev_resize() grows it to the smallest remaining base bdev. */
+	resize_cb_output = 1;
+	rc = raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output);
+	CU_ASSERT(rc == 0);
+	poll_app_thread();
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 1);
+
+	/* Nothing changes on a second request, and the callback is not called. */
+	resize_cb_output = 1;
+	rc = raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output);
+	CU_ASSERT(rc == -EALREADY);
+	poll_app_thread();
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 1);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_busy(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *base_info;
+	struct raid_bdev_process process = { };
+	uint64_t blockcnt_old;
+	int resize_cb_output = 1;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	base_info = &pbdev->base_bdev_info[0];
+	/* Without a RESIZE event, which would grow the raid bdev. */
+	spdk_bdev_desc_get_bdev(base_info->desc)->blockcnt = BLOCK_CNT * 2;
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* A base bdev removal or growth is in progress. */
+	pbdev->base_bdev_updating = RAID_BDEV_UPDATE_REMOVING;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	pbdev->base_bdev_updating = RAID_BDEV_UPDATE_GROWING;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	pbdev->base_bdev_updating = RAID_BDEV_UPDATE_NONE;
+
+	/* A background process is running. */
+	process.raid_bdev = pbdev;
+	process.target = base_info;
+	pbdev->process = &process;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	pbdev->process = NULL;
+
+	/*
+	 * A finished background process cleared process but still has the raid bdev quiesced,
+	 * until its unquiesce completes.
+	 */
+	pbdev->process_finishing = true;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	pbdev->process_finishing = false;
+
+	/* A base bdev removal is scheduled. */
+	base_info->remove_scheduled = true;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	base_info->remove_scheduled = false;
+
+	/* A base bdev is in the faulty state, with or without updating its delta bitmap. */
+	base_info->state = BASE_BDEV_STATE_FAULTY;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	base_info->state = BASE_BDEV_STATE_FAULTY_STOPPED;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	base_info->state = BASE_BDEV_STATE_NONE;
+
+	/* The raid bdev is not online. */
+	pbdev->state = SPDK_BDEV_RAID_STATE_CONFIGURING;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EIO);
+	pbdev->state = SPDK_BDEV_RAID_STATE_ONLINE;
+
+	poll_app_thread();
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 0);
+
+	/* Once nothing else is in progress, the resize succeeds. */
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == 0);
+	poll_app_thread();
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid_resize_not_supported(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct rpc_bdev_raid_delete_ctx destroy_req;
+	struct raid_bdev *pbdev;
+	int resize_cb_output = 1;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	/* The test raid module does not implement the resize hook. */
+	verify_raid_bdev_present("raid1", false);
+	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev(&req, true, SPDK_BDEV_RAID_STATE_ONLINE);
+	pbdev = raid_bdev_find_by_name("raid1");
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -ENOTSUP);
+	poll_app_thread();
+	CU_ASSERT(resize_cb_output == 1);
+
+	free_test_req(&req);
+	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
+	rpc_bdev_raid_delete(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_superblock(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_bdev_superblock *sb;
+	struct raid_base_bdev_info *base_info;
+	uint64_t blockcnt_old;
+	int resize_cb_output;
+	uint8_t i;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	sb = calloc(1, sizeof(*sb) + pbdev->num_base_bdevs * sizeof(sb->base_bdevs[0]));
+	SPDK_CU_ASSERT_FATAL(sb != NULL);
+	sb->raid_size = blockcnt_old;
+	sb->base_bdevs_size = pbdev->num_base_bdevs;
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		sb->base_bdevs[i].slot = i;
+		sb->base_bdevs[i].data_size = pbdev->base_bdev_info[i].data_size;
+	}
+	pbdev->sb = sb;
+	pbdev->superblock_enabled = true;
+
+	/*
+	 * The resize updates the superblock and starts its write with the upstream callback, as
+	 * the upstream automatic resize did. It does not wait for the write.
+	 */
+	ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	spdk_bdev_desc_get_bdev(pbdev->base_bdev_info[0].desc)->blockcnt = BLOCK_CNT * 3;
+	resize_cb_output = 1;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == 0);
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(g_write_sb_calls == 1);
+	CU_ASSERT(g_write_sb_cb == raid_bdev_resize_write_sb_cb);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+	CU_ASSERT(sb->raid_size == BLOCK_CNT * 2);
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		base_info = &pbdev->base_bdev_info[sb->base_bdevs[i].slot];
+		CU_ASSERT(base_info->data_size == BLOCK_CNT * 2 - base_info->data_offset);
+		CU_ASSERT(sb->base_bdevs[i].data_size == base_info->data_size);
+	}
+
+	/*
+	 * A failing superblock write is only logged: the raid bdev keeps the new size. Grow the
+	 * base bdevs without RESIZE events, which would resize the raid bdev on their own.
+	 */
+	ut_set_base_bdevs_blockcnt(pbdev, BLOCK_CNT * 3);
+	g_write_sb_status = -EIO;
+	resize_cb_output = 1;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == 0);
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(g_write_sb_calls == 2);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 3);
+	CU_ASSERT(sb->raid_size == BLOCK_CNT * 3);
+
+	/* Nothing to change: no superblock write. */
+	resize_cb_output = 1;
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EALREADY);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(g_write_sb_calls == 2);
+
+	pbdev->superblock_enabled = false;
+	pbdev->sb = NULL;
+	free(sb);
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid_resize_invalid_args(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct spdk_thread *other_thread;
+	uint64_t blockcnt_old;
+	int resize_cb_output = 1;
+	int rc;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	/* Every base bdev grew, so a resize that passed the checks would grow the raid bdev. */
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	spdk_bdev_desc_get_bdev(pbdev->base_bdev_info[0].desc)->blockcnt = BLOCK_CNT * 2;
+
+	/* A NULL raid bdev or callback is an error, not a crash. */
+	CU_ASSERT(raid_bdev_resize(NULL, 0, ut_resize_cb, &resize_cb_output) == -EINVAL);
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, NULL, NULL) == -EINVAL);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* A call from a thread other than the app thread is not supported. */
+	other_thread = spdk_thread_create("other_thread", NULL);
+	SPDK_CU_ASSERT_FATAL(other_thread != NULL);
+	spdk_set_thread(other_thread);
+	rc = raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output);
+	spdk_set_thread(g_app_thread);
+	CU_ASSERT(rc == -ENOTSUP);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 0);
+
+	spdk_set_thread(other_thread);
+	spdk_thread_exit(other_thread);
+	while (!spdk_thread_is_exited(other_thread)) {
+		spdk_thread_poll(other_thread, 0, 0);
+	}
+	spdk_thread_destroy(other_thread);
+	spdk_set_thread(g_app_thread);
+
+	/* On the app thread the same resize succeeds. */
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == 0);
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_busy_on_concurrent_remove(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *first_info, *second_info;
+	struct spdk_bdev *first_bdev, *second_bdev;
+	uint64_t blockcnt_old;
+	int first_cb_output, second_cb_output, resize_cb_output = 1;
+	int rc;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+
+	/* Grow every base bdev but the first two, which limit the raid bdev size. */
+	first_info = &pbdev->base_bdev_info[0];
+	second_info = &pbdev->base_bdev_info[1];
+	first_bdev = spdk_bdev_desc_get_bdev(first_info->desc);
+	second_bdev = spdk_bdev_desc_get_bdev(second_info->desc);
+	ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	second_bdev->blockcnt = BLOCK_CNT;
+	raid_bdev_resize_base_bdev(second_bdev);
+
+	/* Remove both small base bdevs concurrently. */
+	first_cb_output = 1;
+	rc = raid_bdev_remove_base_bdev(first_bdev, ut_resize_cb, &first_cb_output);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	second_cb_output = 1;
+	rc = raid_bdev_remove_base_bdev(second_bdev, ut_resize_cb, &second_cb_output);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+
+	/*
+	 * Let the first removal complete. It clears base_bdev_updating, but the second removal
+	 * still has the raid bdev quiesced, and its remove_scheduled keeps the resize out.
+	 */
+	while (first_cb_output != 0 && spdk_thread_poll(g_app_thread, 1, 0) > 0) {
+	}
+	CU_ASSERT(first_cb_output == 0);
+	SPDK_CU_ASSERT_FATAL(second_cb_output == 1);
+	CU_ASSERT(pbdev->base_bdev_updating == RAID_BDEV_UPDATE_NONE);
+	CU_ASSERT(second_info->remove_scheduled == true);
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* Once the second removal completed, the resize grows the raid bdev. */
+	poll_app_thread();
+	CU_ASSERT(second_cb_output == 0);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == 0);
+	poll_app_thread();
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_busy_on_grow(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct spdk_io_channel *ch;
+	char spare_name[16];
+	int grow_cb_output, resize_cb_output = 1;
+	int rc;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	/* Leave out the last base bdev to add it with a grow. */
+	snprintf(spare_name, sizeof(spare_name), "%s%u%s", "Nvme", g_max_base_drives - 1, "n1");
+	verify_raid_bdev_present("raid1", false);
+	_create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false, g_max_base_drives - 1);
+	req.strip_size_kb = 0;
+	req.raid_level = (enum rpc_bdev_raid_level)SPDK_BDEV_RAID_LEVEL_RAID1;
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev(&req, true, SPDK_BDEV_RAID_STATE_ONLINE);
+	pbdev = raid_bdev_find_by_name("raid1");
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+	ch = spdk_get_io_channel(pbdev);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	/* While the grow is in progress, the resize is refused. */
+	grow_cb_output = 1;
+	rc = raid_bdev_grow_base_bdev(pbdev, spare_name, ut_resize_cb, &grow_cb_output);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(grow_cb_output == 1);
+	CU_ASSERT(pbdev->base_bdev_updating == RAID_BDEV_UPDATE_GROWING);
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EBUSY);
+
+	poll_app_thread();
+	CU_ASSERT(grow_cb_output == 0);
+	CU_ASSERT(pbdev->base_bdev_updating == RAID_BDEV_UPDATE_NONE);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EALREADY);
+
+	spdk_put_io_channel(ch);
+	poll_app_thread();
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+ut_create_raid_resize_req(struct rpc_bdev_raid_resize_ctx *r, const char *raid_name)
+{
+	memset(r, 0, sizeof(*r));
+	r->name = strdup(raid_name);
+	SPDK_CU_ASSERT_FATAL(r->name != NULL);
+
+	g_rpc_req = r;
+	g_rpc_req_size = sizeof(*r);
+	g_rpc_err = 0;
+	g_json_decode_obj_create = 0;
+	g_json_decode_obj_err = 0;
+	g_test_multi_raids = 0;
+}
+
+static void
+test_rpc_bdev_raid_resize(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct rpc_bdev_raid_resize_ctx resize_req;
+	struct raid_bdev *pbdev;
+	uint64_t blockcnt_old;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+
+	/* Unknown raid bdev. */
+	ut_create_raid_resize_req(&resize_req, "raid_unknown");
+	rpc_bdev_raid_resize(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+
+	/* No change is not an error. */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	rpc_bdev_raid_resize(NULL, NULL);
+	poll_app_thread();
+	CU_ASSERT(g_rpc_err == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* Busy. */
+	pbdev->base_bdev_updating = RAID_BDEV_UPDATE_REMOVING;
+	ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	spdk_bdev_desc_get_bdev(pbdev->base_bdev_info[0].desc)->blockcnt = BLOCK_CNT * 2;
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	rpc_bdev_raid_resize(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	pbdev->base_bdev_updating = RAID_BDEV_UPDATE_NONE;
+
+	/* Grow. */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	rpc_bdev_raid_resize(NULL, NULL);
+	poll_app_thread();
+	CU_ASSERT(g_rpc_err == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_expected_size(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *first_info;
+	uint64_t blockcnt_old;
+	int resize_cb_output = 1;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	first_info = ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	spdk_bdev_desc_get_bdev(first_info->desc)->blockcnt = BLOCK_CNT * 3;
+
+	/* A base bdev is smaller than the expected size: refused, the size is unchanged. */
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 3, ut_resize_cb, &resize_cb_output) == -ENOSPC);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 0);
+
+	/* Every base bdev provides the expected size: resized to the smallest base bdev. */
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 2, ut_resize_cb, &resize_cb_output) == 0);
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	/* The base bdevs provide more than the expected size: "at least" accepts it. */
+	ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 4);
+	spdk_bdev_desc_get_bdev(first_info->desc)->blockcnt = BLOCK_CNT * 4;
+	resize_cb_output = 1;
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 3, ut_resize_cb, &resize_cb_output) == 0);
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 4);
+
+	/* Already at the base bdev size: the check passes and nothing changes. */
+	resize_cb_output = 1;
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 4, ut_resize_cb, &resize_cb_output) == -EALREADY);
+	CU_ASSERT(resize_cb_output == 1);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid_resize_expected_size_not_supported(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *first_info;
+	uint64_t blockcnt_old;
+	int resize_cb_output = 1;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	/* raid0 can resize, but an expected size is supported only for raid1. */
+	pbdev = ut_create_raid_level(&req, SPDK_BDEV_RAID_LEVEL_RAID0);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	first_info = ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	spdk_bdev_desc_get_bdev(first_info->desc)->blockcnt = BLOCK_CNT * 2;
+	CU_ASSERT(raid_bdev_resize(pbdev, 1, ut_resize_cb, &resize_cb_output) == -ENOTSUP);
+	CU_ASSERT(resize_cb_output == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_expected_size_busy(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *first_info;
+	struct spdk_bdev *first_bdev;
+	uint64_t blockcnt_old;
+	int remove_cb_output = 1, resize_cb_output = 1;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	first_info = ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	first_bdev = spdk_bdev_desc_get_bdev(first_info->desc);
+
+	/*
+	 * The small base bdev is being removed and is still listed with its old size: the
+	 * retryable -EBUSY wins over -ENOSPC.
+	 */
+	SPDK_CU_ASSERT_FATAL(raid_bdev_remove_base_bdev(first_bdev, ut_resize_cb, &remove_cb_output) == 0);
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 2, ut_resize_cb, &resize_cb_output) == -EBUSY);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* Once it is removed, the remaining base bdevs provide the expected size. */
+	poll_app_thread();
+	CU_ASSERT(remove_cb_output == 0);
+	CU_ASSERT(raid_bdev_resize(pbdev, BLOCK_CNT * 2, ut_resize_cb, &resize_cb_output) == 0);
+	CU_ASSERT(resize_cb_output == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_rpc_bdev_raid_resize_not_online(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct rpc_bdev_raid_resize_ctx resize_req;
+	struct raid_bdev *pbdev;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	/* No base bdev exists yet: the raid bdev is configuring and has no block length. */
+	verify_raid_bdev_present("raid1", false);
+	create_raid_bdev_create_req(&req, "raid1", 0, false, 0, false);
+	req.strip_size_kb = 0;
+	req.raid_level = (enum rpc_bdev_raid_level)SPDK_BDEV_RAID_LEVEL_RAID1;
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	pbdev = raid_bdev_find_by_name("raid1");
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+	CU_ASSERT(pbdev->state == SPDK_BDEV_RAID_STATE_CONFIGURING);
+	CU_ASSERT(pbdev->bdev.blocklen == 0);
+
+	/* An expected size is not converted with a zero block length: an error, not a crash. */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	resize_req.expected_size_in_mib = 1;
+	rpc_bdev_raid_resize(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	rpc_bdev_raid_resize(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+	CU_ASSERT(pbdev->state == SPDK_BDEV_RAID_STATE_CONFIGURING);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_rpc_bdev_raid_resize_expected_size(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct rpc_bdev_raid_resize_ctx resize_req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *first_info;
+	uint64_t blockcnt_old, expected_mib;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	first_info = ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	spdk_bdev_desc_get_bdev(first_info->desc)->blockcnt = BLOCK_CNT * 2;
+	/* The size of the grown base bdevs in MiB. */
+	expected_mib = BLOCK_CNT * 2 * g_block_len / (1024 * 1024);
+
+	/* One MiB more than the base bdevs provide: -ENOSPC, the size is unchanged. */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	resize_req.expected_size_in_mib = expected_mib + 1;
+	rpc_bdev_raid_resize(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/*
+	 * A size whose byte count does not fit in 64 bits is an invalid parameter. 2^44 MiB is
+	 * 2^64 bytes, which would wrap to 0 and skip the check.
+	 */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	resize_req.expected_size_in_mib = UINT64_MAX / (1024 * 1024) + 1;
+	rpc_bdev_raid_resize(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* Exactly the size of the base bdevs, converted to blocks: resized. */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	resize_req.expected_size_in_mib = expected_mib;
+	rpc_bdev_raid_resize(NULL, NULL);
+	poll_app_thread();
+	CU_ASSERT(g_rpc_err == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+/*
+ * With interleaved metadata, blocklen also counts the metadata of each block: the expected size
+ * is converted with the data block size, so that the raid bdev provides at least that much data.
+ */
+static void
+test_rpc_bdev_raid_resize_md_interleaved(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct rpc_bdev_raid_resize_ctx resize_req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *first_info;
+	uint32_t blocklen_old, md_len_old;
+	uint64_t blockcnt_old;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	pbdev = ut_create_raid1(&req);
+	blockcnt_old = pbdev->bdev.blockcnt;
+	first_info = ut_grow_base_bdevs_but_first(pbdev, BLOCK_CNT * 2);
+	spdk_bdev_desc_get_bdev(first_info->desc)->blockcnt = BLOCK_CNT * 2;
+
+	/* 520-byte blocks, of which 512 bytes of data and 8 bytes of interleaved metadata. */
+	blocklen_old = pbdev->bdev.blocklen;
+	md_len_old = pbdev->bdev.md_len;
+	pbdev->bdev.blocklen = 520;
+	pbdev->bdev.md_len = 8;
+	MOCK_SET(spdk_bdev_is_md_interleaved, true);
+
+	/*
+	 * The base bdevs provide BLOCK_CNT * 2 blocks of 512 data bytes. This expected size is
+	 * exactly BLOCK_CNT * 2 blocks of 520 bytes, so more data than that: -ENOSPC.
+	 */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	resize_req.expected_size_in_mib = BLOCK_CNT * 2 * 520 / (1024 * 1024);
+	rpc_bdev_raid_resize(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 1);
+	CU_ASSERT(pbdev->bdev.blockcnt == blockcnt_old);
+
+	/* Exactly the data that the base bdevs provide: resized. */
+	ut_create_raid_resize_req(&resize_req, "raid1");
+	resize_req.expected_size_in_mib = BLOCK_CNT * 2 * 512 / (1024 * 1024);
+	rpc_bdev_raid_resize(NULL, NULL);
+	poll_app_thread();
+	CU_ASSERT(g_rpc_err == 0);
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+
+	MOCK_CLEAR(spdk_bdev_is_md_interleaved);
+	pbdev->bdev.blocklen = blocklen_old;
+	pbdev->bdev.md_len = md_len_old;
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
+static void
+test_raid1_resize_on_base_bdev_resize(void)
+{
+	struct rpc_bdev_raid_create_ctx req;
+	struct raid_bdev *pbdev;
+	struct raid_base_bdev_info *base_info;
+	struct spdk_bdev *base_bdev;
+	int resize_cb_output = 1;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	/* The raid bdev grows on base bdev RESIZE events, as upstream. */
+	pbdev = ut_create_raid1(&req);
+	RAID_FOR_EACH_BASE_BDEV(pbdev, base_info) {
+		base_bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+		base_bdev->blockcnt = BLOCK_CNT * 2;
+		raid_bdev_resize_base_bdev(base_bdev);
+	}
+	CU_ASSERT(pbdev->bdev.blockcnt == BLOCK_CNT * 2);
+	CU_ASSERT(g_notify_blockcnt_change_calls == 1);
+
+	/* raid_bdev_resize() has nothing left to grow. */
+	CU_ASSERT(raid_bdev_resize(pbdev, 0, ut_resize_cb, &resize_cb_output) == -EALREADY);
+	CU_ASSERT(resize_cb_output == 1);
+
+	ut_delete_raid1(&req);
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
 static int
 test_new_thread_fn(struct spdk_thread *thread)
 {
@@ -2036,10 +3426,33 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_raid_level_conversions);
 	CU_ADD_TEST(suite, test_raid_io_split);
 	CU_ADD_TEST(suite, test_raid_process);
+	CU_ADD_TEST(suite, test_raid_process_finish_resize_busy);
 	CU_ADD_TEST(suite, test_raid_process_with_qos);
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev_not_supported);
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev);
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev_with_hole);
+	CU_ADD_TEST(suite, test_raid_disable_auto_resize);
+	CU_ADD_TEST(suite, test_raid1_resize_busy_on_delta_bitmap);
+	CU_ADD_TEST(suite, test_raid_disable_auto_resize_with_superblock);
+	CU_ADD_TEST(suite, test_raid_auto_resize_config_json);
+	CU_ADD_TEST(suite, test_raid_info_json_remove_scheduled);
+	CU_ADD_TEST(suite, test_raid_resize_while_busy);
+	CU_ADD_TEST(suite, test_raid1_resize_base_bdev_during_remove);
+	CU_ADD_TEST(suite, test_raid1_resize_after_remove_base_bdev);
+	CU_ADD_TEST(suite, test_raid1_resize_busy);
+	CU_ADD_TEST(suite, test_raid_resize_not_supported);
+	CU_ADD_TEST(suite, test_raid1_resize_superblock);
+	CU_ADD_TEST(suite, test_rpc_bdev_raid_resize);
+	CU_ADD_TEST(suite, test_raid1_resize_expected_size);
+	CU_ADD_TEST(suite, test_raid_resize_expected_size_not_supported);
+	CU_ADD_TEST(suite, test_raid1_resize_expected_size_busy);
+	CU_ADD_TEST(suite, test_rpc_bdev_raid_resize_expected_size);
+	CU_ADD_TEST(suite, test_rpc_bdev_raid_resize_md_interleaved);
+	CU_ADD_TEST(suite, test_rpc_bdev_raid_resize_not_online);
+	CU_ADD_TEST(suite, test_raid1_resize_on_base_bdev_resize);
+	CU_ADD_TEST(suite, test_raid1_resize_busy_on_concurrent_remove);
+	CU_ADD_TEST(suite, test_raid1_resize_busy_on_grow);
+	CU_ADD_TEST(suite, test_raid_resize_invalid_args);
 
 	spdk_thread_lib_init(test_new_thread_fn, 0);
 	g_app_thread = spdk_thread_create("app_thread", NULL);
