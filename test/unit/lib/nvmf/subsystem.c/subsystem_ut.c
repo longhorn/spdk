@@ -1018,12 +1018,14 @@ test_reservation_register(void)
 	ut_reservation_build_registrants();
 
 	/* TEST CASE: Replace g_ctrlr1_A with a new key */
+	gen = g_ns.gen;
 	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REPLACE_KEY,
 					      0, 0, 0xa1, 0xa11);
 	nvmf_ns_reservation_register(&g_ns, &g_ctrlr1_A, req);
 	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
 	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid);
 	SPDK_CU_ASSERT_FATAL(reg->rkey == 0xa11);
+	SPDK_CU_ASSERT_FATAL(g_ns.gen == gen + 1);
 
 	/* TEST CASE: Host A with g_ctrlr1_A get reservation with
 	 * type SPDK_NVME_RESERVE_WRITE_EXCLUSIVE
@@ -1293,7 +1295,7 @@ test_reservation_acquire_preempt_no_holder(enum spdk_nvme_reservation_acquire_ac
 	SPDK_CU_ASSERT_FATAL(status == 0);
 	status = nvmf_ns_reservation_add_registrant(g_ns_ptr, &g_ctrlr_C, rkey);
 	SPDK_CU_ASSERT_FATAL(status == 0);
-	SPDK_CU_ASSERT_FATAL(g_ns.gen - gen == 3);
+	SPDK_CU_ASSERT_FATAL(g_ns.gen == gen);
 
 	/* Premept while no reservation holder with prkey == rkey */
 	ut_reservation_build_acquire_request(req, preempt_type, 0,
@@ -1474,7 +1476,7 @@ test_reservation_acquire_preempt_unregister_multi_same_key(enum spdk_nvme_reserv
 	SPDK_CU_ASSERT_FATAL(reg == NULL);
 	SPDK_CU_ASSERT_FATAL(g_ns.crkey == b_rkey);
 	SPDK_CU_ASSERT_FATAL(g_ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE);
-	SPDK_CU_ASSERT_FATAL(g_ns.gen - gen == 2);
+	SPDK_CU_ASSERT_FATAL(g_ns.gen - gen == 1);
 	if (is_abort) {
 		/* A & B were preempeted */
 		SPDK_CU_ASSERT_FATAL(g_ns.preempt_abort);
@@ -1622,7 +1624,7 @@ test_reservation_acquire_preempt_self(enum spdk_nvme_reservation_acquire_action 
 	SPDK_CU_ASSERT_FATAL(reg != NULL);
 	SPDK_CU_ASSERT_FATAL(g_ns.holder == reg);
 	SPDK_CU_ASSERT_FATAL(g_ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_REG_ONLY);
-	SPDK_CU_ASSERT_FATAL(g_ns.gen == gen);
+	SPDK_CU_ASSERT_FATAL(g_ns.gen == gen + 1);
 	if (is_abort) {
 		/* We won't self-abort, so no hostid */
 		SPDK_CU_ASSERT_FATAL(g_ns.preempt_abort);
@@ -1670,7 +1672,7 @@ test_reservation_acquire_preempt_self(enum spdk_nvme_reservation_acquire_action 
 	SPDK_CU_ASSERT_FATAL(reg != NULL);
 	SPDK_CU_ASSERT_FATAL(g_ns.holder == reg);
 	SPDK_CU_ASSERT_FATAL(g_ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_REG_ONLY);
-	SPDK_CU_ASSERT_FATAL(g_ns.gen == gen);
+	SPDK_CU_ASSERT_FATAL(g_ns.gen == gen + 1);
 	if (is_abort) {
 		/* We won't self-abort, so no hostid */
 		SPDK_CU_ASSERT_FATAL(g_ns.preempt_abort);
@@ -1785,6 +1787,7 @@ test_reservation_release(void)
 	struct spdk_nvmf_request *req;
 	struct spdk_nvme_cpl *rsp;
 	struct spdk_nvmf_registrant *reg;
+	uint32_t gen;
 
 	ut_reservation_init();
 
@@ -1815,10 +1818,13 @@ test_reservation_release(void)
 	SPDK_CU_ASSERT_FATAL(g_ns.holder == NULL);
 
 	/* Test Case: Host C clear the registrants */
+	gen = g_ns.gen;
 	ut_reservation_build_release_request(req, SPDK_NVME_RESERVE_CLEAR, 0,
 					     0, 0xc1);
 	nvmf_ns_reservation_release(&g_ns, &g_ctrlr_C, req);
 	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	/* Clear removes multiple registrants but is a single generation change */
+	SPDK_CU_ASSERT_FATAL(g_ns.gen == gen + 1);
 	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid);
 	SPDK_CU_ASSERT_FATAL(reg == NULL);
 	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr2_A.hostid);
@@ -2920,7 +2926,8 @@ test_reservation_request_preempt_abort_timeout(void)
 	poll_thread_times(0, 3);
 
 	SPDK_CU_ASSERT_FATAL(nvmf_ns_registrants_get_count(&g_ns) == 1);
-	SPDK_CU_ASSERT_FATAL(g_ns.gen == 3);
+	/* A successful preempt increments gen even if no registrant was removed */
+	SPDK_CU_ASSERT_FATAL(g_ns.gen == 4);
 	SPDK_CU_ASSERT_FATAL(spdk_uuid_compare(&pg_ns->holder_id,
 					       &g_ctrlr_B.hostid) == 0);
 	SPDK_CU_ASSERT_FATAL(g_ns.preempt_abort->hostids_cnt == 0);
@@ -3045,13 +3052,13 @@ test_nvmf_ns_reservation_add_remove_registrant(void)
 	CU_ASSERT(rc == 0);
 	reg = TAILQ_FIRST(&ns.registrants);
 	SPDK_CU_ASSERT_FATAL(reg != NULL);
-	CU_ASSERT(ns.gen == 1);
+	CU_ASSERT(ns.gen == 0);
 	CU_ASSERT(reg->rkey == 0xa11);
 	CU_ASSERT(!strncmp((uint8_t *)&reg->hostid, (uint8_t *)&ctrlr.hostid, sizeof(ctrlr.hostid)));
 
 	nvmf_ns_reservation_remove_registrant(&ns, reg);
 	CU_ASSERT(TAILQ_EMPTY(&ns.registrants));
-	CU_ASSERT(ns.gen == 2);
+	CU_ASSERT(ns.gen == 0);
 }
 
 static void
