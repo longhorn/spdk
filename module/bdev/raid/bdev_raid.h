@@ -282,6 +282,27 @@ struct raid_bdev {
 
 	/* A flag to enable the recording of a delta bitmap for faulty base bdevs */
 	bool				delta_bitmap_enabled;
+
+	/*
+	 * Longhorn: when true, a base bdev RESIZE event does not resize the raid bdev, which grows
+	 * only through raid_bdev_resize() (bdev_raid_resize). Set by bdev_raid_create.
+	 */
+	bool				disable_auto_resize;
+
+	/*
+	 * Longhorn: true while a finished background process still has the raid bdev quiesced,
+	 * from when it clears process until its unquiesce completes. raid_bdev_resize() must not
+	 * change the size meanwhile, because the unquiesce range must match the quiesced one.
+	 */
+	bool				process_finishing;
+
+	/*
+	 * Longhorn: number of raid bdev quiesces, taken to start a faulty state or stop a delta
+	 * bitmap, that are not unquiesced yet. bdev_raid_resize returns -EBUSY while it is not
+	 * zero, because spdk_bdev_unquiesce() uses the current block count, so the size must not
+	 * change in between. The member state cannot tell, as clearing the faulty state resets it.
+	 */
+	uint32_t			num_delta_bitmap_quiesces;
 };
 
 #define RAID_FOR_EACH_BASE_BDEV(r, i) \
@@ -296,7 +317,7 @@ extern struct raid_all_tailq		g_raid_bdev_list;
 
 int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		     char **base_bdev_names, enum spdk_bdev_raid_level level, bool superblock_enabled,
-		     const struct spdk_uuid *uuid, bool delta_bitmap_enabled,
+		     const struct spdk_uuid *uuid, bool delta_bitmap_enabled, bool disable_auto_resize,
 		     raid_bdev_action_cb cb_fn, void *cb_ctx);
 void raid_bdev_delete(struct raid_bdev *raid_bdev, bool clear_sb, raid_bdev_action_cb cb_fn,
 		      void *cb_ctx);
@@ -312,6 +333,8 @@ int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb 
 			       void *cb_ctx);
 int raid_bdev_grow_base_bdev(struct raid_bdev *raid_bdev, char *base_bdev_name,
 			     raid_bdev_action_cb cb_fn, void *cb_arg);
+int raid_bdev_resize(struct raid_bdev *raid_bdev, uint64_t min_blockcnt, raid_bdev_action_cb cb_fn,
+		     void *cb_arg);
 struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
 struct raid_base_bdev_info *raid_bdev_find_faulty_base_info_by_name(char *base_bdev_name);
 struct spdk_bit_array *raid_bdev_get_base_bdev_delta_bitmap(char *base_bdev_name);

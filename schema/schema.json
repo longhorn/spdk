@@ -5680,6 +5680,11 @@
           "name": "delta_bitmap",
           "type": "boolean",
           "description": "Enable the recording of a delta bitmap for faulty base bdevs (raid1 only)"
+        },
+        {
+          "name": "disable_auto_resize",
+          "type": "boolean",
+          "description": "If set, the raid bdev does not resize when a base bdev is resized and grows only through bdev_raid_resize; not supported with superblock (default: `false`)"
         }
       ]
     },
@@ -5741,6 +5746,22 @@
           "type": "string",
           "required": true,
           "description": "Base bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_raid_resize",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Raid bdev name"
+        },
+        {
+          "name": "expected_size_in_mib",
+          "type": "uint64",
+          "description": "Minimum size in MiB that the raid bdev must reach (raid1 only); otherwise the resize is refused and the size is unchanged"
         }
       ]
     },

@@ -1336,7 +1336,8 @@ def add_parser(subparsers):
                                   base_bdevs=args.base_bdevs,
                                   uuid=args.uuid,
                                   superblock=args.superblock,
-                                  delta_bitmap=args.delta_bitmap)
+                                  delta_bitmap=args.delta_bitmap,
+                                  disable_auto_resize=args.disable_auto_resize)
     p = subparsers.add_parser('bdev_raid_create', help='Create new raid bdev')
     p.add_argument('-n', '--name', help='raid bdev name', required=True)
     p.add_argument('-z', '--strip-size-kb', help='strip size in KB', type=int)
@@ -1347,6 +1348,8 @@ def add_parser(subparsers):
                                               'disabled by default due to backward compatibility', action='store_true')
     p.add_argument('--delta-bitmap', help='enable the recording of a delta bitmap for faulty base bdevs (raid1 only)',
                    action='store_true')
+    p.add_argument('--disable-auto-resize', help='do not resize the raid bdev when a base bdev is resized; '
+                   'grow it only through bdev_raid_resize (not supported with --superblock)', action='store_true')
     p.set_defaults(func=bdev_raid_create)
 
     def bdev_raid_delete(args):
@@ -1381,6 +1384,17 @@ def add_parser(subparsers):
     p.add_argument('raid_name', help='raid bdev name')
     p.add_argument('base_name', help='base bdev name')
     p.set_defaults(func=bdev_raid_grow_base_bdev)
+
+    def bdev_raid_resize(args):
+        print_dict(args.client.bdev_raid_resize(name=args.name,
+                                                expected_size_in_mib=args.expected_size_in_mib))
+    p = subparsers.add_parser('bdev_raid_resize',
+                              help='Recalculate the size of a raid bdev from its current base bdevs')
+    p.add_argument('-n', '--name', help='raid bdev name', required=True)
+    p.add_argument('--expected-size-in-mib', type=int,
+                   help='minimum size in MiB that the raid bdev must reach (raid1 only); '
+                   'otherwise the resize is refused and the size is unchanged')
+    p.set_defaults(func=bdev_raid_resize)
 
     def bdev_raid_get_base_bdev_delta_bitmap(args):
         print_json(args.client.bdev_raid_get_base_bdev_delta_bitmap(base_bdev_name=args.base_bdev_name))

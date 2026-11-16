@@ -389,7 +389,7 @@ def bdev_raid_get_bdevs(client, category):
 
 @deprecated_method
 def bdev_raid_create(client, name, raid_level, base_bdevs, strip_size_kb=None, uuid=None, superblock=None,
-                     delta_bitmap=None):
+                     delta_bitmap=None, disable_auto_resize=None):
     """Create raid bdev. Either strip size arg will work but one is required.
     Args:
         name: user defined raid bdev name
@@ -400,6 +400,9 @@ def bdev_raid_create(client, name, raid_level, base_bdevs, strip_size_kb=None, u
         superblock: information about raid bdev will be stored in superblock on each base bdev,
                     disabled by default due to backward compatibility
         delta_bitmap: a delta bitmap for faulty base bdevs will be recorded, disabled by default
+        disable_auto_resize: the raid bdev does not resize when a base bdev is resized and grows
+                             only through bdev_raid_resize, disabled by default; not supported
+                             with superblock
     Returns:
         None
     """
@@ -415,6 +418,8 @@ def bdev_raid_create(client, name, raid_level, base_bdevs, strip_size_kb=None, u
         params['superblock'] = superblock
     if delta_bitmap is not None:
         params['delta_bitmap'] = delta_bitmap
+    if disable_auto_resize is not None:
+        params['disable_auto_resize'] = disable_auto_resize
 
     return client.call('bdev_raid_create', params)
 
@@ -475,6 +480,26 @@ def bdev_raid_grow_base_bdev(client, raid_name, base_name):
     params = {'raid_name': raid_name, 'base_name': base_name}
 
     return client.call('bdev_raid_grow_base_bdev', params)
+
+
+def bdev_raid_resize(client, name, expected_size_in_mib=None):
+    """Recalculate the size of a raid bdev from its current base bdevs, after growing the base
+    bdevs and removing those that failed to grow. It is the only way to grow a raid bdev created
+    with disable_auto_resize.
+
+    Args:
+        name: raid bdev name
+        expected_size_in_mib: minimum size in MiB that the raid bdev must reach (raid1 only;
+            optional). Otherwise the resize is refused and the size is unchanged.
+
+    Returns:
+        Object with name, old_blockcnt, new_blockcnt, and resized.
+    """
+    params = {'name': name}
+    if expected_size_in_mib is not None:
+        params['expected_size_in_mib'] = expected_size_in_mib
+
+    return client.call('bdev_raid_resize', params)
 
 
 @deprecated_method
