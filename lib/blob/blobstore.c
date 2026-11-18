@@ -86,6 +86,8 @@ static void blob_esnap_destroy_channels(struct blob_esnap_destroy_ctx *ctx, stru
 					struct spdk_bs_dev *bs_dev, bool abort_io,
 					spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 static void blob_esnap_destroy_bs_channel(struct spdk_bs_channel *ch);
+static int blob_channel_create(void *io_device, void *ctx_buf);
+static void blob_channel_destroy(void *io_device, void *ctx_buf);
 static void blob_set_back_bs_dev_frozen(void *_ctx, int bserrno);
 static void blob_close_pending_io(void *ctx);
 struct freeze_io_ctx;
@@ -396,6 +398,15 @@ blob_unref_back_bs_dev(struct spdk_blob *blob)
 }
 
 static void
+blob_io_device_unregister_cpl(void *io_device)
+{
+	struct spdk_blob *blob = io_device;
+
+	pthread_mutex_destroy(&blob->close_barrier_mutex);
+	free(blob);
+}
+
+static void
 blob_free(struct spdk_blob *blob)
 {
 	assert(blob != NULL);
@@ -422,8 +433,13 @@ blob_free(struct spdk_blob *blob)
 		blob_unref_back_bs_dev(blob);
 	}
 
-	pthread_mutex_destroy(&blob->close_barrier_mutex);
-	free(blob);
+	if (__atomic_load_n(&blob->io_device_registered, __ATOMIC_RELAXED)) {
+		__atomic_store_n(&blob->io_device_registered, false, __ATOMIC_RELEASE);
+		spdk_io_device_unregister(blob, blob_io_device_unregister_cpl);
+		return;
+	}
+
+	blob_io_device_unregister_cpl(blob);
 }
 
 static void
@@ -630,20 +646,31 @@ static void
 blob_execute_queued_io(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
-	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct spdk_bs_channel *root_ch = spdk_io_channel_get_ctx(_ch);
+	struct spdk_bs_channel *ch;
 	struct freeze_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	TAILQ_HEAD(, spdk_bs_request_set) exec_ops;
 	struct spdk_bs_request_set	*set;
 	struct spdk_bs_user_op_args	*args;
 	spdk_bs_user_op_t *op, *tmp;
 
-	TAILQ_FOREACH_SAFE(op, &ch->queued_io, link, tmp) {
-		set = (struct spdk_bs_request_set *)op;
-		args = &set->u.user_op;
+	TAILQ_INIT(&exec_ops);
+	TAILQ_FOREACH(ch, &root_ch->thread_channels, thread_link) {
+		TAILQ_FOREACH_SAFE(op, &ch->queued_io, link, tmp) {
+			set = (struct spdk_bs_request_set *)op;
+			args = &set->u.user_op;
 
-		if (args->blob == ctx->blob) {
-			TAILQ_REMOVE(&ch->queued_io, op, link);
-			bs_user_op_execute(op);
+			if (args->blob == ctx->blob) {
+				TAILQ_REMOVE(&ch->queued_io, op, link);
+				TAILQ_INSERT_TAIL(&exec_ops, op, link);
+			}
 		}
+	}
+
+	while (!TAILQ_EMPTY(&exec_ops)) {
+		op = TAILQ_FIRST(&exec_ops);
+		TAILQ_REMOVE(&exec_ops, op, link);
+		bs_user_op_execute(op);
 	}
 
 	spdk_for_each_channel_continue(i, 0);
@@ -4023,15 +4050,11 @@ blob_get_snapshot_and_clone_entries(struct spdk_blob *blob,
 }
 
 static int
-bs_channel_create(void *io_device, void *ctx_buf)
+bs_channel_init(struct spdk_blob_store *bs, struct spdk_bs_channel *channel)
 {
-	struct spdk_blob_store		*bs = io_device;
-	struct spdk_bs_channel		*channel = ctx_buf;
-	struct spdk_bs_dev		*dev;
+	struct spdk_bs_dev		*dev = bs->dev;
 	uint32_t			max_ops = bs->max_channel_ops;
 	uint32_t			i;
-
-	dev = bs->dev;
 
 	channel->req_mem = calloc(max_ops, sizeof(struct spdk_bs_request_set));
 	if (!channel->req_mem) {
@@ -4083,9 +4106,8 @@ bs_channel_create(void *io_device, void *ctx_buf)
 }
 
 static void
-bs_channel_destroy(void *io_device, void *ctx_buf)
+bs_channel_fini(struct spdk_bs_channel *channel, bool is_root)
 {
-	struct spdk_bs_channel *channel = ctx_buf;
 	spdk_bs_user_op_t *op;
 
 	while (!TAILQ_EMPTY(&channel->need_cluster_alloc)) {
@@ -4100,13 +4122,89 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 		bs_user_op_abort(op, -EIO);
 	}
 
-	blob_esnap_destroy_bs_channel(channel);
+	if (is_root) {
+		blob_esnap_destroy_bs_channel(channel);
+	} else {
+		assert(RB_EMPTY(&channel->esnap_channels));
+	}
 
 	free(channel->req_mem);
 	spdk_free(channel->new_cluster_page);
 	spdk_free(channel->release_cluster_page);
 	assert(TAILQ_EMPTY(&channel->pending_free_cluster));
 	channel->dev->destroy_channel(channel->dev, channel->dev_channel);
+}
+
+static int
+bs_channel_create(void *io_device, void *ctx_buf)
+{
+	struct spdk_blob_store		*bs = io_device;
+	struct spdk_bs_channel		*channel = ctx_buf;
+	int				rc;
+
+	rc = bs_channel_init(bs, channel);
+	if (rc != 0) {
+		return rc;
+	}
+
+	channel->bs_io_channel = NULL;
+	TAILQ_INIT(&channel->thread_channels);
+	TAILQ_INSERT_TAIL(&channel->thread_channels, channel, thread_link);
+
+	return 0;
+}
+
+static void
+bs_channel_destroy(void *io_device, void *ctx_buf)
+{
+	struct spdk_bs_channel *channel = ctx_buf;
+
+	TAILQ_REMOVE(&channel->thread_channels, channel, thread_link);
+	assert(TAILQ_EMPTY(&channel->thread_channels));
+	bs_channel_fini(channel, true);
+}
+
+static int
+blob_channel_create(void *io_device, void *ctx_buf)
+{
+	struct spdk_blob		*blob = io_device;
+	struct spdk_bs_channel		*channel = ctx_buf;
+	struct spdk_io_channel		*bs_io_channel;
+	struct spdk_bs_channel		*root;
+
+	if (!__atomic_load_n(&blob->io_device_registered, __ATOMIC_ACQUIRE)) {
+		return -1;
+	}
+
+	bs_io_channel = spdk_get_io_channel(blob->bs);
+	if (bs_io_channel == NULL) {
+		return -1;
+	}
+
+	if (!__atomic_load_n(&blob->io_device_registered, __ATOMIC_ACQUIRE) ||
+	    bs_channel_init(blob->bs, channel) != 0) {
+		spdk_put_io_channel(bs_io_channel);
+		return -1;
+	}
+
+	channel->bs_io_channel = bs_io_channel;
+	root = spdk_io_channel_get_ctx(bs_io_channel);
+	TAILQ_INSERT_TAIL(&root->thread_channels, channel, thread_link);
+
+	return 0;
+}
+
+static void
+blob_channel_destroy(void *io_device, void *ctx_buf)
+{
+	struct spdk_bs_channel *channel = ctx_buf;
+	struct spdk_io_channel *bs_io_channel = channel->bs_io_channel;
+	struct spdk_bs_channel *root = spdk_io_channel_get_ctx(bs_io_channel);
+
+	(void)io_device;
+	TAILQ_REMOVE(&root->thread_channels, channel, thread_link);
+	bs_channel_fini(channel, false);
+	spdk_put_io_channel(bs_io_channel);
 }
 
 static void
@@ -10103,6 +10201,9 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
+	__atomic_store_n(&blob->io_device_registered, true, __ATOMIC_RELEASE);
+	spdk_io_device_register(blob, blob_channel_create, blob_channel_destroy,
+				sizeof(struct spdk_bs_channel), "blob");
 	blob->open_ref++;
 
 	spdk_bit_array_set(blob->bs->open_blobids, blob->id);
@@ -10826,6 +10927,16 @@ spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_ar
 struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs)
 {
 	return spdk_get_io_channel(bs);
+}
+
+struct spdk_io_channel *
+spdk_blob_alloc_io_channel(struct spdk_blob *blob)
+{
+	if (blob == NULL || !__atomic_load_n(&blob->io_device_registered, __ATOMIC_ACQUIRE)) {
+		return NULL;
+	}
+
+	return spdk_get_io_channel(blob);
 }
 
 void
@@ -11741,7 +11852,7 @@ spdk_blob_get_esnap_id(struct spdk_blob *blob, const void **id, size_t *len)
 struct blob_esnap_channel *
 blob_esnap_get_channel(struct spdk_io_channel *ch, struct spdk_blob *blob)
 {
-	struct spdk_bs_channel		*bs_channel = spdk_io_channel_get_ctx(ch);
+	struct spdk_bs_channel		*bs_channel = bs_channel_get_root(spdk_io_channel_get_ctx(ch));
 	struct spdk_bs_dev		*bs_dev = blob->back_bs_dev;
 	struct blob_esnap_channel	find = {};
 	struct blob_esnap_channel	*esnap_channel, *existing;
@@ -11886,13 +11997,24 @@ blob_esnap_destroy_one_channel(struct spdk_io_channel_iter *i)
 		assert(esnap_channel->bs_dev == bs_dev);
 
 		if (ctx->abort_io) {
+			TAILQ_HEAD(, spdk_bs_request_set) abort_ops;
+			struct spdk_bs_channel *sub_ch;
 			spdk_bs_user_op_t *op, *tmp;
 
-			TAILQ_FOREACH_SAFE(op, &bs_channel->queued_io, link, tmp) {
-				if (op->back_channel == esnap_channel->channel) {
-					TAILQ_REMOVE(&bs_channel->queued_io, op, link);
-					bs_user_op_abort(op, -EIO);
+			TAILQ_INIT(&abort_ops);
+			TAILQ_FOREACH(sub_ch, &bs_channel->thread_channels, thread_link) {
+				TAILQ_FOREACH_SAFE(op, &sub_ch->queued_io, link, tmp) {
+					if (op->back_channel == esnap_channel->channel) {
+						TAILQ_REMOVE(&sub_ch->queued_io, op, link);
+						TAILQ_INSERT_TAIL(&abort_ops, op, link);
+					}
 				}
+			}
+
+			while (!TAILQ_EMPTY(&abort_ops)) {
+				op = TAILQ_FIRST(&abort_ops);
+				TAILQ_REMOVE(&abort_ops, op, link);
+				bs_user_op_abort(op, -EIO);
 			}
 		}
 

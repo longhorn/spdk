@@ -204,6 +204,19 @@ struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs)
 	return g_io_channel;
 }
 
+static struct spdk_blob *g_last_channel_blob;
+
+struct spdk_io_channel *
+spdk_blob_alloc_io_channel(struct spdk_blob *blob)
+{
+	if (blob == NULL) {
+		return NULL;
+	}
+
+	g_last_channel_blob = blob;
+	return spdk_bs_alloc_io_channel(NULL);
+}
+
 void
 spdk_bs_free_io_channel(struct spdk_io_channel *channel)
 {
@@ -4108,6 +4121,26 @@ lvol_snapshot_range_checksums(void)
 	free_dev(&bs_dev);
 }
 
+static void
+lvol_get_io_channel(void)
+{
+	struct spdk_lvol lvol = {};
+	struct spdk_blob blob = {};
+	struct spdk_io_channel *ch;
+
+	CU_ASSERT(spdk_lvol_get_io_channel(NULL) == NULL);
+	CU_ASSERT(spdk_lvol_get_io_channel(&lvol) == NULL);
+
+	g_last_channel_blob = NULL;
+	lvol.blob = &blob;
+	ch = spdk_lvol_get_io_channel(&lvol);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+	CU_ASSERT(g_last_channel_blob == &blob);
+
+	spdk_bs_free_io_channel(ch);
+	CU_ASSERT(g_io_channel == NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4162,6 +4195,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_set_external_parent);
 	CU_ADD_TEST(suite, lvol_snapshot_checksum);
 	CU_ADD_TEST(suite, lvol_snapshot_range_checksums);
+	CU_ADD_TEST(suite, lvol_get_io_channel);
 
 	allocate_threads(1);
 	set_thread(0);

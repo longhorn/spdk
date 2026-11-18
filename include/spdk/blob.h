@@ -1129,6 +1129,25 @@ void spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *
 struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs);
 
 /**
+ * Allocate an I/O channel dedicated to the given blob.
+ *
+ * Unlike spdk_bs_alloc_io_channel(), which shares one channel per thread across
+ * the blobstore, this allocates a channel isolated to the given blob on the
+ * calling thread. Each allocated channel owns its own request pool and metadata
+ * page buffers, so memory usage scales with the number of blobs that have an
+ * open I/O channel multiplied by the number of threads allocating one.
+ *
+ * Free the returned channel with spdk_bs_free_io_channel() before closing the
+ * last open reference to the blob. The blob must remain open while this
+ * function runs; calling it concurrently with or after spdk_blob_close() for
+ * the last reference is not supported.
+ *
+ * \param blob Open blob to allocate an I/O channel for.
+ * \return a pointer to the allocated I/O channel, or NULL on failure.
+ */
+struct spdk_io_channel *spdk_blob_alloc_io_channel(struct spdk_blob *blob);
+
+/**
  * Free the I/O channel.
  *
  * \param channel I/O channel to free.

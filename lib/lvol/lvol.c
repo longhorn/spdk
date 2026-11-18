@@ -1997,7 +1997,11 @@ spdk_lvol_close(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_ar
 struct spdk_io_channel *
 spdk_lvol_get_io_channel(struct spdk_lvol *lvol)
 {
-	return spdk_bs_alloc_io_channel(lvol->lvol_store->blobstore);
+	if (lvol == NULL) {
+		return NULL;
+	}
+
+	return spdk_blob_alloc_io_channel(lvol->blob);
 }
 
 static void
@@ -2040,7 +2044,7 @@ spdk_lvol_inflate(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	req->channel = spdk_bs_alloc_io_channel(lvol->lvol_store->blobstore);
+	req->channel = spdk_lvol_get_io_channel(lvol);
 	if (req->channel == NULL) {
 		SPDK_ERRLOG("Cannot alloc io channel for lvol inflate request\n");
 		free(req);
@@ -2081,7 +2085,7 @@ spdk_lvol_decouple_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, v
 
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	req->channel = spdk_bs_alloc_io_channel(lvol->lvol_store->blobstore);
+	req->channel = spdk_lvol_get_io_channel(lvol);
 	if (req->channel == NULL) {
 		SPDK_ERRLOG("Cannot alloc io channel for lvol inflate request\n");
 		free(req);
@@ -2684,7 +2688,7 @@ spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
 	req->lvol = lvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	req->channel = spdk_bs_alloc_io_channel(lvol->lvol_store->blobstore);
+	req->channel = spdk_lvol_get_io_channel(lvol);
 	if (req->channel == NULL) {
 		SPDK_ERRLOG("lvol %s shallow copy, cannot alloc io channel for lvol request\n", lvol->unique_id);
 		free(req);
@@ -2738,7 +2742,7 @@ spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
 	req->lvol = lvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	req->channel = spdk_bs_alloc_io_channel(lvol->lvol_store->blobstore);
+	req->channel = spdk_lvol_get_io_channel(lvol);
 	if (req->channel == NULL) {
 		SPDK_ERRLOG("lvol %s range shallow copy, cannot alloc io channel for lvol request\n",
 			    lvol->unique_id);
@@ -2809,7 +2813,7 @@ spdk_lvol_deep_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
 	req->lvol = lvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	req->channel = spdk_bs_alloc_io_channel(lvol->lvol_store->blobstore);
+	req->channel = spdk_lvol_get_io_channel(lvol);
 	if (req->channel == NULL) {
 		SPDK_ERRLOG("lvol %s deep copy, cannot alloc io channel for lvol request\n", lvol->unique_id);
 		free(req);
@@ -2993,7 +2997,7 @@ spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot,
 	req->lvol = snapshot;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	req->channel = spdk_bs_alloc_io_channel(snapshot->lvol_store->blobstore);
+	req->channel = spdk_lvol_get_io_channel(snapshot);
 	if (req->channel == NULL) {
 		SPDK_ERRLOG("lvol %s snapshot checksum, cannot alloc io channel for lvol request\n",
 			    snapshot->unique_id);
@@ -3069,7 +3073,7 @@ spdk_lvol_register_snapshot_range_checksums(struct spdk_lvol *snapshot,
 	req->lvol = snapshot;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	req->channel = spdk_bs_alloc_io_channel(snapshot->lvol_store->blobstore);
+	req->channel = spdk_lvol_get_io_channel(snapshot);
 	if (req->channel == NULL) {
 		SPDK_ERRLOG("lvol %s snapshot range checksums, cannot alloc io channel for lvol request\n",
 			    snapshot->unique_id);

@@ -168,6 +168,7 @@ struct spdk_blob {
 	/* Close callbacks may be pending while open_ref still includes their references. */
 	uint32_t close_inflight;
 	bool locked_operation_in_progress;
+	bool io_device_registered;
 	enum blob_clear_method clear_method;
 	bool extent_rle_found;
 	bool extent_table_found;
@@ -248,6 +249,10 @@ struct spdk_bs_channel {
 	TAILQ_HEAD(, spdk_bs_request_set) reqs;
 
 	struct spdk_blob_store		*bs;
+	/* Non-NULL on per-blob channels; holds the thread's blobstore channel. */
+	struct spdk_io_channel		*bs_io_channel;
+	TAILQ_HEAD(, spdk_bs_channel)	thread_channels;
+	TAILQ_ENTRY(spdk_bs_channel)	thread_link;
 
 	struct spdk_bs_dev		*dev;
 	struct spdk_io_channel		*dev_channel;
@@ -265,6 +270,12 @@ struct spdk_bs_channel {
 
 	RB_HEAD(blob_esnap_channel_tree, blob_esnap_channel) esnap_channels;
 };
+
+static inline struct spdk_bs_channel *
+bs_channel_get_root(struct spdk_bs_channel *ch)
+{
+	return ch->bs_io_channel != NULL ? spdk_io_channel_get_ctx(ch->bs_io_channel) : ch;
+}
 
 /** operation type */
 enum spdk_blob_op_type {
