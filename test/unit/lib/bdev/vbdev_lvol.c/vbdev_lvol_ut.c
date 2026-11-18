@@ -27,6 +27,7 @@ struct lvol_store_bdev *g_lvs_bdev = NULL;
 struct spdk_bdev_io *g_io = NULL;
 struct spdk_io_channel *g_ch = NULL;
 struct spdk_io_channel *g_bs_ch = NULL;
+bool g_lvol_get_io_channel_fail = false;
 
 #define DEFAULT_BDEV_NAME "bdev"
 #define DEFAULT_BDEV_UUID "a27fd8fe-d4b9-431e-a044-271016228ce4"
@@ -693,6 +694,9 @@ spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, i
 struct spdk_io_channel *spdk_lvol_get_io_channel(struct spdk_lvol *lvol)
 {
 	CU_ASSERT(lvol == g_lvol);
+	if (g_lvol_get_io_channel_fail) {
+		return NULL;
+	}
 	g_bs_ch = spdk_get_io_channel(g_lvol);
 	return g_bs_ch;
 }
@@ -1799,6 +1803,12 @@ ut_vbdev_lvol_get_io_channel(void)
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	CU_ASSERT(g_lvol != NULL);
 	CU_ASSERT(g_lvolerrno == 0);
+
+	/* Channel creation fails when the lvol I/O channel cannot be allocated */
+	g_lvol_get_io_channel_fail = true;
+	ch = spdk_get_io_channel(g_lvol);
+	CU_ASSERT(ch == NULL);
+	g_lvol_get_io_channel_fail = false;
 
 	/* Get io channel */
 	ch = _vbdev_lvol_get_io_channel(g_lvol);

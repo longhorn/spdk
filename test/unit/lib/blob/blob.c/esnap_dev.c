@@ -503,7 +503,7 @@ ut_esnap_create_with_count(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
 static struct ut_esnap_channel *
 ut_esnap_get_io_channel(struct spdk_io_channel *ch, spdk_blob_id blob_id)
 {
-	struct spdk_bs_channel	*bs_channel = spdk_io_channel_get_ctx(ch);
+	struct spdk_bs_channel	*bs_channel = bs_channel_get_root(spdk_io_channel_get_ctx(ch));
 	struct blob_esnap_channel	find = {};
 	struct blob_esnap_channel	*esnap_channel;
 

@@ -9772,6 +9772,301 @@ blob_esnap_shared_bs_channel_free(void)
 	set_thread(start_thread);
 }
 
+struct isolated_cow_counter {
+	uint32_t completed;
+	int first_err;
+};
+
+static void
+isolated_cow_write_cb(void *arg, int bserrno)
+{
+	struct isolated_cow_counter *cnt = arg;
+
+	if (bserrno != 0 && cnt->first_err == 0) {
+		cnt->first_err = bserrno;
+	}
+	cnt->completed++;
+}
+
+/*
+ * spdk_blob_alloc_io_channel() isolates each blob's request pool and CoW queue on a thread.
+ * Exhausting one esnap clone's channel while its CoW read is stalled must not block CoW writes
+ * or reads on another blob's channel on the same thread (longhorn/longhorn#14589).
+ */
+static void
+blob_channel_isolation_under_stalled_esnap_cow(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct ut_esnap_opts esnap_opts;
+	struct spdk_blob *esnap_blob, *other_blob;
+	struct ut_esnap_dev *esnap_dev;
+	struct spdk_io_channel *ch_esnap, *ch_esnap_dup, *ch_other;
+	struct isolated_cow_counter cow_cnt = {};
+	uint64_t start_thread = g_ut_thread_id;
+	uint32_t blocklen = bs->io_unit_size;
+	uint32_t max_ops = bs->max_channel_ops;
+	uint32_t i;
+	int nomem_err = 0;
+	bool destroyed = false;
+	char write_buf[blocklen];
+	char read_buf[blocklen];
+
+	SPDK_CU_ASSERT_FATAL(g_ut_num_threads > 1);
+	CU_ASSERT(spdk_blob_alloc_io_channel(NULL) == NULL);
+
+	set_thread(0);
+	memset(write_buf, 0x5a, sizeof(write_buf));
+	memset(read_buf, 0, sizeof(read_buf));
+
+	ut_esnap_opts_init(blocklen, 2048, "isolated_cow_esnap", &destroyed, &esnap_opts);
+	ut_spdk_blob_opts_init(&opts);
+	opts.esnap_id = &esnap_opts;
+	opts.esnap_id_len = sizeof(esnap_opts);
+	opts.num_clusters = 4;
+	esnap_blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(esnap_blob != NULL);
+	esnap_dev = (struct ut_esnap_dev *)esnap_blob->back_bs_dev;
+	SPDK_CU_ASSERT_FATAL(esnap_dev != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 4;
+	other_blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(other_blob != NULL);
+
+	set_thread(1);
+	ch_esnap = spdk_blob_alloc_io_channel(esnap_blob);
+	SPDK_CU_ASSERT_FATAL(ch_esnap != NULL);
+	ch_esnap_dup = spdk_blob_alloc_io_channel(esnap_blob);
+	CU_ASSERT(ch_esnap_dup == ch_esnap);
+	spdk_bs_free_io_channel(ch_esnap_dup);
+
+	ch_other = spdk_blob_alloc_io_channel(other_blob);
+	SPDK_CU_ASSERT_FATAL(ch_other != NULL);
+	CU_ASSERT(ch_other != ch_esnap);
+
+	/*
+	 * Stall the first CoW read on esnap_blob and fill its entire channel request pool:
+	 * 1 request_set for the in-flight CoW sequence + (max_ops - 1) queued user_ops = max_ops.
+	 */
+	esnap_dev->defer_read = true;
+	for (i = 0; i < max_ops - 1; i++) {
+		spdk_blob_io_write(esnap_blob, ch_esnap, write_buf, 0, 1,
+				   isolated_cow_write_cb, &cow_cnt);
+	}
+	poll_threads();
+	CU_ASSERT(cow_cnt.completed == 0);
+	CU_ASSERT(esnap_dev->num_channels == 1);
+
+	/* One more write on ch_esnap must fail immediately with -ENOMEM. */
+	spdk_blob_io_write(esnap_blob, ch_esnap, write_buf, 0, 1, blob_op_complete, &nomem_err);
+	CU_ASSERT(nomem_err == -ENOMEM);
+
+	/* On the same thread, CoW writes and reads on other_blob's dedicated channel succeed. */
+	g_bserrno = 0xbad;
+	spdk_blob_io_write(other_blob, ch_other, write_buf, 0, 1, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	g_bserrno = 0xbad;
+	spdk_blob_io_read(other_blob, ch_other, read_buf, 0, 1, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(write_buf, read_buf, sizeof(write_buf)) == 0);
+
+	g_bserrno = 0xbad;
+	spdk_blob_io_read(other_blob, ch_other, read_buf, bs->cluster_sz / blocklen, 1,
+			  bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Completing the stalled esnap read drains all queued CoW writes on ch_esnap. */
+	ut_esnap_complete_deferred_read(esnap_dev);
+	poll_threads();
+	CU_ASSERT(cow_cnt.completed == max_ops - 1);
+	CU_ASSERT(cow_cnt.first_err == 0);
+
+	spdk_bs_free_io_channel(ch_esnap);
+	spdk_bs_free_io_channel(ch_other);
+	set_thread(0);
+	poll_threads();
+	CU_ASSERT(esnap_dev->num_channels == 0);
+
+	ut_blob_close_and_delete(bs, other_blob);
+	ut_blob_close_and_delete(bs, esnap_blob);
+	CU_ASSERT(destroyed);
+
+	set_thread(start_thread);
+}
+
+/*
+ * Verify freeze/unfreeze queued I/O execution and esnap parent replacement channel draining
+ * on a thread that only holds a per-blob channel from spdk_blob_alloc_io_channel().
+ */
+static void
+blob_channel_freeze_and_esnap_replace(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct ut_esnap_opts esnap1_opts, esnap2_opts;
+	struct spdk_blob *blob;
+	struct ut_esnap_dev *esnap_dev1;
+	struct spdk_bs_dev *bs_dev2;
+	struct spdk_thread *thread1;
+	struct spdk_io_channel *ch1;
+	uint64_t start_thread = g_ut_thread_id;
+	uint32_t blocklen = bs->io_unit_size;
+	bool destroyed1 = false, destroyed2 = false;
+	int held_err = 0xbad, queued_err = 0xbad;
+	char buf1[blocklen], buf2[blocklen];
+
+	SPDK_CU_ASSERT_FATAL(g_ut_num_threads > 1);
+	set_thread(0);
+
+	ut_esnap_opts_init(blocklen, 2048, "blob_ch_esnap1", &destroyed1, &esnap1_opts);
+	ut_spdk_blob_opts_init(&opts);
+	opts.esnap_id = &esnap1_opts;
+	opts.esnap_id_len = sizeof(esnap1_opts);
+	opts.num_clusters = 4;
+	blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob != NULL);
+	esnap_dev1 = (struct ut_esnap_dev *)blob->back_bs_dev;
+
+	set_thread(1);
+	thread1 = spdk_get_thread();
+	ch1 = spdk_blob_alloc_io_channel(blob);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+
+	/* Hold an in-flight read on ch1 while replacing the esnap parent on thread 0. */
+	esnap_dev1->hold_reads = true;
+	spdk_blob_io_read(blob, ch1, buf1, 0, 1, blob_op_complete, &held_err);
+	set_thread(0);
+	poll_threads();
+	esnap_dev1->hold_reads = false;
+	CU_ASSERT(ut_esnap_num_held_reads(esnap_dev1) == 1);
+
+	ut_esnap_opts_init(blocklen, 2048, "blob_ch_esnap2", &destroyed2, &esnap2_opts);
+	bs_dev2 = ut_esnap_dev_alloc(&esnap2_opts);
+	SPDK_CU_ASSERT_FATAL(bs_dev2 != NULL);
+	g_bserrno = 0xbad;
+	spdk_blob_set_esnap_bs_dev(blob, bs_dev2, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0xbad);
+
+	/* Submit a read on ch1 while blob is frozen; it must queue on ch1 and run on unfreeze. */
+	set_thread(1);
+	spdk_blob_io_read(blob, ch1, buf2, 1, 1, blob_op_complete, &queued_err);
+	set_thread(0);
+	poll_threads();
+	CU_ASSERT(queued_err == 0xbad);
+
+	ut_esnap_complete_held_reads(esnap_dev1, thread1);
+	poll_threads();
+	CU_ASSERT(held_err == 0);
+	CU_ASSERT(queued_err == 0);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(destroyed1);
+	CU_ASSERT(!destroyed2);
+
+	set_thread(1);
+	spdk_bs_free_io_channel(ch1);
+	set_thread(0);
+	poll_threads();
+
+	ut_blob_close_and_delete(bs, blob);
+	CU_ASSERT(destroyed2);
+
+	set_thread(start_thread);
+}
+
+/*
+ * Verify blob_free() defers freeing struct spdk_blob via spdk_io_device_unregister()
+ * when per-blob channel teardown (put_io_channel) is still pending on another thread,
+ * including multi-reference close ordering used by internal lvol operations.
+ */
+static void
+blob_channel_async_close_teardown(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob raw_unopened_blob = {};
+	struct spdk_blob *blob1, *blob2;
+	spdk_blob_id blobid1, blobid2;
+	struct spdk_io_channel *ch1, *ch2, *ch2_dup;
+	uint64_t start_thread = g_ut_thread_id;
+
+	SPDK_CU_ASSERT_FATAL(g_ut_num_threads > 1);
+	CU_ASSERT(spdk_blob_alloc_io_channel(&raw_unopened_blob) == NULL);
+
+	set_thread(0);
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 2;
+	blob1 = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob1 != NULL);
+	blobid1 = spdk_blob_get_id(blob1);
+
+	blob2 = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob2 != NULL);
+	blobid2 = spdk_blob_get_id(blob2);
+	g_bserrno = 0xbad;
+	g_blob = NULL;
+	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blob == blob2);
+
+	set_thread(1);
+	ch1 = spdk_blob_alloc_io_channel(blob1);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+	ch2 = spdk_blob_alloc_io_channel(blob2);
+	SPDK_CU_ASSERT_FATAL(ch2 != NULL);
+
+	/*
+	 * Case 1: Queue async put_io_channel on thread 1 without polling, then immediately
+	 * close clean blob1 synchronously on thread 0 while ch1 refcnt is still held.
+	 */
+	spdk_bs_free_io_channel(ch1);
+	set_thread(0);
+	g_bserrno = 0xbad;
+	spdk_blob_close(blob1, bs_op_complete, NULL);
+	CU_ASSERT(g_bserrno == 0);
+	poll_threads();
+
+	/*
+	 * Case 2: With two open references on blob2 (mirroring an open lvol whose internal
+	 * copy/inflate/checksum operation opens and closes a second reference before its
+	 * completion callback frees the channel), close the inner reference first, verify
+	 * the channel remains active while one reference is still open, then release ch2
+	 * on thread 1 before closing the final reference on thread 0.
+	 */
+	g_bserrno = 0xbad;
+	spdk_blob_close(blob2, bs_op_complete, NULL);
+	CU_ASSERT(g_bserrno == 0);
+	set_thread(1);
+	ch2_dup = spdk_blob_alloc_io_channel(blob2);
+	CU_ASSERT(ch2_dup == ch2);
+	spdk_bs_free_io_channel(ch2_dup);
+	spdk_bs_free_io_channel(ch2);
+	set_thread(0);
+	g_bserrno = 0xbad;
+	spdk_blob_close(blob2, bs_op_complete, NULL);
+	CU_ASSERT(g_bserrno == 0);
+	poll_threads();
+
+	g_bserrno = 0xbad;
+	spdk_bs_delete_blob(bs, blobid1, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	g_bserrno = 0xbad;
+	spdk_bs_delete_blob(bs, blobid2, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	set_thread(start_thread);
+}
+
 static void
 freeze_done(void *cb_arg, int bserrno)
 {
@@ -13505,6 +13800,9 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_esnap_io_512_4096);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_thread_add_remove);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_shared_bs_channel_free);
+		CU_ADD_TEST(suite_esnap_bs, blob_channel_isolation_under_stalled_esnap_cow);
+		CU_ADD_TEST(suite_esnap_bs, blob_channel_freeze_and_esnap_replace);
+		CU_ADD_TEST(suite_esnap_bs, blob_channel_async_close_teardown);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_snapshot);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_inflate);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_decouple);

@@ -357,11 +357,16 @@ struct spdk_lvol *spdk_lvol_get_by_uuid(const struct spdk_uuid *uuid);
 struct spdk_lvol *spdk_lvol_get_by_names(const char *lvs_name, const char *lvol_name);
 
 /**
- * Get I/O channel of bdev associated with specified lvol.
+ * Get an I/O channel dedicated to the specified lvol on the calling thread.
  *
- * \param lvol Handle to lvol.
+ * The channel is isolated from other lvols on the same lvolstore; channel
+ * memory scales with the number of lvols that have an open I/O channel
+ * multiplied by the number of threads allocating one. Release it with
+ * spdk_put_io_channel() before closing the lvol.
  *
- * \return a pointer to the I/O channel.
+ * \param lvol Handle to an open lvol.
+ *
+ * \return a pointer to the I/O channel, or NULL on failure.
  */
 struct spdk_io_channel *spdk_lvol_get_io_channel(struct spdk_lvol *lvol);
 

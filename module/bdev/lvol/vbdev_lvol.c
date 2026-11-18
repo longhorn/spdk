@@ -174,6 +174,9 @@ vbdev_lvol_channel_create(void *io_device, void *ctx_buf)
 	struct freeze_range		*range;
 
 	channel->bs_channel = spdk_lvol_get_io_channel(lvol);
+	if (channel->bs_channel == NULL) {
+		return -1;
+	}
 	TAILQ_INIT(&channel->submitted_io);
 	TAILQ_INIT(&channel->queued_io);
 	TAILQ_INIT(&channel->freezed_ranges);
