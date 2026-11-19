@@ -14,6 +14,8 @@
 
 /* Default blob channel opts for lvol */
 #define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 512
+/* Number of metadata reads in flight during dirty blobstore recovery */
+#define SPDK_LVOL_BLOB_OPTS_RECOVERY_QD 16
 
 #define LVOL_NAME "name"
 #define LVOL_CREATION_TIME "creation_time"
@@ -488,6 +490,7 @@ lvs_bs_opts_init(struct spdk_bs_opts *opts)
 {
 	spdk_bs_opts_init(opts, sizeof(*opts));
 	opts->max_channel_ops = SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS;
+	opts->recovery_qd = SPDK_LVOL_BLOB_OPTS_RECOVERY_QD;
 }
 
 static void

@@ -337,8 +337,24 @@ struct spdk_bs_opts {
 	 * Context to pass with esnap_bs_dev_create.
 	 */
 	void *esnap_ctx;
+
+	/**
+	 * Queue depth for batched dirty recovery.
+	 *
+	 * Phase 1 scans the contiguous metadata region in chunks. Phase 2 replays
+	 * discovered metadata chains. The actual QD may be lower when there are
+	 * fewer chunks or chains to process.
+	 *
+	 * Failed scan reads are retried one page at a time. During batched replay,
+	 * unreadable or invalid referenced metadata fails the load without writing
+	 * recovery masks.
+	 *
+	 * A value of 0 or 1 uses the serial recovery path.
+	 * Default: 0.
+	 */
+	uint32_t recovery_qd;
 } __attribute__((packed));
-SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 88, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 92, "Incorrect size");
 
 /**
  * Initialize a spdk_bs_opts structure to the default blobstore option values.

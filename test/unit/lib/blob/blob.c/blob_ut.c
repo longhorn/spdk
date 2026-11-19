@@ -4048,7 +4048,7 @@ super_block_crc(void)
  *   verify the third blob, it should correct.
  */
 static void
-blob_dirty_shutdown(void)
+blob_dirty_shutdown_common(uint32_t recovery_qd)
 {
 	int rc;
 	int index;
@@ -4062,6 +4062,10 @@ blob_dirty_shutdown(void)
 	uint32_t page_num;
 	struct spdk_blob_md_page *page;
 	struct spdk_blob_opts blob_opts;
+	struct spdk_bs_opts bs_opts;
+
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = recovery_qd;
 
 	/* Create first blob */
 	blobid1 = spdk_blob_get_id(blob);
@@ -4106,7 +4110,7 @@ blob_dirty_shutdown(void)
 	g_blob = NULL;
 	g_blobid = SPDK_BLOBID_INVALID;
 
-	ut_bs_dirty_load(&bs, NULL);
+	ut_bs_dirty_load(&bs, &bs_opts);
 
 	/* Get the super blob */
 	spdk_bs_get_super(bs, blob_op_with_id_complete, NULL);
@@ -4145,7 +4149,7 @@ blob_dirty_shutdown(void)
 	g_blob = NULL;
 	g_blobid = SPDK_BLOBID_INVALID;
 
-	ut_bs_dirty_load(&bs, NULL);
+	ut_bs_dirty_load(&bs, &bs_opts);
 
 	spdk_bs_open_blob(bs, blobid1, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4188,7 +4192,7 @@ blob_dirty_shutdown(void)
 	g_blob = NULL;
 	g_blobid = SPDK_BLOBID_INVALID;
 
-	ut_bs_dirty_load(&bs, NULL);
+	ut_bs_dirty_load(&bs, &bs_opts);
 
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4210,7 +4214,7 @@ blob_dirty_shutdown(void)
 
 	free_clusters = spdk_bs_free_cluster_count(bs);
 
-	ut_bs_dirty_load(&bs, NULL);
+	ut_bs_dirty_load(&bs, &bs_opts);
 
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4296,7 +4300,7 @@ blob_dirty_shutdown(void)
 
 	free_clusters = spdk_bs_free_cluster_count(bs);
 
-	ut_bs_dirty_load(&bs, NULL);
+	ut_bs_dirty_load(&bs, &bs_opts);
 
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4310,6 +4314,1133 @@ blob_dirty_shutdown(void)
 	blob = g_blob;
 
 	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
+}
+
+static void
+blob_batch_result(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	int *result = cb_arg;
+
+	*result = bserrno;
+}
+
+static void
+blob_batch_read_error(void)
+{
+	struct spdk_bs_request_set set = {};
+	int result = -1;
+
+	bs_sequence_to_batch(&set, blob_batch_result, &result);
+	set.u.batch.outstanding_ops = 2;
+	bs_batch_close(&set);
+	bs_batch_completion(NULL, &set, -EIO);
+	CU_ASSERT(result == -1);
+	bs_batch_completion(NULL, &set, 0);
+	CU_ASSERT(result == -EIO);
+
+	/* A successful single-page retry clears the previous error. */
+	set.u.sequence.cb_fn = blob_batch_result;
+	set.u.sequence.cb_arg = &result;
+	bs_sequence_completion(NULL, &set, 0);
+	CU_ASSERT(set.bserrno == 0);
+	bs_sequence_to_batch(&set, blob_batch_result, &result);
+	set.u.batch.outstanding_ops = 2;
+	bs_batch_completion(NULL, &set, 0);
+	bs_batch_completion(NULL, &set, 0);
+	bs_batch_close(&set);
+	CU_ASSERT(result == 0);
+
+	/* Also preserve errors when all I/Os complete before batch_close(). */
+	bs_sequence_to_batch(&set, blob_batch_result, &result);
+	set.u.batch.outstanding_ops = 2;
+	bs_batch_completion(NULL, &set, -EIO);
+	bs_batch_completion(NULL, &set, 0);
+	bs_batch_close(&set);
+	CU_ASSERT(result == -EIO);
+}
+
+enum blob_recovery_read_fault {
+	BLOB_RECOVERY_SCAN_TRANSIENT_ERROR,
+	BLOB_RECOVERY_SCAN_PERSISTENT_ERROR,
+	BLOB_RECOVERY_REPLAY_READ_ERROR,
+	BLOB_RECOVERY_REPLAY_BAD_CRC,
+};
+
+static uint64_t g_recovery_failed_lba;
+static uint32_t g_recovery_read_failures;
+static uint32_t g_recovery_matching_reads;
+static enum blob_recovery_read_fault g_recovery_read_fault;
+
+static void
+blob_recovery_read_error_cpl(void *arg)
+{
+	struct spdk_bs_dev_cb_args *cb_args = arg;
+
+	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EIO);
+}
+
+static void
+blob_recovery_read_error(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			 void *payload, uint64_t lba, uint32_t lba_count,
+			 struct spdk_bs_dev_cb_args *cb_args)
+{
+	if (lba <= g_recovery_failed_lba && g_recovery_failed_lba - lba < lba_count) {
+		g_recovery_matching_reads++;
+		if (g_recovery_read_fault == BLOB_RECOVERY_SCAN_PERSISTENT_ERROR ||
+		    (g_recovery_read_fault == BLOB_RECOVERY_SCAN_TRANSIENT_ERROR &&
+		     g_recovery_matching_reads == 1) ||
+		    (g_recovery_read_fault >= BLOB_RECOVERY_REPLAY_READ_ERROR &&
+		     g_recovery_matching_reads == 2)) {
+			g_recovery_read_failures++;
+			if (g_recovery_read_fault == BLOB_RECOVERY_REPLAY_BAD_CRC) {
+				/* Scan saw a valid root; replay must reject a different, invalid page. */
+				dev_read(dev, channel, payload, lba, lba_count, cb_args);
+				((struct spdk_blob_md_page *)payload)->crc ^= 1;
+			} else {
+				/* Complete before the next chunk, leaving the failed buffer untouched. */
+				spdk_thread_send_msg(spdk_get_thread(), blob_recovery_read_error_cpl, cb_args);
+			}
+			return;
+		}
+	}
+
+	dev_read(dev, channel, payload, lba, lba_count, cb_args);
+}
+
+static void
+blob_dirty_recovery_read_error_common(enum blob_recovery_read_fault fault)
+{
+	struct spdk_bs_opts opts;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	struct spdk_bs_super_block dirty_super;
+	uint64_t free_clusters, write_bytes;
+
+	/* Ensure discovery submits two chunks, with a root in the failing first chunk. */
+	bs_free(g_bs);
+	g_bs = NULL;
+	memset(g_dev_buffer, 0, DEV_BUFFER_SIZE);
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	opts.num_md_pages = 2 * BS_RECOVERY_SCAN_CHUNK_SIZE / g_phys_blocklen;
+	opts.recovery_qd = 2;
+	dev = init_dev();
+	spdk_bs_init(dev, &opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	blob = ut_blob_create_and_open(g_bs, NULL);
+	blobid = spdk_blob_get_id(blob);
+	CU_ASSERT(bs_blobid_to_page(blobid) < BS_RECOVERY_SCAN_CHUNK_SIZE / g_bs->md_page_size);
+	spdk_blob_resize(blob, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	free_clusters = spdk_bs_free_cluster_count(g_bs);
+	g_recovery_failed_lba = bs_md_page_to_lba(g_bs, bs_blobid_to_page(blobid));
+	g_recovery_read_failures = 0;
+	g_recovery_matching_reads = 0;
+	g_recovery_read_fault = fault;
+	g_bs_recovery_batched_fallback_count = 0;
+	memcpy(&dirty_super, g_dev_buffer, sizeof(dirty_super));
+	write_bytes = g_dev_write_bytes;
+	bs_free(g_bs);
+	g_bs = NULL;
+	dev = init_dev();
+	dev->read = blob_recovery_read_error;
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+
+	if (fault != BLOB_RECOVERY_SCAN_TRANSIENT_ERROR) {
+		CU_ASSERT(g_bserrno == (fault == BLOB_RECOVERY_REPLAY_BAD_CRC ? -EILSEQ : -EIO));
+		CU_ASSERT(g_bs == NULL);
+		CU_ASSERT(g_recovery_read_failures ==
+			  (fault == BLOB_RECOVERY_SCAN_PERSISTENT_ERROR ? 2 : 1));
+		CU_ASSERT(g_dev_write_bytes == write_bytes);
+		CU_ASSERT(memcmp(&dirty_super, g_dev_buffer, sizeof(dirty_super)) == 0);
+	} else {
+		CU_ASSERT(g_bserrno == 0);
+		SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+		CU_ASSERT(g_recovery_read_failures == 1);
+		CU_ASSERT(spdk_bs_free_cluster_count(g_bs) == free_clusters);
+		spdk_bs_open_blob(g_bs, blobid, blob_op_with_handle_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+		CU_ASSERT(spdk_blob_get_num_clusters(g_blob) == 4);
+		spdk_blob_close(g_blob, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		g_blob = NULL;
+	}
+	CU_ASSERT(g_bs_recovery_batched_fallback_count == 0);
+}
+
+static void
+blob_dirty_recovery_scan_read_retry(void)
+{
+	blob_dirty_recovery_read_error_common(BLOB_RECOVERY_SCAN_TRANSIENT_ERROR);
+}
+
+static void
+blob_dirty_recovery_scan_read_failure(void)
+{
+	blob_dirty_recovery_read_error_common(BLOB_RECOVERY_SCAN_PERSISTENT_ERROR);
+}
+
+static void
+blob_dirty_recovery_replay_read_failure(void)
+{
+	blob_dirty_recovery_read_error_common(BLOB_RECOVERY_REPLAY_READ_ERROR);
+}
+
+static void
+blob_dirty_recovery_replay_bad_crc(void)
+{
+	blob_dirty_recovery_read_error_common(BLOB_RECOVERY_REPLAY_BAD_CRC);
+}
+
+static void
+blob_dirty_recovery_multiple_extent_pages_common(uint32_t recovery_qd, bool fallback)
+{
+	struct spdk_blob_opts opts;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+	spdk_blob_id blobid;
+	uint64_t offset, free_clusters;
+	uint8_t data[DEV_BUFFER_BLOCKLEN], readback[DEV_BUFFER_BLOCKLEN];
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.use_extent_table = true;
+	opts.thin_provision = true;
+	opts.num_clusters = SPDK_EXTENTS_PER_EP + 1;
+	blob = ut_blob_create_and_open(g_bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	channel = spdk_bs_alloc_io_channel(g_bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	offset = SPDK_EXTENTS_PER_EP * bs_io_units_per_cluster(blob);
+	memset(data, 0x5a, sizeof(data));
+	spdk_blob_io_write(blob, channel, data, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(data, 0xa5, sizeof(data));
+	spdk_blob_io_write(blob, channel, data, offset, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob->active.extent_pages[0] != 0);
+	CU_ASSERT(blob->active.extent_pages[1] != 0);
+	spdk_bs_free_io_channel(channel);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	free_clusters = spdk_bs_free_cluster_count(g_bs);
+
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = recovery_qd;
+	g_bs_recovery_batched_fallback_count = 0;
+	bs_free(g_bs);
+	g_bs = NULL;
+	spdk_bs_load(init_dev(), &bs_opts, bs_op_with_handle_complete, NULL);
+	if (fallback) {
+		MOCK_ENQUEUE(spdk_zmalloc, NULL);
+	}
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	CU_ASSERT(g_bs_recovery_batched_fallback_count == 0);
+	CU_ASSERT(spdk_bs_free_cluster_count(g_bs) == free_clusters);
+	spdk_bs_open_blob(g_bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 2);
+	channel = spdk_bs_alloc_io_channel(g_bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	spdk_blob_io_read(blob, channel, readback, offset, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(data, readback, sizeof(data)) == 0);
+	memset(data, 0x5a, sizeof(data));
+	spdk_blob_io_read(blob, channel, readback, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(data, readback, sizeof(data)) == 0);
+	spdk_bs_free_io_channel(channel);
+	ut_blob_close_and_delete(g_bs, blob);
+}
+
+static void
+blob_dirty_recovery_multiple_extent_pages(void)
+{
+	blob_dirty_recovery_multiple_extent_pages_common(0, false);
+}
+
+static void
+blob_dirty_recovery_multiple_extent_pages_batched(void)
+{
+	blob_dirty_recovery_multiple_extent_pages_common(8, false);
+}
+
+static void
+blob_dirty_recovery_multiple_extent_pages_fallback(void)
+{
+	blob_dirty_recovery_multiple_extent_pages_common(8, true);
+}
+
+static void
+blob_dirty_recovery_invalid_extents(void)
+{
+	struct spdk_blob_store bs = {};
+	struct spdk_bs_load_ctx ctx = {.bs = &bs};
+	struct spdk_blob_md_page page = {};
+	struct spdk_blob_md_descriptor_extent_rle *rle = (void *)page.descriptors;
+	struct spdk_blob_md_descriptor_extent_page *extent = (void *)page.descriptors;
+
+	bs.total_clusters = 16;
+	bs.num_free_clusters = bs.total_clusters;
+	ctx.used_clusters = spdk_bit_array_create(bs.total_clusters);
+	SPDK_CU_ASSERT_FATAL(ctx.used_clusters != NULL);
+
+	/* Do not silently truncate an incomplete RLE entry. */
+	rle->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE;
+	rle->length = sizeof(rle->extents[0]) + 1;
+	rle->extents[0].cluster_idx = 1;
+	rle->extents[0].length = 1;
+	CU_ASSERT(bs_load_replay_md_parse_page(&ctx, &page) == -EINVAL);
+
+	/* A descriptor cannot extend past the metadata page, even with a valid CRC. */
+	rle->length = sizeof(page.descriptors);
+	CU_ASSERT(bs_load_replay_md_parse_page(&ctx, &page) == -EINVAL);
+
+	/* Reject an extent crossing the end of the device before claiming any clusters. */
+	rle->length = sizeof(rle->extents[0]);
+	rle->extents[0].cluster_idx = bs.total_clusters - 1;
+	rle->extents[0].length = 2;
+	CU_ASSERT(bs_load_replay_md_parse_page(&ctx, &page) == -EINVAL);
+
+	/* Extent-page entries must also fit the used-cluster bitmap. */
+	memset(&page, 0, sizeof(page));
+	extent->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE;
+	extent->length = sizeof(extent->start_cluster_idx) + sizeof(extent->cluster_idx[0]);
+	extent->cluster_idx[0] = bs.total_clusters;
+	CU_ASSERT(bs_load_replay_md_parse_page(&ctx, &page) == -EINVAL);
+	CU_ASSERT(bs.num_free_clusters == bs.total_clusters);
+	CU_ASSERT(spdk_bit_array_count_set(ctx.used_clusters) == 0);
+	spdk_bit_array_free(&ctx.used_clusters);
+}
+
+static void
+blob_dirty_recovery_corrupt_chain_common(uint32_t recovery_qd, bool fallback)
+{
+	struct spdk_blob *blob;
+	struct spdk_blob_md_page *page;
+	spdk_blob_id blobid;
+	struct spdk_bs_opts opts;
+	uint8_t xattr[4072 - sizeof(struct spdk_blob_md_descriptor_xattr) - 5] = {};
+	struct spdk_bs_super_block dirty_super;
+	uint64_t write_bytes;
+
+	blob = ut_blob_create_and_open(g_bs, NULL);
+	blobid = spdk_blob_get_id(blob);
+	CU_ASSERT(spdk_blob_set_xattr(blob, "large", xattr, sizeof(xattr)) == 0);
+	spdk_blob_resize(blob, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	page = (void *)&g_dev_buffer[bs_md_page_to_lba(g_bs, bs_blobid_to_page(blobid)) *
+							     g_bs->dev->blocklen];
+	SPDK_CU_ASSERT_FATAL(page->next != SPDK_INVALID_MD_PAGE);
+	page = (void *)&g_dev_buffer[bs_md_page_to_lba(g_bs, page->next) * g_bs->dev->blocklen];
+	page->crc ^= 1;
+	/* A valid root references this page. It cannot be discarded as unused metadata. */
+	memcpy(&dirty_super, g_dev_buffer, sizeof(dirty_super));
+	write_bytes = g_dev_write_bytes;
+	bs_free(g_bs);
+	g_bs = NULL;
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	opts.recovery_qd = recovery_qd;
+	spdk_bs_load(init_dev(), &opts, bs_op_with_handle_complete, NULL);
+	if (fallback) {
+		/* Fail only the scan buffer allocation; the serial page allocation succeeds. */
+		MOCK_ENQUEUE(spdk_zmalloc, NULL);
+	}
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EILSEQ);
+	CU_ASSERT(g_bs == NULL);
+	CU_ASSERT(g_dev_write_bytes == write_bytes);
+	CU_ASSERT(memcmp(&dirty_super, g_dev_buffer, sizeof(dirty_super)) == 0);
+}
+
+static void
+blob_dirty_recovery_corrupt_chain(void)
+{
+	blob_dirty_recovery_corrupt_chain_common(0, false);
+}
+
+static void
+blob_dirty_recovery_corrupt_chain_batched(void)
+{
+	blob_dirty_recovery_corrupt_chain_common(8, false);
+}
+
+static void
+blob_dirty_recovery_corrupt_chain_fallback(void)
+{
+	blob_dirty_recovery_corrupt_chain_common(8, true);
+}
+
+static void
+blob_dirty_recovery_force_write_failure_common(uint32_t recovery_qd)
+{
+	struct spdk_blob *blob;
+	struct spdk_bs_opts opts;
+	struct spdk_bs_super_block *super = (void *)g_dev_buffer;
+	struct spdk_bs_md_mask *mask;
+	struct spdk_power_failure_thresholds thresholds = {.write_threshold = 2};
+	spdk_blob_id blobid;
+	uint64_t free_clusters;
+	uint32_t md_page_size = g_bs->md_page_size;
+
+	blob = ut_blob_create_and_open(g_bs, NULL);
+	blobid = spdk_blob_get_id(blob);
+	spdk_blob_resize(blob, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	free_clusters = spdk_bs_free_cluster_count(g_bs);
+	spdk_bs_unload(g_bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+	CU_ASSERT(super->clean == 1);
+
+	/* Force recovery repairs a stale blobid mask despite a clean superblock. */
+	mask = (void *)&g_dev_buffer[(uint64_t)super->used_blobid_mask_start * md_page_size];
+	memset(mask->mask, 0, spdk_divide_round_up(mask->length, 8));
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	opts.force_recover = true;
+	opts.recovery_qd = recovery_qd;
+	dev_set_power_failure_thresholds(thresholds);
+	spdk_bs_load(init_dev(), &opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	dev_reset_power_failure_event();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_bs == NULL);
+	CU_ASSERT(super->clean == 0);
+
+	/* A normal load must retry recovery, rather than trust the unfinished masks. */
+	spdk_bs_load(init_dev(), NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(g_bs) == free_clusters);
+	spdk_bs_open_blob(g_bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	CU_ASSERT(spdk_blob_get_num_clusters(g_blob) == 4);
+	ut_blob_close_and_delete(g_bs, g_blob);
+}
+
+static void
+blob_dirty_recovery_force_write_failure(void)
+{
+	blob_dirty_recovery_force_write_failure_common(0);
+}
+
+static void
+blob_dirty_recovery_force_write_failure_batched(void)
+{
+	blob_dirty_recovery_force_write_failure_common(8);
+}
+
+static void
+bs_load_blobid_mask_read_failure(void)
+{
+	struct spdk_power_failure_thresholds thresholds = {.read_threshold = 4};
+	uint64_t write_bytes;
+
+	spdk_bs_unload(g_bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+	write_bytes = g_dev_write_bytes;
+
+	/* Clean load reads the superblock, page mask, cluster mask, then blobid mask. */
+	dev_set_power_failure_thresholds(thresholds);
+	spdk_bs_load(init_dev(), NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	dev_reset_power_failure_event();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_bs == NULL);
+	CU_ASSERT(g_dev_write_bytes == write_bytes);
+
+	spdk_bs_load(init_dev(), NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_bs != NULL);
+}
+
+static spdk_bs_sequence_cpl g_load_pool_nomem_cpl;
+static bool g_load_pool_nomem_dev_destroyed;
+
+static void
+bs_load_pool_nomem_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	/* The final mask completion creates the cluster bit pool. */
+	MOCK_SET(calloc, NULL);
+	g_load_pool_nomem_cpl(seq, cb_arg, bserrno);
+	MOCK_CLEAR(calloc);
+}
+
+static void
+bs_load_pool_nomem_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			void *payload, uint64_t lba, uint32_t lba_count,
+			struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct spdk_bs_request_set *set = cb_args->cb_arg;
+
+	dev_read(dev, channel, payload, lba, lba_count, cb_args);
+	if (set->u.sequence.cb_fn == bs_load_used_blobids_cpl) {
+		g_load_pool_nomem_cpl = set->u.sequence.cb_fn;
+		set->u.sequence.cb_fn = bs_load_pool_nomem_cpl;
+	}
+}
+
+static void
+bs_load_pool_nomem_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			 void *payload, uint64_t lba, uint32_t lba_count,
+			 struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct spdk_bs_request_set *set = cb_args->cb_arg;
+
+	dev_write(dev, channel, payload, lba, lba_count, cb_args);
+	if (set->u.sequence.cb_fn == bs_load_write_used_clusters_cpl) {
+		g_load_pool_nomem_cpl = set->u.sequence.cb_fn;
+		set->u.sequence.cb_fn = bs_load_pool_nomem_cpl;
+	}
+}
+
+static void
+bs_load_pool_nomem_destroy(struct spdk_bs_dev *dev)
+{
+	g_load_pool_nomem_dev_destroyed = true;
+	dev_destroy(dev);
+}
+
+static void
+bs_load_pool_nomem_complete(void *cb_arg, struct spdk_blob_store *bs, int bserrno)
+{
+	/* Allow the test thread's message queue to allocate during device cleanup. */
+	MOCK_CLEAR(calloc);
+	bs_op_with_handle_complete(cb_arg, bs, bserrno);
+}
+
+static void
+bs_load_pool_nomem_common(bool dirty)
+{
+	struct spdk_blob *blob;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob_opts opts;
+	spdk_blob_id blobid;
+	uint64_t free_clusters;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 4;
+	blob = ut_blob_create_and_open(g_bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	free_clusters = spdk_bs_free_cluster_count(g_bs);
+	if (dirty) {
+		bs_free(g_bs);
+	} else {
+		spdk_bs_unload(g_bs, bs_op_complete, NULL);
+	}
+	poll_threads();
+	g_bs = NULL;
+
+	dev = init_dev();
+	dev->destroy = bs_load_pool_nomem_destroy;
+	if (dirty) {
+		dev->write = bs_load_pool_nomem_write;
+	} else {
+		dev->read = bs_load_pool_nomem_read;
+	}
+	g_load_pool_nomem_dev_destroyed = false;
+	spdk_bs_load(dev, NULL, bs_load_pool_nomem_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+	CU_ASSERT(g_bs == NULL);
+	CU_ASSERT(g_load_pool_nomem_dev_destroyed);
+
+	/* Allocation failure must release the failed store and allow a fresh load. */
+	spdk_bs_load(init_dev(), NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(g_bs) == free_clusters);
+	spdk_bs_open_blob(g_bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	CU_ASSERT(spdk_blob_get_num_clusters(g_blob) == 4);
+	ut_blob_close_and_delete(g_bs, g_blob);
+}
+
+static void
+bs_load_pool_nomem(void)
+{
+	bs_load_pool_nomem_common(false);
+}
+
+static void
+blob_dirty_recovery_pool_nomem(void)
+{
+	bs_load_pool_nomem_common(true);
+}
+
+static void
+bs_dump_read_failure_complete(void *cb_arg, int bserrno)
+{
+	g_bserrno = bserrno;
+	CU_ASSERT(g_load_pool_nomem_dev_destroyed);
+}
+
+static void
+bs_dump_blobid_mask_read_failure(void)
+{
+	struct spdk_power_failure_thresholds thresholds = {.read_threshold = 4};
+	struct spdk_bs_dev *dev;
+	FILE *fp;
+
+	spdk_bs_unload(g_bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+	fp = fopen("/dev/null", "w");
+	SPDK_CU_ASSERT_FATAL(fp != NULL);
+
+	/* Dump reads the superblock, page mask, cluster mask, then blobid mask. */
+	dev = init_dev();
+	dev->destroy = bs_load_pool_nomem_destroy;
+	g_load_pool_nomem_dev_destroyed = false;
+	g_bserrno = 0;
+	dev_set_power_failure_thresholds(thresholds);
+	spdk_bs_dump(dev, fp, NULL, bs_dump_read_failure_complete, NULL);
+	poll_threads();
+	dev_reset_power_failure_event();
+	CU_ASSERT(g_bserrno == -EIO);
+	fclose(fp);
+
+	spdk_bs_load(init_dev(), NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_bs != NULL);
+}
+
+static void
+blob_dirty_recovery_extent_page_next_common(uint32_t recovery_qd)
+{
+	struct spdk_blob_opts opts;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *blob;
+	struct spdk_blob_md_page *page;
+	struct spdk_io_channel *channel;
+	struct spdk_bs_super_block dirty_super;
+	spdk_blob_id blobid;
+	uint64_t write_bytes;
+	uint8_t data[DEV_BUFFER_BLOCKLEN] = {};
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.use_extent_table = true;
+	opts.thin_provision = true;
+	opts.num_clusters = 1;
+	blob = ut_blob_create_and_open(g_bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	channel = spdk_bs_alloc_io_channel(g_bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	spdk_blob_io_write(blob, channel, data, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(blob->active.extent_pages[0] != 0);
+	page = (void *)&g_dev_buffer[bs_md_page_to_lba(g_bs, blob->active.extent_pages[0]) *
+							     g_bs->dev->blocklen];
+	spdk_bs_free_io_channel(channel);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* A CRC-valid extent page must still end its chain, as blob load requires. */
+	SPDK_CU_ASSERT_FATAL(page->next == SPDK_INVALID_MD_PAGE);
+	page->next = bs_blobid_to_page(blobid);
+	page->crc = blob_md_page_calc_crc(page);
+	memcpy(&dirty_super, g_dev_buffer, sizeof(dirty_super));
+	write_bytes = g_dev_write_bytes;
+	bs_free(g_bs);
+	g_bs = NULL;
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = recovery_qd;
+	spdk_bs_load(init_dev(), &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EILSEQ);
+	CU_ASSERT(g_bs == NULL);
+	CU_ASSERT(g_dev_write_bytes == write_bytes);
+	CU_ASSERT(memcmp(&dirty_super, g_dev_buffer, sizeof(dirty_super)) == 0);
+}
+
+static void
+blob_dirty_recovery_extent_page_next(void)
+{
+	blob_dirty_recovery_extent_page_next_common(0);
+}
+
+static void
+blob_dirty_recovery_extent_page_next_batched(void)
+{
+	blob_dirty_recovery_extent_page_next_common(8);
+}
+
+static void
+blob_dirty_recovery_reserved_cluster_common(uint32_t recovery_qd, bool fallback)
+{
+	struct spdk_blob_opts blob_opts;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob *blob;
+	struct spdk_blob_md_page *page;
+	struct spdk_blob_md_descriptor *desc;
+	struct spdk_blob_md_descriptor_extent_rle *rle = NULL;
+	spdk_blob_id blobid;
+	struct spdk_bs_super_block dirty_super;
+	uint64_t write_bytes;
+	size_t offset;
+
+	/* Use a metadata region spanning multiple clusters, so cluster 1 is reserved. */
+	bs_free(g_bs);
+	g_bs = NULL;
+	memset(g_dev_buffer, 0, DEV_BUFFER_SIZE);
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.num_md_pages = 512;
+	bs_opts.recovery_qd = recovery_qd;
+	spdk_bs_init(init_dev(), &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.use_extent_table = false;
+	blob_opts.num_clusters = 1;
+	blob = ut_blob_create_and_open(g_bs, &blob_opts);
+	blobid = spdk_blob_get_id(blob);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	page = (void *)&g_dev_buffer[bs_md_page_to_lba(g_bs, bs_blobid_to_page(blobid)) *
+							     g_bs->dev->blocklen];
+	for (offset = 0; offset + sizeof(*desc) <= sizeof(page->descriptors);
+	     offset += sizeof(*desc) + desc->length) {
+		desc = (void *)(page->descriptors + offset);
+		if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) {
+			rle = (void *)desc;
+			break;
+		}
+	}
+	SPDK_CU_ASSERT_FATAL(rle != NULL);
+	rle->extents[0].cluster_idx = 1;
+	page->crc = blob_md_page_calc_crc(page);
+	memcpy(&dirty_super, g_dev_buffer, sizeof(dirty_super));
+	write_bytes = g_dev_write_bytes;
+	bs_free(g_bs);
+	g_bs = NULL;
+	spdk_bs_load(init_dev(), &bs_opts, bs_op_with_handle_complete, NULL);
+	if (fallback) {
+		MOCK_ENQUEUE(spdk_zmalloc, NULL);
+	}
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EILSEQ);
+	CU_ASSERT(g_bs == NULL);
+	CU_ASSERT(g_dev_write_bytes == write_bytes);
+	CU_ASSERT(memcmp(&dirty_super, g_dev_buffer, sizeof(dirty_super)) == 0);
+}
+
+static void
+blob_dirty_recovery_reserved_cluster(void)
+{
+	blob_dirty_recovery_reserved_cluster_common(0, false);
+}
+
+static void
+blob_dirty_recovery_reserved_cluster_batched(void)
+{
+	blob_dirty_recovery_reserved_cluster_common(8, false);
+}
+
+static void
+blob_dirty_recovery_reserved_cluster_fallback(void)
+{
+	blob_dirty_recovery_reserved_cluster_common(8, true);
+}
+
+static void
+blob_dirty_shutdown(void)
+{
+	blob_dirty_shutdown_common(0);
+}
+
+static void
+blob_dirty_shutdown_batched_recovery(void)
+{
+	blob_dirty_shutdown_common(8);
+}
+
+static void
+blob_dirty_shutdown_batched_recovery_fallback_after_partial_commit(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob1 = g_blob;
+	struct spdk_blob *blob2;
+	struct spdk_bs_opts bs_opts;
+	spdk_blob_id blobid1, blobid2;
+	uint64_t length1 = 1234;
+	uint64_t length2 = 5678;
+	uint64_t free_clusters;
+	const void *value;
+	size_t value_len;
+	int rc;
+
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = 8;
+
+	blobid1 = spdk_blob_get_id(blob1);
+	rc = spdk_blob_set_xattr(blob1, "length", &length1, sizeof(length1));
+	CU_ASSERT(rc == 0);
+	spdk_blob_resize(blob1, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	blob2 = ut_blob_create_and_open(bs, NULL);
+	blobid2 = spdk_blob_get_id(blob2);
+	rc = spdk_blob_set_xattr(blob2, "length", &length2, sizeof(length2));
+	CU_ASSERT(rc == 0);
+	spdk_blob_resize(blob2, 8, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	free_clusters = spdk_bs_free_cluster_count(bs);
+	spdk_blob_close(blob2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	g_bs_recovery_parse_page_fail_after = 2;
+	/* Exercise resource fallback after the first chain has updated the masks. */
+	g_bs_recovery_parse_page_fail_rc = -ENOMEM;
+	g_bs_recovery_batched_fallback_count = 0;
+	ut_bs_dirty_load(&bs, &bs_opts);
+	CU_ASSERT(g_bs_recovery_batched_fallback_count == 1);
+	CU_ASSERT(g_bs_recovery_parse_page_fail_after == 0);
+	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
+
+	spdk_bs_open_blob(bs, blobid1, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob1 = g_blob;
+	CU_ASSERT(spdk_blob_get_num_clusters(blob1) == 4);
+	value = NULL;
+	rc = spdk_blob_get_xattr_value(blob1, "length", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(value != NULL);
+	CU_ASSERT(*(uint64_t *)value == length1);
+	CU_ASSERT(value_len == sizeof(length1));
+	spdk_blob_close(blob1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob2 = g_blob;
+	CU_ASSERT(spdk_blob_get_num_clusters(blob2) == 8);
+	value = NULL;
+	rc = spdk_blob_get_xattr_value(blob2, "length", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(value != NULL);
+	CU_ASSERT(*(uint64_t *)value == length2);
+	CU_ASSERT(value_len == sizeof(length2));
+}
+
+struct blob_dirty_recovery_result {
+	uint64_t free_clusters;
+	uint32_t md_len;
+	uint32_t total_clusters;
+	uint32_t used_md_pages;
+	uint32_t used_blobids;
+	spdk_blob_id super_blob;
+	uint64_t blob1_clusters;
+	uint64_t blob2_clusters;
+	uint64_t blob1_length;
+	uint64_t blob2_length;
+	uint8_t *used_md_page_map;
+	uint8_t *used_blobid_map;
+	uint8_t *used_cluster_map;
+};
+
+static void
+blob_dirty_recovery_collect_result(struct spdk_blob_store *bs, spdk_blob_id blobid1,
+				   spdk_blob_id blobid2,
+				   struct blob_dirty_recovery_result *result)
+{
+	struct spdk_blob *blob;
+	const void *value;
+	size_t value_len;
+	uint32_t i;
+	int rc;
+
+	memset(result, 0, sizeof(*result));
+	result->free_clusters = spdk_bs_free_cluster_count(bs);
+	result->md_len = bs->md_len;
+	result->total_clusters = spdk_bit_pool_capacity(bs->used_clusters);
+	result->used_md_pages = spdk_bit_array_count_set(bs->used_md_pages);
+	result->used_blobids = spdk_bit_array_count_set(bs->used_blobids);
+	result->used_md_page_map = calloc(result->md_len, sizeof(*result->used_md_page_map));
+	result->used_blobid_map = calloc(result->md_len, sizeof(*result->used_blobid_map));
+	result->used_cluster_map = calloc(result->total_clusters, sizeof(*result->used_cluster_map));
+	SPDK_CU_ASSERT_FATAL(result->used_md_page_map != NULL);
+	SPDK_CU_ASSERT_FATAL(result->used_blobid_map != NULL);
+	SPDK_CU_ASSERT_FATAL(result->used_cluster_map != NULL);
+
+	for (i = 0; i < result->md_len; i++) {
+		result->used_md_page_map[i] = spdk_bit_array_get(bs->used_md_pages, i);
+		result->used_blobid_map[i] = spdk_bit_array_get(bs->used_blobids, i);
+	}
+
+	for (i = 0; i < result->total_clusters; i++) {
+		result->used_cluster_map[i] = spdk_bit_pool_is_allocated(bs->used_clusters, i);
+	}
+
+	spdk_bs_get_super(bs, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	result->super_blob = g_blobid;
+
+	spdk_bs_open_blob(bs, blobid1, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	result->blob1_clusters = spdk_blob_get_num_clusters(blob);
+	value = NULL;
+	rc = spdk_blob_get_xattr_value(blob, "length", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(value != NULL);
+	CU_ASSERT(value_len == sizeof(result->blob1_length));
+	result->blob1_length = *(uint64_t *)value;
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	result->blob2_clusters = spdk_blob_get_num_clusters(blob);
+	value = NULL;
+	rc = spdk_blob_get_xattr_value(blob, "length", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(value != NULL);
+	CU_ASSERT(value_len == sizeof(result->blob2_length));
+	result->blob2_length = *(uint64_t *)value;
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+}
+
+static void
+blob_dirty_recovery_result_cleanup(struct blob_dirty_recovery_result *result)
+{
+	free(result->used_md_page_map);
+	free(result->used_blobid_map);
+	free(result->used_cluster_map);
+	memset(result, 0, sizeof(*result));
+}
+
+static void
+blob_dirty_recovery_result_compare(const struct blob_dirty_recovery_result *legacy,
+				   const struct blob_dirty_recovery_result *batched)
+{
+	uint32_t i;
+
+	CU_ASSERT(legacy->free_clusters == batched->free_clusters);
+	CU_ASSERT(legacy->md_len == batched->md_len);
+	CU_ASSERT(legacy->total_clusters == batched->total_clusters);
+	CU_ASSERT(legacy->used_md_pages == batched->used_md_pages);
+	CU_ASSERT(legacy->used_blobids == batched->used_blobids);
+	CU_ASSERT(legacy->super_blob == batched->super_blob);
+	CU_ASSERT(legacy->blob1_clusters == batched->blob1_clusters);
+	CU_ASSERT(legacy->blob2_clusters == batched->blob2_clusters);
+	CU_ASSERT(legacy->blob1_length == batched->blob1_length);
+	CU_ASSERT(legacy->blob2_length == batched->blob2_length);
+
+	for (i = 0; i < legacy->md_len && i < batched->md_len; i++) {
+		CU_ASSERT(legacy->used_md_page_map[i] == batched->used_md_page_map[i]);
+		CU_ASSERT(legacy->used_blobid_map[i] == batched->used_blobid_map[i]);
+	}
+
+	for (i = 0; i < legacy->total_clusters && i < batched->total_clusters; i++) {
+		CU_ASSERT(legacy->used_cluster_map[i] == batched->used_cluster_map[i]);
+	}
+}
+
+static uint64_t g_recovery_scan_corrupt_lba;
+static uint32_t g_recovery_scan_page_lbas;
+static uint32_t g_recovery_scan_corruptions;
+
+static void
+blob_recovery_scan_corrupt_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+				void *payload, uint64_t lba, uint32_t lba_count,
+				struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct spdk_blob_md_page *page;
+
+	dev_read(dev, channel, payload, lba, lba_count, cb_args);
+	/* Discovery reads whole chunks, while replay reads one page at a time. */
+	if (lba_count > g_recovery_scan_page_lbas && lba <= g_recovery_scan_corrupt_lba &&
+	    g_recovery_scan_corrupt_lba - lba < lba_count) {
+		page = (void *)((uint8_t *)payload + (g_recovery_scan_corrupt_lba - lba) * dev->blocklen);
+		page->crc ^= 1;
+		g_recovery_scan_corruptions++;
+	}
+}
+
+static void
+blob_dirty_shutdown_recovery_compare_common(bool standard_replay)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob1 = g_blob;
+	struct spdk_blob *blob2;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_bs_dev *dev;
+	struct blob_dirty_recovery_result legacy, batched;
+	spdk_blob_id blobid1, blobid2;
+	uint64_t length1 = 1111;
+	uint64_t length2 = 2222;
+	uint8_t *dirty_image;
+	char big_xattr[3000] = {};
+	int rc;
+
+	dirty_image = malloc(DEV_BUFFER_SIZE);
+	SPDK_CU_ASSERT_FATAL(dirty_image != NULL);
+
+	blobid1 = spdk_blob_get_id(blob1);
+	rc = spdk_blob_set_xattr(blob1, "length", &length1, sizeof(length1));
+	CU_ASSERT(rc == 0);
+	spdk_blob_resize(blob1, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_set_super(bs, blobid1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	blob2 = ut_blob_create_and_open(bs, NULL);
+	blobid2 = spdk_blob_get_id(blob2);
+	rc = spdk_blob_set_xattr(blob2, "length", &length2, sizeof(length2));
+	CU_ASSERT(rc == 0);
+	/* Spread blob2 metadata over two pages. */
+	rc = spdk_blob_set_xattr(blob2, "big1", big_xattr, sizeof(big_xattr));
+	CU_ASSERT(rc == 0);
+	rc = spdk_blob_set_xattr(blob2, "big2", big_xattr, sizeof(big_xattr));
+	CU_ASSERT(rc == 0);
+	spdk_blob_resize(blob2, 8, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_sync_md(blob2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(blob2->active.num_pages > 1);
+	g_recovery_scan_corrupt_lba = bs_md_page_to_lba(bs, blob2->active.pages[1]);
+	g_recovery_scan_page_lbas = bs->md_page_size / bs->dev->blocklen;
+	spdk_blob_close(blob2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	memcpy(dirty_image, g_dev_buffer, DEV_BUFFER_SIZE);
+
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = 1;
+	bs_free(bs);
+	memcpy(g_dev_buffer, dirty_image, DEV_BUFFER_SIZE);
+	dev = init_dev();
+	spdk_bs_load(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+	blob_dirty_recovery_collect_result(bs, blobid1, blobid2, &legacy);
+
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = 8;
+	bs_free(bs);
+	memcpy(g_dev_buffer, dirty_image, DEV_BUFFER_SIZE);
+	dev = init_dev();
+	if (standard_replay) {
+		/* A page summary that misses blob2's second page forces standard replay. */
+		dev->read = blob_recovery_scan_corrupt_read;
+	}
+	g_recovery_scan_corruptions = 0;
+	g_bs_recovery_batched_fallback_count = 0;
+	spdk_bs_load(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	CU_ASSERT(g_recovery_scan_corruptions == (standard_replay ? 1 : 0));
+	CU_ASSERT(g_bs_recovery_batched_fallback_count == 0);
+	bs = g_bs;
+	blob_dirty_recovery_collect_result(bs, blobid1, blobid2, &batched);
+	blob_dirty_recovery_result_compare(&legacy, &batched);
+	blob_dirty_recovery_result_cleanup(&legacy);
+	blob_dirty_recovery_result_cleanup(&batched);
+
+	free(dirty_image);
+
+	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+}
+
+static void
+blob_dirty_shutdown_recovery_compare_legacy_and_batched(void)
+{
+	blob_dirty_shutdown_recovery_compare_common(false);
+}
+
+static void
+blob_dirty_shutdown_recovery_compare_legacy_and_standard_replay(void)
+{
+	blob_dirty_shutdown_recovery_compare_common(true);
 }
 
 static void
@@ -4467,7 +5598,8 @@ bs_version(void)
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
-	CU_ASSERT(super->clean == 1);
+	/* Rebuilding the missing v2 blobid mask marks the store dirty before writing masks. */
+	CU_ASSERT(super->clean == 0);
 	bs = g_bs;
 
 	/*
@@ -7587,11 +8719,12 @@ blobstore_clean_power_failure(void)
 }
 
 static void
-blob_delete_snapshot_power_failure(void)
+blob_delete_snapshot_power_failure_common(uint32_t recovery_qd)
 {
 	struct spdk_bs_dev *dev;
 	struct spdk_blob_store *bs;
 	struct spdk_blob_opts opts;
+	struct spdk_bs_opts bs_opts;
 	struct spdk_blob *blob, *snapshot;
 	struct spdk_power_failure_thresholds thresholds = {};
 	spdk_blob_id blobid, snapshotid;
@@ -7603,6 +8736,9 @@ blob_delete_snapshot_power_failure(void)
 	bool deleted = false;
 	int delete_snapshot_bserrno = -1;
 	uint32_t first_data_cluster;
+
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = recovery_qd;
 
 	thresholds.general_threshold = 1;
 	while (!deleted) {
@@ -7644,7 +8780,9 @@ blob_delete_snapshot_power_failure(void)
 		/* Do not shut down cleanly. Assumption is that after snapshot deletion
 		 * reports success, changes to both blobs should already persisted. */
 		dev_reset_power_failure_event();
-		ut_bs_dirty_load(&bs, NULL);
+		ut_bs_dirty_load(&bs, &bs_opts);
+		/* Snapshot crash recovery must account for each physical cluster only once. */
+		CU_ASSERT(spdk_bs_free_cluster_count(bs) == spdk_bit_pool_count_free(bs->used_clusters));
 
 		SPDK_CU_ASSERT_FATAL(spdk_bit_pool_is_allocated(bs->used_clusters, first_data_cluster));
 		SPDK_CU_ASSERT_FATAL(!spdk_bit_pool_is_allocated(bs->used_clusters, first_data_cluster + 10));
@@ -7701,11 +8839,24 @@ blob_delete_snapshot_power_failure(void)
 }
 
 static void
-blob_create_snapshot_power_failure(void)
+blob_delete_snapshot_power_failure(void)
+{
+	blob_delete_snapshot_power_failure_common(0);
+}
+
+static void
+blob_delete_snapshot_power_failure_batched_recovery(void)
+{
+	blob_delete_snapshot_power_failure_common(16);
+}
+
+static void
+blob_create_snapshot_power_failure_common(uint32_t recovery_qd)
 {
 	struct spdk_blob_store *bs = g_bs;
 	struct spdk_bs_dev *dev;
 	struct spdk_blob_opts opts;
+	struct spdk_bs_opts bs_opts;
 	struct spdk_blob *blob, *snapshot;
 	struct spdk_power_failure_thresholds thresholds = {};
 	spdk_blob_id blobid, snapshotid;
@@ -7717,6 +8868,9 @@ blob_create_snapshot_power_failure(void)
 	bool created = false;
 	int create_snapshot_bserrno = -1;
 	uint32_t first_data_cluster;
+
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.recovery_qd = recovery_qd;
 
 	thresholds.general_threshold = 1;
 	while (!created) {
@@ -7755,7 +8909,9 @@ blob_create_snapshot_power_failure(void)
 		/* Do not shut down cleanly. Assumption is that after create snapshot
 		 * reports success, both blobs should be power-fail safe. */
 		dev_reset_power_failure_event();
-		ut_bs_dirty_load(&bs, NULL);
+		ut_bs_dirty_load(&bs, &bs_opts);
+		/* Snapshot crash recovery must account for each physical cluster only once. */
+		CU_ASSERT(spdk_bs_free_cluster_count(bs) == spdk_bit_pool_count_free(bs->used_clusters));
 
 		SPDK_CU_ASSERT_FATAL(spdk_bit_pool_is_allocated(bs->used_clusters, first_data_cluster));
 		SPDK_CU_ASSERT_FATAL(!spdk_bit_pool_is_allocated(bs->used_clusters, first_data_cluster + 10));
@@ -7809,6 +8965,18 @@ blob_create_snapshot_power_failure(void)
 
 		thresholds.general_threshold++;
 	}
+}
+
+static void
+blob_create_snapshot_power_failure(void)
+{
+	blob_create_snapshot_power_failure_common(0);
+}
+
+static void
+blob_create_snapshot_power_failure_batched_recovery(void)
+{
+	blob_create_snapshot_power_failure_common(16);
 }
 
 #define IO_UT_BLOCKS_PER_CLUSTER 64
@@ -13738,6 +14906,12 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
 		CU_ADD_TEST(suite, bs_load_error);
+		CU_ADD_TEST(suite_bs, bs_load_blobid_mask_read_failure);
+		CU_ADD_TEST(suite_bs, bs_load_pool_nomem);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_pool_nomem);
+		CU_ADD_TEST(suite_bs, bs_dump_blobid_mask_read_failure);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_extent_page_next);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_extent_page_next_batched);
 		CU_ADD_TEST(suite_bs, bs_unload);
 		CU_ADD_TEST(suite, bs_unload_hotremove);
 		CU_ADD_TEST(suite, bs_cluster_sz);
@@ -13754,7 +14928,28 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_serialize_checksums_test);
 		CU_ADD_TEST(suite_bs, blob_crc);
 		CU_ADD_TEST(suite, super_block_crc);
+		CU_ADD_TEST(suite, blob_batch_read_error);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_replay_read_failure);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_replay_bad_crc);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_multiple_extent_pages);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_multiple_extent_pages_batched);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_multiple_extent_pages_fallback);
+		CU_ADD_TEST(suite, blob_dirty_recovery_invalid_extents);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_force_write_failure);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_force_write_failure_batched);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_reserved_cluster);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_reserved_cluster_batched);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_reserved_cluster_fallback);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_corrupt_chain);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_corrupt_chain_batched);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_corrupt_chain_fallback);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_scan_read_retry);
+		CU_ADD_TEST(suite_bs, blob_dirty_recovery_scan_read_failure);
 		CU_ADD_TEST(suite_blob, blob_dirty_shutdown);
+		CU_ADD_TEST(suite_blob, blob_dirty_shutdown_batched_recovery);
+		CU_ADD_TEST(suite_blob, blob_dirty_shutdown_batched_recovery_fallback_after_partial_commit);
+		CU_ADD_TEST(suite_blob, blob_dirty_shutdown_recovery_compare_legacy_and_batched);
+		CU_ADD_TEST(suite_blob, blob_dirty_shutdown_recovery_compare_legacy_and_standard_replay);
 		CU_ADD_TEST(suite_bs, blob_flags);
 		CU_ADD_TEST(suite_bs, bs_version);
 		CU_ADD_TEST(suite_bs, blob_set_xattrs_test);
@@ -13779,7 +14974,9 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_relations3);
 		CU_ADD_TEST(suite, blobstore_clean_power_failure);
 		CU_ADD_TEST(suite, blob_delete_snapshot_power_failure);
+		CU_ADD_TEST(suite, blob_delete_snapshot_power_failure_batched_recovery);
 		CU_ADD_TEST(suite, blob_create_snapshot_power_failure);
+		CU_ADD_TEST(suite, blob_create_snapshot_power_failure_batched_recovery);
 		CU_ADD_TEST(suite_bs, blob_inflate_rw);
 		CU_ADD_TEST(suite_bs, blob_inflate_unmap);
 		CU_ADD_TEST(suite_bs, blob_snapshot_freeze_io);
