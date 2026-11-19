@@ -38,6 +38,12 @@ struct ec_base_bdev_cleanup_ctx {
 	uint32_t                slot;
 	struct spdk_io_channel *reset_ch;
 	bool                    quiesced;
+	/*
+	 * Block count at the time we quiesced. A resize may land while the
+	 * quiesce is queued, so the unquiesce must use this value, not the
+	 * current bdev.blockcnt.
+	 */
+	uint64_t                quiesced_blockcnt;
 };
 
 static void ec_cleanup_close_descriptor(struct ec_base_bdev_cleanup_ctx *ctx);
@@ -207,7 +213,8 @@ ec_cleanup_close_descriptor(struct ec_base_bdev_cleanup_ctx *ctx)
 	}
 
 	if (ctx->quiesced) {
-		spdk_bdev_unquiesce(&ec->bdev, &ec_if, NULL, NULL);
+		spdk_bdev_unquiesce_range(&ec->bdev, &ec_if, 0,
+					  ctx->quiesced_blockcnt, NULL, NULL);
 	}
 
 	SPDK_NOTICELOG("EC bdev %s: async cleanup complete for slot %u\n",
@@ -368,6 +375,7 @@ ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 	ctx->ec       = ec;
 	ctx->slot     = slot;
 	ctx->quiesced = false;
+	ctx->quiesced_blockcnt = ec->bdev.blockcnt;
 
 	spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
 }
