@@ -295,6 +295,8 @@ struct ec_rebuild_ctx {
 	/* DMA-safe I/O buffers, one per slot; reused across all stripes. */
 	uint8_t         *chunk_bufs[EC_MAX_BASE_BDEVS];
 	struct iovec     chunk_iovs[EC_MAX_BASE_BDEVS];
+	/* Slots that were read into chunk_bufs, one bit per slot. */
+	uint64_t         src_slots;
 
 	/* Dedicated I/O channels, separate from user ec_io_channel instances. */
 	struct spdk_io_channel *rebuild_chans[EC_MAX_BASE_BDEVS];
@@ -508,6 +510,8 @@ struct ec_scrub_ctx {
 	uint8_t         *chunk_bufs[EC_MAX_BASE_BDEVS];
 	struct iovec     chunk_iovs[EC_MAX_BASE_BDEVS];
 	uint64_t         chunk_bytes;
+	/* Slots that were read into chunk_bufs, one bit per slot. */
+	uint64_t         src_slots;
 
 	/* write half: only parity slots */
 	uint32_t         writes_remaining;
@@ -1073,6 +1077,9 @@ struct ec_rmw_ctx {
 	 */
 	uint8_t                 *chunk_bufs[EC_MAX_BASE_BDEVS];
 	struct iovec             chunk_iovs[EC_MAX_BASE_BDEVS];
+
+	/* Slots that were read into chunk_bufs, one bit per slot. */
+	uint64_t                 src_slots;
 
 	/* Number of read completions still pending */
 	uint32_t                 reads_remaining;
@@ -2030,11 +2037,11 @@ void ec_drain_deferred_unregister(struct ec_bdev *ec);
 /* Reconstruction (ISA-L wrappers). Used by io, rmw, and rebuild paths. */
 int ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
-			      uint8_t *out_buf, uint32_t failed_slot,
-			      uint64_t chunk_len);
+			      uint64_t src_slots, uint8_t *out_buf,
+			      uint32_t failed_slot, uint64_t chunk_len);
 int ec_reconstruct_multi_data(const struct ec_bdev *ec,
 			      uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
-			      uint8_t *out_bufs[],
+			      uint64_t src_slots, uint8_t *out_bufs[],
 			      const uint32_t failed_data_slots[],
 			      uint32_t f, uint64_t chunk_len);
 

@@ -123,10 +123,10 @@ DEFINE_STUB_V(ec_io_route_complete_to_submitter, (struct ec_bdev_io *ec_io,
 /* Link-only stubs: bdev_ec_rebuild.c references these on paths the skip
  * tests never run, so a no-op definition is enough to link. */
 DEFINE_STUB(ec_reconstruct_data_chunk, int, (const struct ec_bdev *ec,
-		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint8_t *out_buf,
-		uint32_t failed_slot, uint64_t chunk_len), 0);
+		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint64_t src_slots,
+		uint8_t *out_buf, uint32_t failed_slot, uint64_t chunk_len), 0);
 DEFINE_STUB(ec_reconstruct_multi_data, int, (const struct ec_bdev *ec,
-		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint8_t *out_bufs[],
+		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint64_t src_slots, uint8_t *out_bufs[],
 		const uint32_t failed_data_slots[], uint32_t f, uint64_t chunk_len), 0);
 DEFINE_STUB(ec_wib_persist, int, (struct ec_bdev *ec, void (*cb)(void *cb_arg, int rc),
 				  void *cb_arg), 0);

@@ -43,7 +43,7 @@ DEFINE_STUB(spdk_thread_get_name, const char *, (const struct spdk_thread *threa
 DEFINE_STUB(ec_wib_persist, int, (struct ec_bdev *ec,
 				  void (*cb)(void *cb_arg, int rc), void *cb_arg), 0);
 DEFINE_STUB(ec_reconstruct_multi_data, int, (const struct ec_bdev *ec,
-		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint8_t *out_bufs[],
+		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint64_t src_slots, uint8_t *out_bufs[],
 		const uint32_t failed_data_slots[], uint32_t f, uint64_t chunk_len), 0);
 DEFINE_STUB_V(ec_encode_data, (int len, int k, int rows, unsigned char *g_tbls,
 			       unsigned char **data, unsigned char **coding));

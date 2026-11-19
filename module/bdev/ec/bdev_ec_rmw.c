@@ -384,9 +384,9 @@ ec_rmw_reads_done(struct ec_rmw_ctx *mctx)
 		uint8_t *out_bufs[EC_MAX_BASE_BDEVS];
 		uint32_t num_failed = 0;
 
-		/* Collect all unreadable DATA slots */
+		/* Collect the data slots we did not read. */
 		for (i = 0; i < ec->k; i++) {
-			if (!ec_slot_is_readable(ec, i)) {
+			if (!(mctx->src_slots & (1ULL << i))) {
 				failed_data_slots[num_failed] = i;
 				out_bufs[num_failed]          = mctx->chunk_bufs[i];
 				num_failed++;
@@ -402,6 +402,7 @@ ec_rmw_reads_done(struct ec_rmw_ctx *mctx)
 			 */
 			rc = ec_reconstruct_multi_data(ec,
 						       mctx->chunk_bufs,
+						       mctx->src_slots,
 						       out_bufs,
 						       failed_data_slots,
 						       num_failed,
@@ -875,6 +876,7 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 	 */
 	assert(spdk_get_thread() == ec_io->submitter_thread);
 	mctx->reads_remaining = 0;
+	mctx->src_slots       = 0;
 
 	for (disk = 0; disk < ec->n; disk++) {
 		if (!ec_slot_is_readable(ec, disk)) {
@@ -901,6 +903,7 @@ ec_rmw_dispatch_reads(struct ec_rmw_ctx *mctx)
 			mctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 		} else {
 			reads_submitted++;
+			mctx->src_slots |= 1ULL << disk;
 		}
 	}
 
