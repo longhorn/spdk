@@ -2919,11 +2919,188 @@ bdev_unregister_open_qos_data_race(void)
 
 	/* Poll the threads to allow all events to be processed. */
 	poll_threads();
+	CU_ASSERT(done == true);
 
 	/* Restore the original g_bdev so that we can use teardown_test(). */
 	set_thread(0);
 	register_bdev(&g_bdev, "ut_bdev", &g_io_device);
 	spdk_bdev_open_ext("ut_bdev", true, _bdev_event_cb, NULL, &g_desc);
+	teardown_test();
+}
+
+/*
+ * Mimic the bdev_set_qos_limit RPC (open desc, set limits, close desc without
+ * polling in between) on a bdev that has no I/O channels. Opening a descriptor
+ * on such a bdev triggers an asynchronous QoS enable, which must not make the
+ * following spdk_bdev_set_qos_rate_limits() fail with -EAGAIN.
+ * See https://github.com/spdk/spdk/issues/3768
+ */
+static void
+qos_set_limits_without_channels(void)
+{
+	struct spdk_bdev *bdev = &g_bdev.bdev;
+	struct spdk_bdev_desc *desc;
+	struct spdk_io_channel *io_ch;
+	uint64_t limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
+	uint64_t mbytes;
+	int status, i, iter;
+
+	setup_test();
+	set_thread(0);
+
+	/* setup_test() keeps a descriptor open; this test needs no open descriptors. */
+	spdk_bdev_close(g_desc);
+	g_desc = NULL;
+	poll_threads();
+
+	for (iter = 0; iter < 3; iter++) {
+		for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
+			limits[i] = SPDK_BDEV_QOS_LIMIT_NOT_DEFINED;
+		}
+		mbytes = 10 * (iter + 1);
+		limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT] = mbytes;
+
+		desc = NULL;
+		spdk_bdev_open_ext("ut_bdev", false, _bdev_event_cb, NULL, &desc);
+		SPDK_CU_ASSERT_FATAL(desc != NULL);
+		/* Opening must not mark a user-visible QoS change as in progress. */
+		CU_ASSERT(bdev->internal.qos_mod_in_progress == false);
+
+		status = -1;
+		spdk_bdev_set_qos_rate_limits(bdev, limits, qos_dynamic_enable_done, &status);
+		spdk_bdev_close(desc);
+		poll_threads();
+
+		CU_ASSERT(status == 0);
+		CU_ASSERT(bdev->internal.qos_mod_in_progress == false);
+		SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+		CU_ASSERT(bdev->internal.qos->thread == NULL);
+		CU_ASSERT(bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT].limit ==
+			  mbytes * 1024 * 1024);
+	}
+
+	/* A channel created later picks up the configured QoS and updates still work. */
+	desc = NULL;
+	spdk_bdev_open_ext("ut_bdev", true, _bdev_event_cb, NULL, &desc);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
+	set_thread(1);
+	io_ch = spdk_bdev_get_io_channel(desc);
+	SPDK_CU_ASSERT_FATAL(io_ch != NULL);
+	set_thread(0);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	CU_ASSERT(bdev->internal.qos->thread == spdk_io_channel_get_thread(io_ch));
+
+	for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
+		limits[i] = SPDK_BDEV_QOS_LIMIT_NOT_DEFINED;
+	}
+	limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT] = 100;
+	status = -1;
+	spdk_bdev_set_qos_rate_limits(bdev, limits, qos_dynamic_enable_done, &status);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT(bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT].limit ==
+		  100ULL * 1024 * 1024);
+
+	set_thread(1);
+	spdk_put_io_channel(io_ch);
+	set_thread(0);
+	spdk_bdev_close(desc);
+	poll_threads();
+
+	/* Disabling through the same open/set/close sequence also succeeds. */
+	for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
+		limits[i] = SPDK_BDEV_QOS_LIMIT_NOT_DEFINED;
+	}
+	limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT] = 0;
+	desc = NULL;
+	spdk_bdev_open_ext("ut_bdev", false, _bdev_event_cb, NULL, &desc);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
+	status = -1;
+	spdk_bdev_set_qos_rate_limits(bdev, limits, qos_dynamic_enable_done, &status);
+	spdk_bdev_close(desc);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT(bdev->internal.qos == NULL);
+	CU_ASSERT(bdev->internal.qos_mod_in_progress == false);
+
+	/* Restore g_desc so that we can use teardown_test(). */
+	spdk_bdev_open_ext("ut_bdev", true, _bdev_event_cb, NULL, &g_desc);
+	teardown_test();
+}
+
+/*
+ * A channel created while QoS is being disabled must not enable QoS on itself:
+ * once the disable completes, internal.qos is freed and any channel still
+ * flagged with BDEV_CH_QOS_ENABLED would submit I/O against a NULL qos.
+ */
+static void
+qos_disable_concurrent_channel_create(void)
+{
+	struct spdk_bdev *bdev = &g_bdev.bdev;
+	struct spdk_io_channel *io_ch0, *io_ch2;
+	struct spdk_bdev_channel *bdev_ch2;
+	uint64_t limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
+	enum spdk_bdev_io_status io_status;
+	int status, i, rc;
+
+	setup_test();
+
+	/* Enable QoS with a channel on thread 0, so the QoS thread is thread 0. */
+	set_thread(0);
+	io_ch0 = spdk_bdev_get_io_channel(g_desc);
+	SPDK_CU_ASSERT_FATAL(io_ch0 != NULL);
+
+	for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
+		limits[i] = SPDK_BDEV_QOS_LIMIT_NOT_DEFINED;
+	}
+	limits[SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT] = 10000;
+	status = -1;
+	spdk_bdev_set_qos_rate_limits(bdev, limits, qos_dynamic_enable_done, &status);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	CU_ASSERT(bdev->internal.qos->thread == spdk_get_thread());
+
+	/*
+	 * Start disabling from thread 1 and only poll thread 0: the disable message
+	 * clears the flag on channel 0, but the completion (queued on thread 1)
+	 * has not run yet, so the disable is still in progress.
+	 */
+	limits[SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT] = 0;
+	set_thread(1);
+	status = -1;
+	spdk_bdev_set_qos_rate_limits(bdev, limits, qos_dynamic_enable_done, &status);
+	poll_thread(0);
+	CU_ASSERT(status == -1);
+
+	/* Create a new channel mid-disable. */
+	set_thread(2);
+	io_ch2 = spdk_bdev_get_io_channel(g_desc);
+	SPDK_CU_ASSERT_FATAL(io_ch2 != NULL);
+	bdev_ch2 = spdk_io_channel_get_ctx(io_ch2);
+	CU_ASSERT(bdev_ch2->flags == 0);
+
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT(bdev->internal.qos == NULL);
+	/* Fatal: I/O below would dereference a NULL qos if the flag were set. */
+	SPDK_CU_ASSERT_FATAL(bdev_ch2->flags == 0);
+
+	/* I/O on the new channel bypasses QoS and completes normally. */
+	set_thread(2);
+	io_status = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch2, NULL, 0, 1, io_during_io_done, &io_status);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+	CU_ASSERT(io_status == SPDK_BDEV_IO_STATUS_SUCCESS);
+
+	spdk_put_io_channel(io_ch2);
+	set_thread(0);
+	spdk_put_io_channel(io_ch0);
+	poll_threads();
 	teardown_test();
 }
 
@@ -2965,6 +3142,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, reset_start_complete_race);
 	CU_ADD_TEST(suite, qos_bdev_open_close_data_race);
 	CU_ADD_TEST(suite, bdev_unregister_open_qos_data_race);
+	CU_ADD_TEST(suite, qos_set_limits_without_channels);
+	CU_ADD_TEST(suite, qos_disable_concurrent_channel_create);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

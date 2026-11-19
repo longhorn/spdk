@@ -208,6 +208,9 @@ struct spdk_bdev_qos {
 
 	/** Poller that processes queued I/O commands each time slice. */
 	struct spdk_poller *poller;
+
+	/** Set while QoS is being disabled; channels must not (re)enable QoS. */
+	bool disabling;
 };
 
 struct spdk_bdev_mgmt_channel {
@@ -4317,7 +4320,7 @@ bdev_enable_qos(struct spdk_bdev *bdev, struct spdk_bdev_channel *ch)
 	assert(spdk_spin_held(&bdev->internal.spinlock));
 
 	/* Rate limiting on this bdev enabled */
-	if (qos) {
+	if (qos && !qos->disabling) {
 		if (qos->ch == NULL) {
 			struct spdk_io_channel *io_ch;
 
@@ -8793,6 +8796,19 @@ spdk_bdev_unregister_by_name(const char *bdev_name, struct spdk_bdev_module *mod
 	return 0;
 }
 
+static void
+bdev_start_qos_done(struct spdk_bdev *bdev, void *_ctx, int status)
+{
+	/*
+	 * The bdev may already be destroyed when an open-triggered QoS enable
+	 * completes, so this must not dereference bdev or touch
+	 * qos_mod_in_progress (setting that flag here made every
+	 * spdk_bdev_set_qos_rate_limits() right after an open fail with -EAGAIN
+	 * on bdevs without I/O channels).
+	 */
+	free(_ctx);
+}
+
 static int
 bdev_start_qos(struct spdk_bdev *bdev)
 {
@@ -8806,8 +8822,7 @@ bdev_start_qos(struct spdk_bdev *bdev)
 			return -ENOMEM;
 		}
 		ctx->bdev = bdev;
-		ctx->bdev->internal.qos_mod_in_progress = true;
-		spdk_bdev_for_each_channel(bdev, bdev_enable_qos_msg, ctx, bdev_enable_qos_done);
+		spdk_bdev_for_each_channel(bdev, bdev_enable_qos_msg, ctx, bdev_start_qos_done);
 	}
 
 	return 0;
@@ -10215,7 +10230,7 @@ bdev_enable_qos_msg(struct spdk_bdev_channel_iter *i, struct spdk_bdev *bdev,
 		SPDK_DEBUGLOG(bdev,
 			      "Data race detected - requested to enable QoS on wrong bdev state bdev name: %s, bdev state: %d",
 			      bdev->name, bdev->internal.status);
-		if (bdev->internal.qos &&
+		if (bdev->internal.qos && !bdev->internal.qos->disabling &&
 		    bdev->internal.qos->ch == NULL) { /* QoS has not been fully created yet, shall clean up */
 			free(bdev->internal.qos);
 			bdev->internal.qos = NULL;
@@ -10358,6 +10373,7 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 			bdev_set_qos_rate_limits(bdev, limits);
 
 			/* Disabling */
+			bdev->internal.qos->disabling = true;
 			spdk_bdev_for_each_channel(bdev, bdev_disable_qos_msg, ctx,
 						   bdev_disable_qos_msg_done);
 		} else {
