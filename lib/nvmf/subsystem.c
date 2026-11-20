@@ -3546,7 +3546,6 @@ nvmf_ns_reservation_add_registrant(struct spdk_nvmf_ns *ns,
 	/* set hostid for the registrant */
 	spdk_uuid_copy(&reg->hostid, &ctrlr->hostid);
 	TAILQ_INSERT_TAIL(&ns->registrants, reg, link);
-	ns->gen++;
 
 	return 0;
 }
@@ -3589,7 +3588,6 @@ nvmf_ns_reservation_remove_registrant(struct spdk_nvmf_ns *ns,
 	TAILQ_REMOVE(&ns->registrants, reg, link);
 	nvmf_ns_reservation_check_release_on_remove_registrant(ns, reg);
 	free(reg);
-	ns->gen++;
 	return;
 }
 
@@ -3806,6 +3804,10 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 	}
 
 exit:
+	/* Every successful Reservation Register command increments the generation */
+	if (status == SPDK_NVME_SC_SUCCESS) {
+		ns->gen++;
+	}
 	req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 	req->rsp->nvme_cpl.status.sc = status;
 	return update_sgroup;
@@ -3961,6 +3963,9 @@ nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
 	}
 
 exit:
+	if (status == SPDK_NVME_SC_SUCCESS && is_preempt) {
+		ns->gen++;
+	}
 	if (update_sgroup && is_preempt) {
 		new_num_hostid = nvmf_ns_reservation_get_all_other_hostid(ns, new_hostid_list,
 				 SPDK_NVMF_MAX_NUM_REGISTRANTS,
@@ -4093,6 +4098,7 @@ nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
 		break;
 	case SPDK_NVME_RESERVE_CLEAR:
 		nvmf_ns_reservation_clear_all_registrants(ns);
+		ns->gen++;
 		if (num_hostid) {
 			nvmf_subsystem_gen_ctrlr_notification(ns->subsystem, ns,
 							      hostid_list,
