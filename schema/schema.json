@@ -5884,6 +5884,23 @@
       ]
     },
     {
+      "name": "bdev_ec_fail_base_bdev",
+      "params": [
+        {
+          "name": "ec_name",
+          "type": "string",
+          "required": true,
+          "description": "EC bdev name"
+        },
+        {
+          "name": "slot",
+          "type": "uint32",
+          "required": true,
+          "description": "Slot index of the base bdev to fail"
+        }
+      ]
+    },
+    {
       "name": "bdev_ec_get_bdevs",
       "params": [
         {

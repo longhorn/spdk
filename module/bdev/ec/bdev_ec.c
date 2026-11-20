@@ -38,6 +38,12 @@ struct ec_base_bdev_cleanup_ctx {
 	uint32_t                slot;
 	struct spdk_io_channel *reset_ch;
 	bool                    quiesced;
+	/*
+	 * Block count at the time we quiesced. A resize may land while the
+	 * quiesce is queued, so the unquiesce must use this value, not the
+	 * current bdev.blockcnt.
+	 */
+	uint64_t                quiesced_blockcnt;
 };
 
 static void ec_cleanup_close_descriptor(struct ec_base_bdev_cleanup_ctx *ctx);
@@ -207,7 +213,8 @@ ec_cleanup_close_descriptor(struct ec_base_bdev_cleanup_ctx *ctx)
 	}
 
 	if (ctx->quiesced) {
-		spdk_bdev_unquiesce(&ec->bdev, &ec_if, NULL, NULL);
+		spdk_bdev_unquiesce_range(&ec->bdev, &ec_if, 0,
+					  ctx->quiesced_blockcnt, NULL, NULL);
 	}
 
 	SPDK_NOTICELOG("EC bdev %s: async cleanup complete for slot %u\n",
@@ -275,9 +282,9 @@ ec_cleanup_reset_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 
 	if (!success) {
-		SPDK_WARNLOG("EC bdev %s: reset of slot %u did not succeed "
-			     "(expected for dead device); continuing\n",
-			     ec->bdev.name, ctx->slot);
+		SPDK_NOTICELOG("EC bdev %s: reset of slot %u did not succeed "
+			       "(expected for dead device); continuing\n",
+			       ec->bdev.name, ctx->slot);
 	}
 
 	cctx = calloc(1, sizeof(*cctx));
@@ -354,22 +361,45 @@ static void
 ec_start_base_bdev_cleanup(struct ec_bdev *ec, uint32_t slot)
 {
 	struct ec_base_bdev_cleanup_ctx *ctx;
+	int                              rc;
 
 	SPDK_NOTICELOG("EC bdev %s: starting async cleanup for slot %u\n",
 		       ec->bdev.name, slot);
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
-		SPDK_ERRLOG("EC bdev %s: OOM for cleanup ctx slot %u\n",
+		SPDK_ERRLOG("EC bdev %s: OOM for cleanup ctx slot %u; "
+			    "closing descriptor without full cleanup\n",
 			    ec->bdev.name, slot);
-		return;
+		goto close_direct;
 	}
 
 	ctx->ec       = ec;
 	ctx->slot     = slot;
 	ctx->quiesced = false;
+	ctx->quiesced_blockcnt = ec->bdev.blockcnt;
 
-	spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
+	rc = spdk_bdev_quiesce(&ec->bdev, &ec_if, ec_cleanup_quiesce_cb, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: failed to submit quiesce for slot %u "
+			    "(rc=%d); closing descriptor without full cleanup\n",
+			    ec->bdev.name, slot, rc);
+		free(ctx);
+		goto close_direct;
+	}
+	return;
+
+close_direct:
+	/*
+	 * The cleanup chain never started. Close the descriptor here, as
+	 * ec_cleanup_quiesce_cb does on quiesce failure; nothing else will,
+	 * and leaving it open leaks it for the life of the bdev.
+	 */
+	if (ec->descs[slot]) {
+		ec_slot_publish_base_bdev(ec, slot, NULL);
+		spdk_bdev_close(ec->descs[slot]);
+		ec->descs[slot] = NULL;
+	}
 }
 
 /*
@@ -391,14 +421,8 @@ ec_teardown_must_defer(const struct ec_bdev *ec)
 }
 
 /*
- * Release the home-thread channels a single slot holds: its WIB channel
- * (parity slots only), its bitmap channel, and any live scrub / rebuild
- * channel. Each is NULL-checked, so this is safe to call once per slot
- * regardless of which channels that slot actually opened.
- *
- * Caller must ensure no persist write is outstanding on the WIB / bitmap
- * channels (see ec_teardown_must_defer and the deferral in
- * ec_handle_base_bdev_failure) -- putting a channel with I/O still in
+ * Release the home-thread channels held by one slot. Callers must check
+ * ec_teardown_must_defer first; putting a channel that still has I/O in
  * flight trips the bdev-layer io_outstanding assert.
  */
 static void
@@ -432,6 +456,84 @@ ec_release_slot_dedicated_channels(struct ec_bdev *ec, uint32_t slot)
  * Failure detection
  * ========================================================================= */
 
+/*
+ * Move a NORMAL or REPLACING slot to FAILED, release its dedicated
+ * channels, and start the async quiesce/reset/close chain that closes
+ * the descriptor.
+ */
+static void
+ec_fail_slot(struct ec_bdev *ec, uint32_t slot)
+{
+	const char *bdev_name;
+
+	assert(ec->base_states[slot] != EC_BASE_STATE_FAILED);
+	assert(ec->descs[slot] != NULL);
+
+	bdev_name = spdk_bdev_get_name(spdk_bdev_desc_get_bdev(ec->descs[slot]));
+
+	if (ec->base_states[slot] == EC_BASE_STATE_REPLACING) {
+		/*
+		 * Replacement disk failed before rebuild finished.
+		 * Clear rebuild flags; allow a new replace.
+		 */
+		SPDK_WARNLOG("EC bdev %s: REPLACEMENT disk %s "
+			     "(slot %u) failed before rebuild; "
+			     "slot returns to FAILED\n",
+			     ec->bdev.name, bdev_name, slot);
+		ec->needs_rebuild[slot] = false;
+		ec->replace_in_progress = false;
+		/*
+		 * If a rebuild is in progress for this slot,
+		 * it will fail on its next I/O and call
+		 * ec_rebuild_finish with a non-zero rc.
+		 * We do not abort it here; let the I/O error
+		 * path handle it naturally.
+		 */
+	} else {
+		ec->failed_count++;
+	}
+
+	ec->base_states[slot] = EC_BASE_STATE_FAILED;
+
+	if (ec->failed_count > ec->m) {
+		SPDK_ERRLOG("EC bdev %s fault tolerance exceeded: "
+			    "%u/%u disks failed (max %u). OFFLINE.\n",
+			    ec->bdev.name, ec->failed_count, ec->n, ec->m);
+		ec->offline = true;
+		/* Fail the writes parked on stripe conflicts. */
+		ec_stripe_waitq_fail_all(ec, SPDK_BDEV_IO_STATUS_ABORTED);
+	} else {
+		SPDK_WARNLOG("EC bdev %s: %s disk %s (slot %u/%u) failed "
+			     "(%u/%u disks failed, can tolerate %u more)\n",
+			     ec->bdev.name,
+			     slot >= ec->k ? "PARITY" : "DATA",
+			     bdev_name, slot, ec->n,
+			     ec->failed_count, ec->n,
+			     ec->m - ec->failed_count);
+	}
+
+	/*
+	 * Release this slot's dedicated channels and start the async
+	 * quiesce/reset/close. Defer both while ec_teardown_must_defer
+	 * says something still has I/O outstanding on those channels;
+	 * releasing now would trip the bdev-layer io_outstanding assert.
+	 * The slot is already FAILED, so reads degrade either way.
+	 * ec_drain_deferred_slot_releases finishes the job once the
+	 * holder completes.
+	 */
+	if (ec_teardown_must_defer(ec)) {
+		ec->dedicated_release_pending[slot] = true;
+		SPDK_NOTICELOG("EC bdev %s: slot %u channel "
+			       "release deferred behind an "
+			       "in-flight persist\n",
+			       ec->bdev.name, slot);
+		return;
+	}
+
+	ec_release_slot_dedicated_channels(ec, slot);
+	ec_start_base_bdev_cleanup(ec, slot);
+}
+
 static void
 ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
 {
@@ -446,71 +548,7 @@ ec_handle_base_bdev_failure(struct ec_bdev *ec, struct spdk_bdev *bdev)
 					bdev_name, i);
 				return;
 			}
-
-			if (ec->base_states[i] == EC_BASE_STATE_REPLACING) {
-				/*
-				 * Replacement disk failed before rebuild finished.
-				 * Clear rebuild flags; allow a new replace.
-				 */
-				SPDK_WARNLOG("EC bdev %s: REPLACEMENT disk %s "
-					     "(slot %u) failed before rebuild; "
-					     "slot returns to FAILED\n",
-					     ec->bdev.name, bdev_name, i);
-				ec->needs_rebuild[i]    = false;
-				ec->replace_in_progress = false;
-				/*
-				 * If a rebuild is in progress for this slot,
-				 * it will fail on its next I/O and call
-				 * ec_rebuild_finish with a non-zero rc.
-				 * We do not abort it here; let the I/O error
-				 * path handle it naturally.
-				 */
-			} else {
-				ec->failed_count++;
-			}
-
-			ec->base_states[i] = EC_BASE_STATE_FAILED;
-
-			if (ec->failed_count > ec->m) {
-				SPDK_ERRLOG("EC bdev %s fault tolerance exceeded: "
-					    "%u/%u disks failed (max %u). OFFLINE.\n",
-					    ec->bdev.name, ec->failed_count, ec->n, ec->m);
-				ec->offline = true;
-				/* Fail the writes parked on stripe conflicts. */
-				ec_stripe_waitq_fail_all(ec, SPDK_BDEV_IO_STATUS_ABORTED);
-			} else {
-				SPDK_WARNLOG("EC bdev %s: %s disk %s (slot %u/%u) failed "
-					     "(%u/%u disks failed, can tolerate %u more)\n",
-					     ec->bdev.name,
-					     i >= ec->k ? "PARITY" : "DATA",
-					     bdev_name, i, ec->n,
-					     ec->failed_count, ec->n,
-					     ec->m - ec->failed_count);
-			}
-
-			/*
-			 * Release this slot's dedicated channels, then start the
-			 * async quiesce/reset/close. Defer both if a persist write
-			 * is still outstanding on the slot's WIB / bitmap channel --
-			 * releasing then would trip the bdev-layer io_outstanding
-			 * assert. The slot is already FAILED, so reads degrade
-			 * regardless of when the channels are freed.
-			 *
-			 * The deferral holds the base descriptor open only briefly:
-			 * the stuck write is aborted at ctrlr-loss, the same event
-			 * as this REMOVE, and its completion resumes the release.
-			 */
-			if (ec_teardown_must_defer(ec)) {
-				ec->dedicated_release_pending[i] = true;
-				SPDK_NOTICELOG("EC bdev %s: slot %u channel "
-					       "release deferred behind an "
-					       "in-flight persist\n",
-					       ec->bdev.name, i);
-				return;
-			}
-
-			ec_release_slot_dedicated_channels(ec, i);
-			ec_start_base_bdev_cleanup(ec, i);
+			ec_fail_slot(ec, i);
 			return;
 		}
 	}
@@ -1934,6 +1972,8 @@ ec_slot_name_for_json(const struct ec_bdev *ec, uint32_t slot)
  *   name           live base bdev name, or "<failed>" / "<unknown>"
  *   state          "normal" | "failed" | "replacing"
  *   needs_rebuild  bool   (only when state == "replacing")
+ *   cleanup_pending bool (only when state == "failed"): descriptor
+ *                  still held by the async slot cleanup
  *
  * When descs[i] is NULL on a non-FAILED slot (state machine
  * inconsistency, should not happen in normal operation), writes
@@ -1959,6 +1999,8 @@ ec_write_base_bdevs_array_json(struct spdk_json_write_ctx *w,
 		case EC_BASE_STATE_FAILED:
 			spdk_json_write_named_string(w, "name",  "<failed>");
 			spdk_json_write_named_string(w, "state", "failed");
+			spdk_json_write_named_bool(w, "cleanup_pending",
+						   ec->descs[i] != NULL);
 			break;
 		case EC_BASE_STATE_REPLACING:
 			spdk_json_write_named_string(w, "name",
@@ -2551,6 +2593,16 @@ ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
 		return -EINVAL;
 	}
 
+	/*
+	 * An open descriptor on a FAILED slot means the async cleanup chain
+	 * is still tearing it down. Installing the replacement now would leak
+	 * the old descriptor and let the chain close the new one instead.
+	 * Retry once descs[slot] is NULL.
+	 */
+	if (ec->descs[slot] != NULL) {
+		return -EBUSY;
+	}
+
 	if (ec->replace_in_progress) {
 		return -EBUSY;
 	}
@@ -2616,6 +2668,46 @@ ec_bdev_replace_base_bdev(const char *ec_name, uint32_t slot,
 	ec->replace_in_progress = true;
 
 	ec_replace_start_channel_walk(rctx);
+	return 0;
+}
+
+int
+ec_bdev_fail_base_bdev(const char *ec_name, uint32_t slot)
+{
+	struct ec_bdev *ec;
+
+	ec = ec_bdev_find(ec_name);
+	if (!ec) {
+		return -ENODEV;
+	}
+
+	if (slot >= ec->n) {
+		return -ENOENT;
+	}
+
+	if (ec->base_states[slot] == EC_BASE_STATE_FAILED) {
+		return 0;
+	}
+
+	/*
+	 * A REPLACING slot belongs to the replace/rebuild flow. Failing it
+	 * from the control plane would race that flow; a real failure of the
+	 * replacement disk still arrives through the REMOVE event.
+	 */
+	if (ec->base_states[slot] == EC_BASE_STATE_REPLACING) {
+		return -EBUSY;
+	}
+
+	/* Slots are not fully wired until create finishes. */
+	if (ec->create_in_progress) {
+		return -EBUSY;
+	}
+
+	assert(spdk_get_thread() == ec->home_thread);
+
+	SPDK_NOTICELOG("EC bdev %s: slot %u failed by request\n",
+		       ec->bdev.name, slot);
+	ec_fail_slot(ec, slot);
 	return 0;
 }
 

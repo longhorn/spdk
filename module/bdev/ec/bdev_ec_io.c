@@ -37,6 +37,8 @@ struct ec_degraded_read_ctx {
 	uint64_t            chunk_blocks;
 	uint8_t            *chunk_bufs[EC_MAX_BASE_BDEVS];
 	struct iovec        chunk_iovs[EC_MAX_BASE_BDEVS];
+	/* Slots that were read into chunk_bufs, one bit per slot. */
+	uint64_t            src_slots;
 	uint32_t            reads_remaining;
 	enum spdk_bdev_io_status status;
 };
@@ -473,7 +475,11 @@ ec_free_degraded_read_ctx(struct ec_degraded_read_ctx *dctx,
  * rebuild (data slots only).
  *
  * Preconditions:
- *   - src_bufs[i] is valid for all readable slots (ec_slot_is_readable).
+ *   - src_bufs[i] is valid for every slot i set in src_slots.
+ *   - src_slots: bitmask of the slots that were read into src_bufs.
+ *     Set by the caller when it submits the reads. Reconstruction uses
+ *     this mask rather than live slot state, so a slot that fails after
+ *     its read completed still counts as a source.
  *   - out_buf receives the reconstructed data for failed_slot.
  *   - failed_slot < ec->k  (data chunk only; parity uses encode path).
  *   - chunk_len is the number of bytes per chunk.
@@ -483,6 +489,7 @@ ec_free_degraded_read_ctx(struct ec_degraded_read_ctx *dctx,
 int
 ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 			  uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
+			  uint64_t src_slots,
 			  uint8_t *out_buf,
 			  uint32_t failed_slot,
 			  uint64_t chunk_len)
@@ -500,7 +507,7 @@ ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 	int      rc;
 
 	for (disk = 0; disk < n && avail_row < k; disk++) {
-		if (!ec_slot_is_readable(ec, disk)) {
+		if (!(src_slots & (1ULL << disk))) {
 			continue;
 		}
 		memcpy(&avail_matrix[avail_row * k],
@@ -511,7 +518,7 @@ ec_reconstruct_data_chunk(const struct ec_bdev *ec,
 	}
 
 	if (avail_row < k) {
-		SPDK_ERRLOG("EC bdev %s: not enough readable disks to reconstruct "
+		SPDK_ERRLOG("EC bdev %s: not enough source chunks to reconstruct "
 			    "(need %u, found %u)\n",
 			    ec->bdev.name, k, avail_row);
 		return -1;
@@ -548,13 +555,14 @@ ec_reconstruct_data_chunk(const struct ec_bdev *ec,
  *   - failed_data_slots[0..f-1] all < ec->k  (data slots only)
  *   - 1 <= f <= ec->m  (guaranteed by offline guard)
  *   - out_bufs[j] is a valid DMA buffer of chunk_len bytes for each j
- *   - src_bufs[i] is valid for all readable i
+ *   - src_bufs and src_slots: see ec_reconstruct_data_chunk.
  *
  * Returns 0 on success, -1 on matrix inversion failure.
  */
 int
 ec_reconstruct_multi_data(const struct ec_bdev *ec,
 			   uint8_t *src_bufs[EC_MAX_BASE_BDEVS],
+			   uint64_t src_slots,
 			   uint8_t *out_bufs[],
 			   const uint32_t failed_data_slots[],
 			   uint32_t f,
@@ -578,9 +586,9 @@ ec_reconstruct_multi_data(const struct ec_bdev *ec,
 
 	assert(f >= 1 && f <= ec->m);
 
-	/* Step 1: build kxk avail_matrix from readable disk rows */
+	/* Step 1: build kxk avail_matrix from the source slot rows */
 	for (disk = 0; disk < n && avail_row < k; disk++) {
-		if (!ec_slot_is_readable(ec, disk)) {
+		if (!(src_slots & (1ULL << disk))) {
 			continue;
 		}
 		memcpy(&avail_matrix[avail_row * k],
@@ -591,7 +599,7 @@ ec_reconstruct_multi_data(const struct ec_bdev *ec,
 	}
 
 	if (avail_row < k) {
-		SPDK_ERRLOG("EC bdev %s: not enough readable disks to reconstruct "
+		SPDK_ERRLOG("EC bdev %s: not enough source chunks to reconstruct "
 			    "%u failed slots (need %u, found %u)\n",
 			    ec->bdev.name, f, k, avail_row);
 		return -1;
@@ -671,7 +679,7 @@ ec_reconstruct_missing_chunk(const struct ec_bdev *ec,
 {
 	uint64_t chunk_bytes = dctx->chunk_blocks * ec->bdev.blocklen;
 
-	return ec_reconstruct_data_chunk(ec, dctx->chunk_bufs,
+	return ec_reconstruct_data_chunk(ec, dctx->chunk_bufs, dctx->src_slots,
 					 dctx->chunk_bufs[failed_slot],
 					 failed_slot, chunk_bytes);
 }
@@ -726,7 +734,8 @@ ec_degraded_read_complete(struct ec_degraded_read_ctx *dctx)
 
 		assert(chunk_offset * blocklen + seg_bytes <= chunk_bytes);
 
-		if (!ec_slot_is_readable(ec, chunk_idx)) {
+		/* A chunk we read is good even if its slot failed since. */
+		if (!(dctx->src_slots & (1ULL << chunk_idx))) {
 			rc = ec_reconstruct_missing_chunk(ec, dctx, chunk_idx);
 			if (rc != 0) {
 				SPDK_ERRLOG("EC bdev %s: reconstruction failed "
@@ -1034,6 +1043,7 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 
 	reads_submitted       = 0;
 	dctx->reads_remaining = 0;
+	dctx->src_slots       = 0;
 
 	for (disk = 0; disk < ec->n; disk++) {
 		if (!ec_slot_is_readable(ec, disk)) {
@@ -1059,6 +1069,7 @@ ec_submit_degraded_read(struct ec_bdev_io *ec_io)
 				    ec->bdev.name, disk, rc);
 		} else {
 			reads_submitted++;
+			dctx->src_slots |= 1ULL << disk;
 		}
 	}
 

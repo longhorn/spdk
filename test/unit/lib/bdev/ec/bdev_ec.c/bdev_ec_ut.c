@@ -123,10 +123,10 @@ DEFINE_STUB_V(ec_io_route_complete_to_submitter, (struct ec_bdev_io *ec_io,
 /* Link-only stubs: bdev_ec_rebuild.c references these on paths the skip
  * tests never run, so a no-op definition is enough to link. */
 DEFINE_STUB(ec_reconstruct_data_chunk, int, (const struct ec_bdev *ec,
-		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint8_t *out_buf,
-		uint32_t failed_slot, uint64_t chunk_len), 0);
+		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint64_t src_slots,
+		uint8_t *out_buf, uint32_t failed_slot, uint64_t chunk_len), 0);
 DEFINE_STUB(ec_reconstruct_multi_data, int, (const struct ec_bdev *ec,
-		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint8_t *out_bufs[],
+		uint8_t *src_bufs[EC_MAX_BASE_BDEVS], uint64_t src_slots, uint8_t *out_bufs[],
 		const uint32_t failed_data_slots[], uint32_t f, uint64_t chunk_len), 0);
 DEFINE_STUB(ec_wib_persist, int, (struct ec_bdev *ec, void (*cb)(void *cb_arg, int rc),
 				  void *cb_arg), 0);
@@ -1221,6 +1221,165 @@ test_resize_precondition_errors(void)
 }
 
 /*
+ * Replace must not run while the async slot cleanup still owns the old
+ * descriptor: a FAILED slot with descs[slot] != NULL is -EBUSY.
+ */
+static void
+test_replace_rejects_slot_cleanup_in_flight(void)
+{
+	struct ec_bdev         ec;
+	struct spdk_bdev_desc *old_desc = (struct spdk_bdev_desc *)0x1;
+	int                    rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	ec.bdev.name = "ec_ut_replace";
+	TAILQ_INSERT_TAIL(&g_ec_bdev_list, &ec, link);
+
+	ec.base_states[1] = EC_BASE_STATE_FAILED;
+	ec.descs[1]       = old_desc;
+
+	rc = ec_bdev_replace_base_bdev("ec_ut_replace", 1, "new_base", NULL, NULL);
+	CU_ASSERT(rc == -EBUSY);
+	CU_ASSERT(ec.descs[1] == old_desc);
+	CU_ASSERT(ec.replace_in_progress == false);
+
+	/*
+	 * Cleanup finished: the request passes the guard. spdk_bdev_open_ext is
+	 * forced to fail so it stops at the next step without a real new bdev.
+	 */
+	ec.descs[1] = NULL;
+	MOCK_SET(spdk_bdev_open_ext, -ENODEV);
+	rc = ec_bdev_replace_base_bdev("ec_ut_replace", 1, "new_base", NULL, NULL);
+	CU_ASSERT(rc == -ENODEV);
+	MOCK_CLEAR(spdk_bdev_open_ext);
+
+	TAILQ_REMOVE(&g_ec_bdev_list, &ec, link);
+	ec_free_runtime_arrays(&ec);
+}
+
+/*
+ * cleanup_pending mirrors the replace guard: a FAILED slot reports true
+ * while its descriptor is still open, false once cleanup closed it. The
+ * key is absent on other states.
+ */
+static char   g_ut_json_buf[4096];
+static size_t g_ut_json_len;
+
+static int
+ut_json_write_cb(void *cb_ctx, const void *data, size_t size)
+{
+	SPDK_CU_ASSERT_FATAL(g_ut_json_len + size < sizeof(g_ut_json_buf));
+	memcpy(g_ut_json_buf + g_ut_json_len, data, size);
+	g_ut_json_len += size;
+	g_ut_json_buf[g_ut_json_len] = '\0';
+	return 0;
+}
+
+static void
+ut_render_base_bdevs(const struct ec_bdev *ec)
+{
+	struct spdk_json_write_ctx *w;
+
+	g_ut_json_len = 0;
+	w = spdk_json_write_begin(ut_json_write_cb, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(w != NULL);
+	spdk_json_write_object_begin(w);
+	ec_write_base_bdevs_array_json(w, ec);
+	spdk_json_write_object_end(w);
+	spdk_json_write_end(w);
+}
+
+static void
+test_json_cleanup_pending(void)
+{
+	struct ec_bdev ec;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	/* All NORMAL: the key never appears. */
+	ut_render_base_bdevs(&ec);
+	CU_ASSERT(strstr(g_ut_json_buf, "cleanup_pending") == NULL);
+
+	/* FAILED with the descriptor still open: cleanup in flight. */
+	ec.base_states[1] = EC_BASE_STATE_FAILED;
+	ec.descs[1]       = (struct spdk_bdev_desc *)0x1;
+	ut_render_base_bdevs(&ec);
+	CU_ASSERT(strstr(g_ut_json_buf, "\"cleanup_pending\":true") != NULL);
+
+	/* Cleanup closed the descriptor. */
+	ec.descs[1] = NULL;
+	ut_render_base_bdevs(&ec);
+	CU_ASSERT(strstr(g_ut_json_buf, "\"cleanup_pending\":false") != NULL);
+	CU_ASSERT(strstr(g_ut_json_buf, "\"cleanup_pending\":true") == NULL);
+
+	ec_free_runtime_arrays(&ec);
+}
+
+/*
+ * ec_bdev_fail_base_bdev: validation, then the same transition as a
+ * REMOVE event. spdk_bdev_quiesce is forced to fail so the cleanup chain
+ * takes its synchronous close path instead of leaking a context whose
+ * callback never fires under the stubs.
+ */
+static void
+test_fail_base_bdev(void)
+{
+	struct ec_bdev ec;
+	int            rc;
+
+	ut_init_ec(&ec, 4, 2, 64, (1ull << 30) / UT_BLOCKLEN);
+	rc = ec_compute_geometry(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	rc = ec_alloc_runtime_arrays(&ec);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	ec.bdev.name = "ec_ut_fail";
+	TAILQ_INSERT_TAIL(&g_ec_bdev_list, &ec, link);
+	ec.descs[1] = (struct spdk_bdev_desc *)&g_base_bdev;
+	ec.descs[2] = (struct spdk_bdev_desc *)&g_base_bdev;
+
+	CU_ASSERT(ec_bdev_fail_base_bdev("no_such_ec", 1) == -ENODEV);
+	CU_ASSERT(ec_bdev_fail_base_bdev("ec_ut_fail", ec.n) == -ENOENT);
+
+	ec.base_states[2] = EC_BASE_STATE_REPLACING;
+	CU_ASSERT(ec_bdev_fail_base_bdev("ec_ut_fail", 2) == -EBUSY);
+	CU_ASSERT(ec.base_states[2] == EC_BASE_STATE_REPLACING);
+	ec.base_states[2] = EC_BASE_STATE_NORMAL;
+
+	ec.create_in_progress = true;
+	CU_ASSERT(ec_bdev_fail_base_bdev("ec_ut_fail", 1) == -EBUSY);
+	CU_ASSERT(ec.base_states[1] == EC_BASE_STATE_NORMAL);
+	ec.create_in_progress = false;
+
+	MOCK_SET(spdk_bdev_quiesce, -EIO);
+	rc = ec_bdev_fail_base_bdev("ec_ut_fail", 1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ec.base_states[1] == EC_BASE_STATE_FAILED);
+	CU_ASSERT(ec.failed_count == 1);
+	CU_ASSERT(ec.descs[1] == NULL);
+	CU_ASSERT(ec.offline == false);
+
+	/* Repeat is a no-op. */
+	rc = ec_bdev_fail_base_bdev("ec_ut_fail", 1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ec.failed_count == 1);
+	MOCK_CLEAR(spdk_bdev_quiesce);
+
+	TAILQ_REMOVE(&g_ec_bdev_list, &ec, link);
+	ec_free_runtime_arrays(&ec);
+}
+
+/*
  * Unit coverage: deferred dedicated-channel teardown.
  *
  * A persist write to a failing disk can sit outstanding on a WIB /
@@ -1790,6 +1949,9 @@ main(int argc, char **argv)
 
 	CU_ADD_TEST(suite, test_resize_wib_reset_on_grow);
 	CU_ADD_TEST(suite, test_resize_precondition_errors);
+	CU_ADD_TEST(suite, test_replace_rejects_slot_cleanup_in_flight);
+	CU_ADD_TEST(suite, test_json_cleanup_pending);
+	CU_ADD_TEST(suite, test_fail_base_bdev);
 
 	CU_ADD_TEST(suite, test_dedicated_channel_release);
 	CU_ADD_TEST(suite, test_dedicated_release_deferred_gate);

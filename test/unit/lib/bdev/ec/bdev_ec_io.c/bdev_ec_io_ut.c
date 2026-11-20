@@ -615,6 +615,53 @@ test_degraded_read_readable_chunks_direct(void)
 	CU_ASSERT(g_reads[0].num_blocks == 4);
 }
 
+/* Decoder uses the slots the caller read, not live slot state. Slot 1 is
+ * marked FAILED after its read landed; slot 2 (parity) was never read.
+ * src_slots says {0,1}: the decoder must use buf 1 and ignore buf 2. */
+static void
+test_reconstruct_follows_src_slots(void)
+{
+	enum { CHUNK = 64 };
+	static uint8_t encode_matrix[3 * 2];
+	static uint8_t g_tbls[32 * 2 * 1];
+	uint8_t  bufs[3][CHUNK];
+	uint8_t *src_bufs[EC_MAX_BASE_BDEVS] = { bufs[0], bufs[1], bufs[2] };
+	uint8_t  expect[CHUNK];
+	uint8_t  out[CHUNK];
+	uint8_t *data_ptrs[2]  = { bufs[0], bufs[1] };
+	uint8_t *parity_ptr[1] = { bufs[2] };
+	uint32_t i;
+
+	ut_reset();
+	g_ec.n             = 3;
+	g_ec.m             = 1;
+	g_ec.encode_matrix = encode_matrix;
+	g_ec.g_tbls        = g_tbls;
+	gf_gen_rs_matrix(g_ec.encode_matrix, g_ec.n, g_ec.k);
+	ec_init_tables(g_ec.k, g_ec.m, &g_ec.encode_matrix[g_ec.k * g_ec.k],
+		       g_ec.g_tbls);
+
+	for (i = 0; i < CHUNK; i++) {
+		bufs[0][i] = (uint8_t)(i * 3 + 1);
+		bufs[1][i] = (uint8_t)(i * 7 + 5);
+	}
+	memcpy(expect, bufs[1], CHUNK);
+	ec_encode_data(CHUNK, g_ec.k, g_ec.m, g_ec.g_tbls, data_ptrs, parity_ptr);
+
+	/* Slot 1 fails after its read completed; parity was never read. */
+	g_ec.failed_count   = 1;
+	g_ec.base_states[1] = EC_BASE_STATE_FAILED;
+	memset(bufs[2], 0, CHUNK);
+
+	CU_ASSERT(ec_reconstruct_data_chunk(&g_ec, src_bufs, 0x3, out, 1,
+					    CHUNK) == 0);
+	CU_ASSERT(memcmp(out, expect, CHUNK) == 0);
+
+	/* Fewer than k sources: refuse rather than decode from garbage. */
+	CU_ASSERT(ec_reconstruct_data_chunk(&g_ec, src_bufs, 0x1, out, 1,
+					    CHUNK) == -1);
+}
+
 /* Sub-stripe write crossing a strip boundary: still one RMW dispatch. */
 static void
 test_write_cross_strip_routes_rmw(void)
@@ -660,6 +707,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_read_fanout_two_strips);
 	CU_ADD_TEST(suite, test_read_fanout_all_submits_fail);
 	CU_ADD_TEST(suite, test_degraded_read_readable_chunks_direct);
+	CU_ADD_TEST(suite, test_reconstruct_follows_src_slots);
 	CU_ADD_TEST(suite, test_write_cross_strip_routes_rmw);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);

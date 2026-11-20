@@ -102,6 +102,7 @@ ec_rebuild_free_resources(struct ec_rebuild_ctx *ctx)
 static int
 ec_reencode_parity_from_chunk_bufs(const struct ec_bdev *ec,
 				   uint8_t *chunk_bufs[EC_MAX_BASE_BDEVS],
+				   uint64_t src_slots,
 				   uint64_t chunk_bytes)
 {
 	uint8_t *data_ptrs[EC_MAX_BASE_BDEVS];
@@ -113,7 +114,7 @@ ec_reencode_parity_from_chunk_bufs(const struct ec_bdev *ec,
 	int      rc;
 
 	for (i = 0; i < ec->k; i++) {
-		if (!ec_slot_is_readable(ec, i)) {
+		if (!(src_slots & (1ULL << i))) {
 			failed_data_slots[num_failed] = i;
 			failed_out_bufs[num_failed]   = chunk_bufs[i];
 			num_failed++;
@@ -121,9 +122,9 @@ ec_reencode_parity_from_chunk_bufs(const struct ec_bdev *ec,
 	}
 
 	if (num_failed > 0) {
-		rc = ec_reconstruct_multi_data(ec, chunk_bufs, failed_out_bufs,
-					       failed_data_slots, num_failed,
-					       chunk_bytes);
+		rc = ec_reconstruct_multi_data(ec, chunk_bufs, src_slots,
+					       failed_out_bufs, failed_data_slots,
+					       num_failed, chunk_bytes);
 		if (rc != 0) {
 			return rc;
 		}
@@ -499,6 +500,7 @@ ec_rebuild_reconstruct_write(struct ec_rebuild_ctx *ctx)
 		 */
 		rc = ec_reconstruct_data_chunk(ec,
 					       ctx->chunk_bufs,
+					       ctx->src_slots,
 					       ctx->chunk_bufs[slot],
 					       slot,
 					       ctx->chunk_bytes);
@@ -528,6 +530,7 @@ ec_rebuild_reconstruct_write(struct ec_rebuild_ctx *ctx)
 		 * which is what makes the guard necessary.
 		 */
 		rc = ec_reencode_parity_from_chunk_bufs(ec, ctx->chunk_bufs,
+							ctx->src_slots,
 							ctx->chunk_bytes);
 		if (rc != 0) {
 			SPDK_ERRLOG("EC bdev %s: rebuild parity slot %u "
@@ -613,6 +616,7 @@ ec_rebuild_submit_stripe_reads(struct ec_rebuild_ctx *ctx)
 
 	ctx->io_status       = SPDK_BDEV_IO_STATUS_SUCCESS;
 	ctx->reads_remaining = 0;
+	ctx->src_slots       = 0;
 	ctx->io_in_flight    = true;
 
 	for (disk = 0; disk < ec->n; disk++) {
@@ -641,6 +645,7 @@ ec_rebuild_submit_stripe_reads(struct ec_rebuild_ctx *ctx)
 			ctx->io_status = SPDK_BDEV_IO_STATUS_FAILED;
 		} else {
 			reads_submitted++;
+			ctx->src_slots |= 1ULL << disk;
 		}
 	}
 
@@ -1192,6 +1197,7 @@ ec_scrub_reads_done(struct ec_scrub_ctx *sctx)
 	 * lands corrupt bytes on disk.
 	 */
 	rc = ec_reencode_parity_from_chunk_bufs(ec, sctx->chunk_bufs,
+						sctx->src_slots,
 						sctx->chunk_bytes);
 	if (rc != 0) {
 		SPDK_WARNLOG("EC bdev %s: scrub -- multi-data reconstruction "
@@ -1299,6 +1305,7 @@ ec_scrub_submit_reads(struct ec_scrub_ctx *sctx)
 
 	sctx->io_status       = SPDK_BDEV_IO_STATUS_SUCCESS;
 	sctx->reads_remaining = 0;
+	sctx->src_slots       = 0;
 	sctx->io_in_flight    = true;
 
 	for (disk = 0; disk < ec->n && reads_submitted < ec->k; disk++) {
@@ -1327,6 +1334,7 @@ ec_scrub_submit_reads(struct ec_scrub_ctx *sctx)
 				     sctx->current_stripe, rc);
 		} else {
 			reads_submitted++;
+			sctx->src_slots |= 1ULL << disk;
 		}
 	}
 

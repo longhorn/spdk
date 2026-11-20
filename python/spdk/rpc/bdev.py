@@ -1378,6 +1378,18 @@ def bdev_ec_replace_base_bdev(client, ec_name, slot, new_bdev_name):
     return client.call('bdev_ec_replace_base_bdev', params)
 
 
+def bdev_ec_fail_base_bdev(client, ec_name, slot):
+    """Mark a disk in an EC bdev as failed.
+    Args:
+        ec_name: name of the EC bdev
+        slot: slot index of the disk to fail
+    """
+    params = dict()
+    params['ec_name'] = ec_name
+    params['slot'] = slot
+    return client.call('bdev_ec_fail_base_bdev', params)
+
+
 def bdev_ec_start_rebuild(client, ec_name):
     """Start background rebuild for all REPLACING slots in an EC bdev.
 
