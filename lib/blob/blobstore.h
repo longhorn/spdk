@@ -130,6 +130,8 @@ struct spdk_blob {
 	bool		invalid;
 	bool		data_ro;
 	bool		md_ro;
+	/* Quarantined until the blobstore is loaded again, see blob_quarantine(). */
+	bool		quarantined;
 
 	uint64_t	invalid_flags;
 	uint64_t	data_ro_flags;
@@ -201,6 +203,8 @@ struct spdk_blob_store {
 	struct spdk_bit_pool		*used_clusters;		/* Protected by used_lock */
 	struct spdk_bit_array		*used_blobids;
 	struct spdk_bit_array		*open_blobids;
+	/* Blobs that cannot be opened until the blobstore is loaded again, see blob_quarantine() */
+	struct spdk_bit_array		*quarantined_blobids;
 
 	struct spdk_spinlock		used_lock;
 
@@ -231,6 +235,18 @@ struct spdk_blob_store {
 	TAILQ_HEAD(, spdk_blob_list)	snapshots;
 
 	bool				clean;
+
+	/*
+	 * When set, the unload leaves the blobstore dirty, so that the next load rebuilds the
+	 * allocation maps from the metadata of the blobs, as after a power failure.
+	 *
+	 * Set it only when the maps may no longer match the metadata on disk, rather than for
+	 * every quarantined blob, because a rebuild:
+	 * - reads every metadata page, so the next load takes longer;
+	 * - fails the whole load if it cannot read a page, while a load that uses the saved maps
+	 *   only skips the blob of that page.
+	 */
+	bool				needs_recovery;
 
 	spdk_bs_esnap_dev_create	esnap_bs_dev_create;
 	void				*esnap_ctx;
