@@ -12154,6 +12154,87 @@ blob_persist_error(void)
 }
 
 static void
+blob_persist_chain_page_error(void)
+{
+	/*
+	 * A persist writes all pages of a blob's metadata but the first one together. Then it
+	 * writes the first page, which points to the others. If one of these writes fails, the
+	 * persist must fail without writing the first page, even when another write completes
+	 * after the failed one. Otherwise the first page on disk points to a page that was not
+	 * written, and the blob cannot be loaded anymore.
+	 */
+	struct spdk_blob_xattr_opts xattrs;
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob_opts blob_opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	char *xattr_names[] = {"large0", "large1", "large2"};
+	uint8_t xattr_value[UT_LARGE_XATTR_LEN];
+	uint32_t saved_phys_blocklen = g_phys_blocklen;
+	uint32_t page;
+	const void *value;
+	size_t value_len;
+	int rc;
+
+	g_phys_blocklen = 4096;
+	dev = init_dev();
+	spdk_bs_init(dev, NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	memset(xattr_value, 0x6A, sizeof(xattr_value));
+	xattrs.count = SPDK_COUNTOF(xattr_names);
+	xattrs.names = xattr_names;
+	xattrs.ctx = xattr_value;
+	xattrs.get_value = ut_get_large_xattr_value;
+	ut_spdk_blob_opts_init(&blob_opts);
+	blob_opts.xattrs = xattrs;
+
+	blob = ut_blob_create_and_open(bs, &blob_opts);
+	blobid = spdk_blob_get_id(blob);
+	SPDK_CU_ASSERT_FATAL(blob->active.num_pages == 3);
+
+	/* The next persist writes the second and third pages to the lowest free metadata pages.
+	 * Fail the write of the second page. The write of the third page completes after it. */
+	rc = spdk_blob_set_xattr(blob, "lost", "value", sizeof("value"));
+	CU_ASSERT(rc == 0);
+	page = spdk_bit_array_find_first_clear(bs->used_md_pages, 0);
+	ut_arm_io_failure(bs->dev, bs_md_page_to_lba(bs, page), 1);
+	g_bserrno = 0;
+	blob_sync_md_checked(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_ut_io_failed);
+	ut_disarm_io_failure(bs->dev);
+	CU_ASSERT(g_bserrno == -EIO);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* The first page on disk still points to the old pages. */
+	ut_bs_reload(&bs, NULL);
+	blob = ut_open_blob(bs, blobid);
+	rc = spdk_blob_get_xattr_value(blob, "large2", &value, &value_len);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(value_len == UT_LARGE_XATTR_LEN);
+	rc = spdk_blob_get_xattr_value(blob, "lost", &value, &value_len);
+	CU_ASSERT(rc == -ENOENT);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	g_phys_blocklen = saved_phys_blocklen;
+}
+
+static void
 blob_esnap_clone_resize(void)
 {
 	struct spdk_bs_dev *dev;
@@ -13808,6 +13889,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_clone_resize);
 		CU_ADD_TEST(suite, blob_delete_snapshot_resized_clone);
 		CU_ADD_TEST(suite, blob_persist_error);
+		CU_ADD_TEST(suite, blob_persist_chain_page_error);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_deep_copy);
